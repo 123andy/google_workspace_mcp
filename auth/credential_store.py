@@ -14,9 +14,45 @@ from datetime import datetime
 from typing import List, Optional
 from urllib.parse import quote, unquote
 
+from cryptography.fernet import Fernet, InvalidToken
 from google.oauth2.credentials import Credentials
 
 logger = logging.getLogger(__name__)
+
+
+def _credentials_to_dict(credentials: Credentials) -> dict:
+    """Serialize a Credentials object to the same JSON shape the other stores use."""
+    return {
+        "token": credentials.token,
+        "refresh_token": credentials.refresh_token,
+        "token_uri": credentials.token_uri,
+        "client_id": credentials.client_id,
+        "client_secret": credentials.client_secret,
+        "scopes": credentials.scopes,
+        "expiry": credentials.expiry.isoformat() if credentials.expiry else None,
+    }
+
+
+def _credentials_from_dict(creds_data: dict) -> Credentials:
+    """Rebuild a Credentials object from the serialized dict (inverse of above)."""
+    expiry = None
+    if creds_data.get("expiry"):
+        try:
+            expiry = datetime.fromisoformat(creds_data["expiry"])
+            # Google's auth library expects timezone-naive expiry.
+            if expiry.tzinfo is not None:
+                expiry = expiry.replace(tzinfo=None)
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Could not parse expiry time: {e}")
+    return Credentials(
+        token=creds_data.get("token"),
+        refresh_token=creds_data.get("refresh_token"),
+        token_uri=creds_data.get("token_uri"),
+        client_id=creds_data.get("client_id"),
+        client_secret=creds_data.get("client_secret"),
+        scopes=creds_data.get("scopes"),
+        expiry=expiry,
+    )
 
 
 class CredentialStore(ABC):
@@ -506,6 +542,167 @@ class GCSCredentialStore(CredentialStore):
         )
 
 
+def _default_pg_connect(dsn: str):
+    """Open a new psycopg connection. Imported lazily so the driver is only required
+    when the postgres backend is actually selected."""
+    import psycopg  # noqa: PLC0415  (lazy: postgres-only dependency)
+
+    return psycopg.connect(dsn)
+
+
+class PostgresCredentialStore(CredentialStore):
+    """Durable, shared credential store backed by PostgreSQL.
+
+    Unlike the local-directory store (ephemeral per pod) this survives pod restarts
+    and is shared across replicas, so users do not have to re-authenticate after a
+    redeploy. Unlike the GCS store it implements ``list_users()``, so it works in
+    single-user / Path-B deployments (``MCP_ENABLE_OAUTH21=false``) too.
+
+    Google refresh tokens are sensitive, so each row's credential JSON is encrypted
+    at rest with Fernet (AES-128-CBC + HMAC) before it ever reaches the database —
+    a DB dump or read replica never exposes a usable token.
+
+    Config (env):
+        WORKSPACE_MCP_CREDENTIAL_POSTGRES_DSN   — libpq DSN / URL (required)
+        WORKSPACE_MCP_CREDENTIAL_ENCRYPTION_KEY — urlsafe-base64 Fernet key (required)
+        WORKSPACE_MCP_CREDENTIAL_POSTGRES_TABLE — table name, default "credentials"
+
+    Isolation: point each endpoint (base, delta) at its OWN database via the DSN, so
+    a credential stored by one endpoint can never be read by another.
+    """
+
+    def __init__(
+        self,
+        dsn: Optional[str] = None,
+        table: Optional[str] = None,
+        encryption_key: Optional[str] = None,
+        connect=_default_pg_connect,
+    ):
+        self.dsn = dsn or os.getenv("WORKSPACE_MCP_CREDENTIAL_POSTGRES_DSN")
+        if not self.dsn:
+            raise ValueError(
+                "PostgresCredentialStore requires a DSN; set "
+                "WORKSPACE_MCP_CREDENTIAL_POSTGRES_DSN or pass dsn."
+            )
+
+        # Table name is interpolated into DDL/DML, so constrain it to a safe identifier.
+        self.table = table or os.getenv(
+            "WORKSPACE_MCP_CREDENTIAL_POSTGRES_TABLE", "credentials"
+        )
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", self.table):
+            raise ValueError(f"Invalid credential table name: {self.table!r}")
+
+        key = encryption_key or os.getenv("WORKSPACE_MCP_CREDENTIAL_ENCRYPTION_KEY")
+        if not key:
+            raise ValueError(
+                "PostgresCredentialStore requires an encryption key; set "
+                "WORKSPACE_MCP_CREDENTIAL_ENCRYPTION_KEY (urlsafe-base64 Fernet key)."
+            )
+        self._fernet = Fernet(key.encode() if isinstance(key, str) else key)
+
+        self._connect = connect
+        self._schema_ready = False
+        logger.info(
+            f"PostgresCredentialStore initialized (table={self.table}, encrypted at rest)"
+        )
+
+    def _ensure_schema(self):
+        """Create the credentials table on first use (idempotent, once per process)."""
+        if self._schema_ready:
+            return
+        with self._connect(self.dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {self.table} (
+                        user_email TEXT PRIMARY KEY,
+                        cred_blob  BYTEA NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+        self._schema_ready = True
+
+    def get_credential(self, user_email: str) -> Optional[Credentials]:
+        try:
+            self._ensure_schema()
+            with self._connect(self.dsn) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT cred_blob FROM {self.table} WHERE user_email = %s",
+                        (user_email,),
+                    )
+                    row = cur.fetchone()
+            if not row:
+                logger.debug(f"No stored credential for {user_email}")
+                return None
+            blob = bytes(row[0])
+            creds_data = json.loads(self._fernet.decrypt(blob).decode())
+            logger.debug(f"Loaded credentials for {user_email} from postgres")
+            return _credentials_from_dict(creds_data)
+        except InvalidToken:
+            logger.error(
+                f"Could not decrypt credentials for {user_email} — wrong "
+                "WORKSPACE_MCP_CREDENTIAL_ENCRYPTION_KEY?"
+            )
+            return None
+        except Exception as e:
+            logger.error(f"Error loading credentials for {user_email}: {e}")
+            return None
+
+    def store_credential(self, user_email: str, credentials: Credentials) -> bool:
+        try:
+            self._ensure_schema()
+            blob = self._fernet.encrypt(
+                json.dumps(_credentials_to_dict(credentials)).encode()
+            )
+            with self._connect(self.dsn) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        INSERT INTO {self.table} (user_email, cred_blob, updated_at)
+                        VALUES (%s, %s, now())
+                        ON CONFLICT (user_email)
+                        DO UPDATE SET cred_blob = EXCLUDED.cred_blob, updated_at = now()
+                        """,
+                        (user_email, blob),
+                    )
+            logger.info(f"Stored credentials for {user_email} to postgres")
+            return True
+        except Exception as e:
+            logger.error(f"Error storing credentials for {user_email}: {e}")
+            return False
+
+    def delete_credential(self, user_email: str) -> bool:
+        try:
+            self._ensure_schema()
+            with self._connect(self.dsn) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"DELETE FROM {self.table} WHERE user_email = %s",
+                        (user_email,),
+                    )
+            logger.info(f"Deleted credentials for {user_email} from postgres")
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting credentials for {user_email}: {e}")
+            return False
+
+    def list_users(self) -> List[str]:
+        try:
+            self._ensure_schema()
+            with self._connect(self.dsn) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT user_email FROM {self.table} ORDER BY user_email"
+                    )
+                    rows = cur.fetchall()
+            return [r[0] for r in rows]
+        except Exception as e:
+            logger.error(f"Error listing credential users: {e}")
+            return []
+
+
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"", "0", "false", "no", "off"})
 
@@ -574,12 +771,16 @@ def get_credential_store() -> CredentialStore:
                     "for single-user deployments, or enable OAuth 2.1 mode."
                 )
             _credential_store = GCSCredentialStore()
+        elif backend == "postgres":
+            # Postgres supports list_users(), so (unlike GCS) it works in Path-B /
+            # single-user mode — no OAuth 2.1 requirement. Durable + shared across pods.
+            _credential_store = PostgresCredentialStore()
         elif backend == "local_directory":
             _credential_store = LocalDirectoryCredentialStore()
         else:
             raise ValueError(
                 f"Unsupported WORKSPACE_MCP_CREDENTIAL_STORE_BACKEND: {backend!r}. "
-                f"Expected 'local_directory' or 'gcs'."
+                f"Expected 'local_directory', 'postgres', or 'gcs'."
             )
         logger.info(f"Initialized credential store: {type(_credential_store).__name__}")
 
