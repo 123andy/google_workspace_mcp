@@ -73,11 +73,15 @@ disk = [
 valkey = [
     "py-key-value-aio[valkey]>=0.3.0",
 ]
+postgres = [
+    "py-key-value-aio[postgresql]>=0.4.4",
+]
 test = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.23.0",
     "google-cloud-storage>=2.18.0",
     "requests>=2.32.3",
+    "py-key-value-aio[postgresql]>=0.4.4",
 ]
 release = [
     "tomlkit>=0.13.3",
@@ -91,6 +95,7 @@ dev = [
     "ruff>=0.12.4",
     "tomlkit>=0.13.3",
     "twine>=5.0.0",
+    "py-key-value-aio[postgresql]>=0.4.4",
 ]
 
 [dependency-groups]
@@ -100,11 +105,15 @@ disk = [
 valkey = [
     "py-key-value-aio[valkey]>=0.3.0",
 ]
+postgres = [
+    "py-key-value-aio[postgresql]>=0.4.4",
+]
 test = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.23.0",
     "google-cloud-storage>=2.18.0",
     "requests>=2.32.3",
+    "py-key-value-aio[postgresql]>=0.4.4",
 ]
 release = [
     "tomlkit>=0.13.3",
@@ -118,6 +127,7 @@ dev = [
     "ruff>=0.12.4",
     "tomlkit>=0.13.3",
     "twine>=5.0.0",
+    "py-key-value-aio[postgresql]>=0.4.4",
 ]
 
 [tool.setuptools]

@@ -1266,6 +1266,7 @@ The server supports pluggable storage backends for OAuth proxy state management 
 | Memory | Development, testing | ❌ | ❌ |
 | Disk | Single-server production | ✅ | ❌ |
 | Valkey/Redis | Distributed production | ✅ | ✅ |
+| PostgreSQL | Distributed production | ✅ | ✅ |
 
 **Configuration:**
 
@@ -1281,12 +1282,19 @@ export WORKSPACE_MCP_OAUTH_PROXY_DISK_DIRECTORY=~/.fastmcp/oauth-proxy
 export WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND=valkey
 export WORKSPACE_MCP_OAUTH_PROXY_VALKEY_HOST=redis.example.com
 export WORKSPACE_MCP_OAUTH_PROXY_VALKEY_PORT=6379
+
+# PostgreSQL storage (distributed, multi-server)
+export WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND=postgres
+export WORKSPACE_MCP_OAUTH_PROXY_POSTGRES_DSN="postgresql://user:pass@db.example.com:5432/workspace_mcp"
 ```
+
+**How the backend is chosen:** `WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND` always wins when set. When it is unset, a set `WORKSPACE_MCP_OAUTH_PROXY_VALKEY_HOST` selects Valkey; otherwise a set `WORKSPACE_MCP_OAUTH_PROXY_POSTGRES_DSN` selects Postgres. With none of these, the OAuth proxy uses FastMCP's default in-memory storage. Prefer naming the backend explicitly, as in the examples above. Note that proxy state (registered clients, sessions, tokens) does not migrate between backends — after switching, MCP clients simply re-authenticate.
 
 > Disk support requires `workspace-mcp[disk]` (or `py-key-value-aio[disk]`) when installing from source.
 > The official Docker image includes the `disk` extra by default.
 > Valkey support is optional. Install `workspace-mcp[valkey]` (or `py-key-value-aio[valkey]`) only if you enable the Valkey backend.
 > Windows: building `valkey-glide` from source requires MSVC C++ build tools with C11 support. If you see `aws-lc-sys` C11 errors, set `CFLAGS=/std:c11`.
+> PostgreSQL support is optional. Install `workspace-mcp[postgres]` (or `py-key-value-aio[postgresql]`) only if you enable the Postgres backend.
 
 <details open>
 <summary>🔐 <b>Valkey/Redis Configuration Options</b></summary>
@@ -1302,7 +1310,22 @@ export WORKSPACE_MCP_OAUTH_PROXY_VALKEY_PORT=6379
 | `WORKSPACE_MCP_OAUTH_PROXY_VALKEY_REQUEST_TIMEOUT_MS` | 5000 | Request timeout for remote hosts |
 | `WORKSPACE_MCP_OAUTH_PROXY_VALKEY_CONNECTION_TIMEOUT_MS` | 10000 | Connection timeout for remote hosts |
 
-**Encryption:** Disk and Valkey storage are encrypted with Fernet. The encryption key is derived from `FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY` if set, otherwise from `GOOGLE_OAUTH_CLIENT_SECRET`. Public OAuth 2.1 client setups without a client secret must set `FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY`.
+**Encryption:** Disk, Valkey, and PostgreSQL storage are encrypted with Fernet. The encryption key is derived from `FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY` if set, otherwise from `GOOGLE_OAUTH_CLIENT_SECRET`. Public OAuth 2.1 client setups without a client secret must set `FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY`.
+
+</details>
+
+<details open>
+<summary>🐘 <b>PostgreSQL Configuration Options</b></summary>
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WORKSPACE_MCP_OAUTH_PROXY_POSTGRES_DSN` | - | Connection URL (`postgresql://user:pass@host:port/db`); localhost defaults if unset |
+| `WORKSPACE_MCP_OAUTH_PROXY_POSTGRES_TABLE` | `workspace_mcp_kv` | Table name (created automatically) |
+| `WORKSPACE_MCP_OAUTH_PROXY_POSTGRES_SWEEP_INTERVAL_SECONDS` | 900 | Min. seconds between expired-row sweeps (0 disables) |
+| `WORKSPACE_MCP_OAUTH_PROXY_POSTGRES_POOL_MIN` | 1 | Connection pool minimum size |
+| `WORKSPACE_MCP_OAUTH_PROXY_POSTGRES_POOL_MAX` | 5 | Connection pool maximum size |
+
+**Expiry sweeping:** TTLs are enforced on read, but unlike Valkey, Postgres does not evict expired rows by itself. The server opportunistically deletes expired rows in the background — after a storage operation, if more than the sweep interval has passed since the last sweep in that process. Idle processes don't sweep; the first operation after a restart or idle stretch cleans up immediately.
 
 </details>
 
