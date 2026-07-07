@@ -15,7 +15,9 @@ COPY . .
 # Install Python dependencies using uv sync
 # --extra otel ships the OpenTelemetry SDK/exporter so tracing can be enabled at
 # runtime via OTEL_* env vars; it stays a no-op unless an OTLP endpoint is set.
-RUN uv sync --frozen --no-dev --extra disk --extra otel
+# (postgres extra = asyncpg, needed when WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND=postgres;
+#  without it the server logs a warning and falls back to in-memory proxy storage)
+RUN uv sync --frozen --no-dev --extra disk --extra otel --extra postgres
 
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash app \
