@@ -601,123 +601,43 @@ def configure_server_for_http():
             provider_valid_scopes: List[str] = sorted(get_current_scopes())
             provider_required_scopes: List[str] = sorted(PROTOCOL_AUTH_SCOPES)
 
-            client_storage = None
             jwt_signing_key_override = (
                 os.getenv("FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY", "").strip()
                 or None
             )
-            storage_backend = (
-                os.getenv("WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND", "")
-                .strip()
-                .lower()
+            # Derived up front: every storage backend and both provider modes
+            # need it, and a missing secret should fail loudly here rather than
+            # after a storage backend was silently skipped.
+            jwt_signing_key = validate_and_derive_jwt_key(
+                jwt_signing_key_override, config.client_secret
             )
-            valkey_host = os.getenv("WORKSPACE_MCP_OAUTH_PROXY_VALKEY_HOST", "").strip()
 
-            # Determine storage backend: valkey, disk, memory (default)
-            use_valkey = storage_backend == "valkey" or bool(valkey_host)
-            use_disk = storage_backend == "disk"
+            from core.storage import get_configured_kv_store
 
-            if use_valkey:
-                try:
-                    from core.valkey_storage import (
-                        ResilientValkeyStore,
-                        build_valkey_client_config,
-                        configure_glide_logging,
-                        describe_valkey_client_config,
-                    )
-
-                    configure_glide_logging()
-                    valkey_config = build_valkey_client_config()
-                    client_storage = ResilientValkeyStore(config=valkey_config)
-
-                    jwt_signing_key = validate_and_derive_jwt_key(
-                        jwt_signing_key_override, config.client_secret
-                    )
-
+            client_storage = None
+            configured_storage = get_configured_kv_store()
+            if configured_storage is not None:
+                client_storage = configured_storage.store
+                if configured_storage.needs_encryption:
                     storage_encryption_key = derive_jwt_key(
                         high_entropy_material=jwt_signing_key.decode(),
                         salt="fastmcp-storage-encryption-key",
                     )
-
                     client_storage = FernetEncryptionWrapper(
                         key_value=client_storage,
                         fernet=Fernet(key=storage_encryption_key),
                     )
-                    logger.info(
-                        "OAuth 2.1: Using ResilientValkeyStore for FastMCP OAuth proxy client_storage (%s)",
-                        describe_valkey_client_config(valkey_config),
-                    )
-                    logger.info(
-                        "OAuth 2.1: Applied Fernet encryption wrapper to Valkey client_storage (key derived from FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY or GOOGLE_OAUTH_CLIENT_SECRET)."
-                    )
-                except ImportError as exc:
-                    logger.warning(
-                        "OAuth 2.1: Valkey client_storage requested but Valkey dependencies are not installed (%s). "
-                        "Install 'workspace-mcp[valkey]' (or 'py-key-value-aio[valkey]', which includes 'valkey-glide') "
-                        "or unset WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND/WORKSPACE_MCP_OAUTH_PROXY_VALKEY_HOST.",
-                        exc,
-                    )
-                except ValueError as exc:
-                    logger.warning(
-                        "OAuth 2.1: Invalid Valkey configuration; falling back to default storage (%s).",
-                        exc,
-                    )
-            elif use_disk:
-                try:
-                    from core.storage import make_sanitized_file_store
-
-                    disk_directory = os.getenv(
-                        "WORKSPACE_MCP_OAUTH_PROXY_DISK_DIRECTORY", ""
-                    ).strip()
-                    if not disk_directory:
-                        # Default to FASTMCP_HOME/oauth-proxy or ~/.fastmcp/oauth-proxy
-                        fastmcp_home = os.getenv("FASTMCP_HOME", "").strip()
-                        if fastmcp_home:
-                            disk_directory = os.path.join(fastmcp_home, "oauth-proxy")
-                        else:
-                            disk_directory = os.path.expanduser(
-                                "~/.fastmcp/oauth-proxy"
-                            )
-
-                    client_storage = make_sanitized_file_store(disk_directory)
-
-                    jwt_signing_key = validate_and_derive_jwt_key(
-                        jwt_signing_key_override, config.client_secret
-                    )
-
-                    storage_encryption_key = derive_jwt_key(
-                        high_entropy_material=jwt_signing_key.decode(),
-                        salt="fastmcp-storage-encryption-key",
-                    )
-
-                    client_storage = FernetEncryptionWrapper(
-                        key_value=client_storage,
-                        fernet=Fernet(key=storage_encryption_key),
-                    )
-                    logger.info(
-                        "OAuth 2.1: Using FileTreeStore for FastMCP OAuth proxy client_storage (directory=%s)",
-                        disk_directory,
-                    )
-                except ImportError as exc:
-                    logger.warning(
-                        "OAuth 2.1: Disk storage requested but dependencies not available (%s). "
-                        "Falling back to default storage.",
-                        exc,
-                    )
-            elif storage_backend == "memory":
-                from key_value.aio.stores.memory import MemoryStore
-
-                client_storage = MemoryStore()
                 logger.info(
-                    "OAuth 2.1: Using MemoryStore for FastMCP OAuth proxy client_storage"
+                    "OAuth 2.1: Using %s for FastMCP OAuth proxy client_storage (%s)%s",
+                    type(configured_storage.store).__name__,
+                    configured_storage.detail,
+                    " with Fernet encryption (key derived from "
+                    "FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY or "
+                    "GOOGLE_OAUTH_CLIENT_SECRET)"
+                    if configured_storage.needs_encryption
+                    else "",
                 )
             # else: client_storage remains None, FastMCP uses its default
-
-            # Ensure JWT signing key is always derived for all storage backends
-            if "jwt_signing_key" not in locals():
-                jwt_signing_key = validate_and_derive_jwt_key(
-                    jwt_signing_key_override, config.client_secret
-                )
 
             expiry_kwargs = get_oauth_proxy_expiry_kwargs()
 
