@@ -15,9 +15,14 @@ from core import attachment_cred_cache as cache
 
 @pytest.fixture(autouse=True)
 def _reset_store(monkeypatch):
+    from core import storage
+
     # Force the in-process MemoryStore fallback and a clean singleton each test.
     monkeypatch.delenv("WORKSPACE_MCP_OAUTH_PROXY_VALKEY_HOST", raising=False)
+    monkeypatch.delenv("WORKSPACE_MCP_OAUTH_PROXY_POSTGRES_DSN", raising=False)
     monkeypatch.delenv("WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND", raising=False)
+    monkeypatch.setattr(storage, "_configured", None)
+    monkeypatch.setattr(storage, "_configured_built", False)
     monkeypatch.setattr(cache, "_store", None)
     monkeypatch.setattr(cache, "_store_built", False)
     yield

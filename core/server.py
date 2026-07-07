@@ -587,8 +587,9 @@ async def serve_signed_attachment(request: Request):
     an agent can hand the URL to any HTTP client.
 
     Credential recovery is two-tier: the in-process OAuth 2.1 session store first,
-    then a shared short-TTL Valkey cache, so the URL works even when the request
-    lands on a replica that never ran the originating tool call.
+    then a shared short-TTL credential cache (Valkey or Postgres, whichever backs
+    the OAuth proxy storage), so the URL works even when the request lands on a
+    replica that never ran the originating tool call.
     """
     from core.attachment_signing import verify_attachment_token
     from auth.oauth21_session_store import get_oauth21_session_store

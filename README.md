@@ -1245,7 +1245,7 @@ With this enabled, the download tools return a short-lived **signed URL** instea
 **How it works:**
 - The token is a signed (HS256) capability referencing the resource, its owner, and a short expiry. The signature *is* the per-user authorization, so the GET needs no bearer token and any HTTP client can fetch it.
 - **Sources:** Gmail attachments and Google Drive — binary files via `get_media`, plus native Google files via `export_media` (Docs→PDF, Sheets→XLSX, Slides→PPTX).
-- **Credential recovery is two-tier**, so a URL works even when the fetch lands on a different replica than the tool call: (1) the in-process OAuth 2.1 session store, then (2) a short-TTL, Fernet-encrypted Valkey cache keyed by email, stashed at mint time (reusing the OAuth-proxy Valkey config).
+- **Credential recovery is two-tier**, so a URL works even when the fetch lands on a different replica than the tool call: (1) the in-process OAuth 2.1 session store, then (2) a short-TTL, Fernet-encrypted cache keyed by email, stashed at mint time (sharing the OAuth-proxy storage backend — Valkey or Postgres).
 - **Drive downloads stream in bounded chunks** so a large file never buffers whole in memory; tune the per-download memory/throughput trade-off with `WORKSPACE_MCP_DRIVE_STREAM_CHUNK_BYTES` (default 16 MiB). Gmail attachments arrive whole in one API response, so they are buffered (bounded by Gmail's attachment-size limit).
 
 **Configuration:**
