@@ -79,6 +79,9 @@ otel = [
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-exporter-otlp>=1.20.0",
 ]
+postgres = [
+    "py-key-value-aio[postgresql]>=0.4.4",
+]
 test = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.23.0",
@@ -87,6 +90,7 @@ test = [
     "opentelemetry-exporter-otlp>=1.20.0",
     "requests>=2.32.3",
     "httpx2>=2.12.0",
+    "py-key-value-aio[postgresql]>=0.4.4",
 ]
 release = [
     "tomlkit>=0.13.3",
@@ -103,6 +107,7 @@ dev = [
     "ruff>=0.15.22,<0.16",
     "tomlkit>=0.13.3",
     "twine>=5.0.0",
+    "py-key-value-aio[postgresql]>=0.4.4",
 ]
 
 [dependency-groups]
@@ -112,6 +117,9 @@ disk = [
 valkey = [
     "py-key-value-aio[valkey]>=0.3.0",
 ]
+postgres = [
+    "py-key-value-aio[postgresql]>=0.4.4",
+]
 test = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.23.0",
@@ -120,6 +128,7 @@ test = [
     "opentelemetry-exporter-otlp>=1.20.0",
     "requests>=2.32.3",
     "httpx2>=2.12.0",
+    "py-key-value-aio[postgresql]>=0.4.4",
 ]
 release = [
     "tomlkit>=0.13.3",
@@ -136,6 +145,7 @@ dev = [
     "ruff>=0.15.22,<0.16",
     "tomlkit>=0.13.3",
     "twine>=5.0.0",
+    "py-key-value-aio[postgresql]>=0.4.4",
 ]
 
 [tool.setuptools]
