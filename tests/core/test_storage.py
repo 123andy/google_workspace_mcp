@@ -216,13 +216,23 @@ class TestConsistency:
         # Must NOT contain the old inline pattern
         assert "HybridSanitizationStrategy" not in source
 
-    def test_server_references_shared_factory(self):
-        """core.server must use make_sanitized_file_store, not inline config."""
+    def test_server_uses_shared_builder(self):
+        """core.server must delegate storage selection to core.storage."""
         import inspect
 
         import core.server as server_module
 
         source = inspect.getsource(server_module.configure_server_for_http)
-        assert "make_sanitized_file_store" in source
-        # Must NOT contain the old inline pattern
+        assert "get_configured_kv_store" in source
+        # Must NOT contain the old inline patterns
         assert "HybridSanitizationStrategy" not in source
+        assert "ValkeyStore" not in source
+
+    def test_disk_builder_uses_shared_factory(self):
+        """The disk backend must go through make_sanitized_file_store."""
+        import inspect
+
+        from core.storage import _build_disk_store
+
+        source = inspect.getsource(_build_disk_store)
+        assert "make_sanitized_file_store" in source
