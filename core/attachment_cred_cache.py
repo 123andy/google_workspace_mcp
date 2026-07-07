@@ -13,10 +13,11 @@ route reads it back. Records are Fernet-encrypted with the same key derivation a
 the OAuth proxy's Valkey storage, and expire on the same horizon as the URL, so a
 credential record never outlives the link it backs.
 
-Backed by Valkey when ``WORKSPACE_MCP_OAUTH_PROXY_VALKEY_HOST`` is set (the
-stateless / hosted deployment, and the local PoC stack). Falls back to an
-in-process store otherwise, which still works locally because the single container
-serves both the tool and the route.
+Backed by the shared ``WORKSPACE_MCP_OAUTH_PROXY_*`` storage backend (Valkey
+or Postgres — see ``core.storage``) when one is configured, as in the
+stateless / hosted deployment and the local PoC stack. Falls back to an
+in-process store otherwise, which still works locally because the single
+container serves both the tool and the route.
 """
 
 import logging
@@ -69,7 +70,7 @@ def _derive_storage_key() -> bytes:
 
 
 def _build_store():
-    """Build the encrypted key-value store once (Valkey if configured, else memory)."""
+    """Build the encrypted key-value store once (shared backend if configured, else memory)."""
     global _store, _store_built
     if _store_built:
         return _store
@@ -79,73 +80,28 @@ def _build_store():
         from cryptography.fernet import Fernet
         from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
 
-        # Mirror server.py's backend selection: an explicit STORAGE_BACKEND=valkey
-        # (host defaulting to localhost) is a valid config and must not silently
-        # fall back to per-process memory, which would break cross-replica recovery.
-        storage_backend = (
-            os.getenv("WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND", "").strip().lower()
-        )
-        valkey_host = os.getenv("WORKSPACE_MCP_OAUTH_PROXY_VALKEY_HOST", "").strip()
-        use_valkey = storage_backend == "valkey" or bool(valkey_host)
+        from core.storage import get_configured_kv_store
 
-        if use_valkey:
-            if not valkey_host:
-                valkey_host = "localhost"
-            from key_value.aio.stores.valkey import ValkeyStore
-
-            port = int(
-                os.getenv("WORKSPACE_MCP_OAUTH_PROXY_VALKEY_PORT", "6379").strip()
-            )
-            db = int(os.getenv("WORKSPACE_MCP_OAUTH_PROXY_VALKEY_DB", "0").strip())
-            username = (
-                os.getenv("WORKSPACE_MCP_OAUTH_PROXY_VALKEY_USERNAME", "").strip()
-                or None
-            )
-            password = (
-                os.getenv("WORKSPACE_MCP_OAUTH_PROXY_VALKEY_PASSWORD", "").strip()
-                or None
-            )
-
-            base = ValkeyStore(
-                host=valkey_host, port=port, db=db, username=username, password=password
-            )
-
-            # Mirror the proxy's TLS/timeout handling so remote/TLS Valkey doesn't
-            # trip Glide's 250ms default request timeout.
-            tls_raw = (
-                os.getenv("WORKSPACE_MCP_OAUTH_PROXY_VALKEY_USE_TLS", "")
-                .strip()
-                .lower()
-            )
-            use_tls = tls_raw in ("1", "true", "yes") if tls_raw else port == 6380
-            glide_config = getattr(base, "_client_config", None)
-            if glide_config is not None:
-                glide_config.use_tls = use_tls
-                is_remote = valkey_host not in {"localhost", "127.0.0.1"}
-                if use_tls or is_remote:
-                    glide_config.request_timeout = 5000
-                    from glide_shared.config import AdvancedGlideClientConfiguration
-
-                    glide_config.advanced_config = AdvancedGlideClientConfiguration(
-                        connection_timeout=10000
-                    )
-
+        # Same selection (and same store instance / connection pool) as the
+        # OAuth proxy's client_storage, so cross-replica recovery works
+        # whenever the proxy itself is backed by shared storage.
+        configured = get_configured_kv_store()
+        if configured is not None and configured.needs_encryption:
             _store = FernetEncryptionWrapper(
-                key_value=base, fernet=Fernet(key=_derive_storage_key())
+                key_value=configured.store, fernet=Fernet(key=_derive_storage_key())
             )
             logger.info(
-                "Attachment credential cache: using encrypted ValkeyStore (host=%s, port=%s, db=%s)",
-                valkey_host,
-                port,
-                db,
+                "Attachment credential cache: using encrypted shared %s store (%s)",
+                configured.backend,
+                configured.detail,
             )
         else:
             from key_value.aio.stores.memory import MemoryStore
 
             _store = MemoryStore()
             logger.info(
-                "Attachment credential cache: no Valkey configured, using in-process store "
-                "(single-instance only)."
+                "Attachment credential cache: no shared backend configured, using "
+                "in-process store (single-instance only)."
             )
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("Attachment credential cache unavailable: %s", exc)
