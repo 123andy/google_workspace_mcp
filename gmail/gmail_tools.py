@@ -1763,6 +1763,7 @@ async def get_gmail_attachment_content(
         signed_attachment_urls_enabled,
         build_download_url,
         clamp_ttl_to_expiry,
+        format_ttl,
     )
 
     if signed_attachment_urls_enabled():
@@ -1819,7 +1820,7 @@ async def get_gmail_attachment_content(
                     f"Message ID: {message_id}",
                     f"\n📎 Download URL: {download_url}",
                     "\nThe server streams the bytes directly from Gmail when this URL is "
-                    "fetched; the link is signed to you and expires in ~15 minutes.",
+                    f"fetched; the link is signed to you and expires in {format_ttl(eff_ttl)}.",
                     "\nNote: Attachment IDs are ephemeral. Always use IDs from the most "
                     "recent message fetch.",
                 ]
