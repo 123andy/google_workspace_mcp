@@ -595,10 +595,10 @@ async def start_auth_flow(
                 [
                     f"**ACTION REQUIRED: Google sign-in needed for {user_display_name}**\n",
                     f"You're authenticated at the gateway as **{user_google_email}**. To authorize Google access:",
-                    f"1. Open this URL and sign in to Google as **{user_google_email}** — it must be that exact account (your verified gateway identity):",
-                    f"   Authorization URL: {auth_url}",
+                    f"1. [Sign in with Google as **{user_google_email}**]({auth_url}) — it must be that exact account (your verified gateway identity).",
                     "2. After authorizing, retry your original request.",
                     f"\nOnly the Google account matching your gateway identity (**{user_google_email}**) can be authorized — signing in with a different account is rejected.",
+                    "\n**LLM: present the sign-in link to the user as a markdown hyperlink (e.g. [Sign in with Google](...)); only print the raw URL if the user directly asks for it.**",
                 ]
             )
 
@@ -606,14 +606,12 @@ async def start_auth_flow(
             message_lines = [
                 f"**ACTION REQUIRED: Google Authentication Needed for {user_display_name}**\n",
                 "1. The authorization page has been **automatically opened in your browser**. Please complete the authorization there.",
-                "   If it did not appear, open this URL manually:",
-                f"   Authorization URL: {auth_url}",
+                f"   If it did not appear, use this link: [Sign in with Google]({auth_url})",
             ]
         else:
             message_lines = [
                 f"**ACTION REQUIRED: Google Authentication Needed for {user_display_name}**\n",
-                f"1. Open this URL in your browser to authorize {service_name} access using all required permissions:",
-                f"   Authorization URL: {auth_url}",
+                f"1. [Sign in with Google]({auth_url}) to authorize {service_name} access using all required permissions.",
             ]
         session_info_for_llm = ""
 
@@ -632,6 +630,9 @@ async def start_auth_flow(
 
         message_lines.append(
             f"\nThe application will use the new credentials. If '{user_google_email}' was provided, it must match the authenticated account."
+        )
+        message_lines.append(
+            "\n**LLM: present the sign-in link to the user as a markdown hyperlink (e.g. [Sign in with Google](...)); only print the raw URL if the user directly asks for it.**"
         )
         return "\n".join(message_lines)
 
