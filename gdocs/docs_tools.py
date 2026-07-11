@@ -444,12 +444,23 @@ async def list_docs_in_folder(
     ),
 )
 @handle_http_errors("create_doc", service_type="docs")
-@require_google_service("docs", "docs_write")
+@require_multiple_services(
+    [
+        {"service_type": "docs", "scopes": "docs_write", "param_name": "docs_service"},
+        {
+            "service_type": "drive",
+            "scopes": "drive_file",
+            "param_name": "drive_service",
+        },
+    ]
+)
 async def create_doc(
-    service: Any,
+    docs_service: Any,
+    drive_service: Any,
     user_google_email: str,
     title: str,
     content: str = "",
+    folder_id: str = "root",
 ) -> str:
     """
     Creates a new Google Doc and optionally inserts initial content.
@@ -466,22 +477,48 @@ async def create_doc(
         user_google_email: User's Google email address
         title: Title of the new document
         content: Optional initial plain text content to insert
+        folder_id: The ID of the parent folder. Defaults to 'root'. For shared
+            drives, this must be a folder ID within the shared drive.
 
     Returns:
         str: Confirmation message with document ID, link, and initial document state.
     """
     logger.info(
-        f"[create_doc] Invoked. Email: '{user_google_email}', title_len={len(title)}"
+        f"[create_doc] Invoked. Email: '{user_google_email}', title_len={len(title)}, "
+        f"folder_id='{folder_id}'"
     )
 
     doc = await asyncio.to_thread(
-        service.documents().create(body={"title": title}).execute
+        docs_service.documents().create(body={"title": title}).execute
     )
     doc_id = doc.get("documentId")
+
+    if folder_id and folder_id != "root":
+        from gdrive.drive_helpers import resolve_folder_id
+
+        resolved_folder_id = await resolve_folder_id(drive_service, folder_id)
+        existing = await asyncio.to_thread(
+            drive_service.files()
+            .get(fileId=doc_id, fields="parents", supportsAllDrives=True)
+            .execute
+        )
+        remove_parents = ",".join(existing.get("parents", []))
+        await asyncio.to_thread(
+            drive_service.files()
+            .update(
+                fileId=doc_id,
+                addParents=resolved_folder_id,
+                removeParents=remove_parents,
+                fields="id, parents",
+                supportsAllDrives=True,
+            )
+            .execute
+        )
+
     if content:
         requests = [{"insertText": {"location": {"index": 1}, "text": content}}]
         await asyncio.to_thread(
-            service.documents()
+            docs_service.documents()
             .batchUpdate(documentId=doc_id, body={"requests": requests})
             .execute
         )
@@ -490,8 +527,11 @@ async def create_doc(
         content_note = f"Initial content: {len(content)} characters inserted."
     else:
         content_note = "Document is empty (body starts at index 1, total length 2)."
+    folder_note = (
+        f" Placed in folder '{folder_id}'." if folder_id and folder_id != "root" else ""
+    )
     msg = (
-        f"Created Google Doc '{title}' (ID: {doc_id}) for {user_google_email}. "
+        f"Created Google Doc '{title}' (ID: {doc_id}) for {user_google_email}.{folder_note} "
         f"{content_note} "
         f"Use batch_update_doc with end_of_segment=true to append content. "
         f"Link: {link}"
