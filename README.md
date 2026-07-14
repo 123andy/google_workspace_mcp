@@ -275,6 +275,8 @@ Office files (`.docx`, `.xlsx`, `.pptx`) are ZIP archives, so the ceiling above 
 
 Advanced OAuth 2.1 deployments affected by concurrent client token refreshes can tune FastMCP's early-refresh threshold and client-facing access-token lifetime. See [`.env.oauth21`](.env.oauth21) for the bounded settings, recommended values, and security tradeoffs. These settings reduce how often the race occurs; they do not add a grace period to FastMCP's one-time-use refresh-token rotation.
 
+**Short sign-in URLs** (this fork): the ~800-character Google authorization URL in an auth prompt is replaced by `{external_base}/auth/{handle}` (~60 chars), the same claim-check trick as `/dl`. The full URL is held Fernet-encrypted in the shared KV store under a random 128-bit handle with the OAuth state's TTL (10 min); `/auth/{handle}` 302-redirects to it. The stored value is validated as an `https://accounts.google.com` URL on both store and load, so the route cannot become an open redirect. Falls back to the full URL when no store is usable. `WORKSPACE_MCP_SHORT_AUTH_URLS=false` disables it.
+
 ## Security Best Practices
 
 By default this server sends no data anywhere except Google's APIs, using your own OAuth client credentials - no usage reporting, analytics, license server, or SaaS dependency. MIT licensed with no CLA, no dual licensing, and no copyleft in the dependency chain. The full security posture - scope minimization, sensitive-path blocking, stateless mode - is documented at [workspacemcp.com](https://workspacemcp.com/privacy?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=security-privacy).
