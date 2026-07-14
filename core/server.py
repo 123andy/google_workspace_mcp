@@ -37,6 +37,7 @@ from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
     FileResponse,
+    RedirectResponse,
     Response,
     StreamingResponse,
 )
@@ -619,6 +620,26 @@ async def serve_short_download(request: Request):
             {"error": "Invalid or expired download link"}, status_code=403
         )
     return await _stream_download_for_claims(claims)
+
+
+@server.custom_route("/auth/{handle}", methods=["GET"])
+async def serve_short_auth_url(request: Request):
+    """Short claim-check redirect for a Google authorization URL.
+
+    The handle is a random 128-bit capability referencing a full ~800-char
+    authorization URL stored in the shared KV store with the OAuth state's TTL
+    (see ``core.auth_handles``). We 302-redirect to it. ``load_auth_url_ref``
+    only ever returns a validated ``https://accounts.google.com`` URL, so this
+    cannot become an open redirect.
+    """
+    from core.auth_handles import load_auth_url_ref
+
+    auth_url = await load_auth_url_ref(request.path_params["handle"])
+    if not auth_url:
+        return JSONResponse(
+            {"error": "Invalid or expired sign-in link"}, status_code=403
+        )
+    return RedirectResponse(url=auth_url, status_code=302)
 
 
 async def _stream_download_for_claims(claims: dict):

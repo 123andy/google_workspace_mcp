@@ -1258,6 +1258,15 @@ With this enabled, the download tools return a short-lived **signed URL** instea
 
 > **Limitation (OAuth 2.1 proxy mode):** the credential the route recovers carries no refresh token, so once the underlying Google access token expires the route cannot renew it. The URL's TTL is therefore clamped to the token's remaining life, and an already-expired credential returns a retryable `401 {"error": "credentials expired - re-authenticate"}` (re-running the tool mints a fresh URL) instead of a generic failure.
 
+### Short sign-in URLs
+
+The Google authorization URL an auth prompt hands the user runs ~800 characters (scopes + PKCE challenge + state + `redirect_uri`). Rendering it as a markdown hyperlink hides the length, but a plain-text client still shows the whole thing and a model can corrupt it when it retypes the link. Enabled by default, this applies the same claim-check trick as the `/dl` short download URLs:
+
+- The full authorization URL is stored server-side in the shared KV store (`core.auth_handles`), Fernet-encrypted, under a random 128-bit handle with the OAuth state's TTL (10 min). The user receives `{external_base}/auth/{handle}` (~60 chars); the `/auth/{handle}` route 302-redirects to the stored URL.
+- The stored value is validated as an `https://accounts.google.com` URL on both store and load, so `/auth/{handle}` can never become an open redirect.
+- Falls back automatically to the full authorization URL when no shared store is usable (e.g. multi-replica without a backend), so it always works.
+- `WORKSPACE_MCP_SHORT_AUTH_URLS` — default `true`; set `false` to always emit the full authorization URL.
+
 ### OAuth Proxy Storage Backends
 
 The server supports pluggable storage backends for OAuth proxy state management via FastMCP 2.13.0+. Choose a backend based on your deployment needs.
