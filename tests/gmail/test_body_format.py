@@ -661,6 +661,7 @@ async def test_get_gmail_message_full_http_returns_url(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_get_gmail_message_full_blocked_in_stateless_mode(monkeypatch):
     monkeypatch.setattr("auth.oauth_config.is_stateless_mode", lambda: True)
+    monkeypatch.delenv("WORKSPACE_ALLOW_FULL_MESSAGE_ON_DISK", raising=False)
     service = _build_service(
         message_responses={("msg-6", "metadata"): _metadata_response("msg-6")}
     )
@@ -674,6 +675,39 @@ async def test_get_gmail_message_full_blocked_in_stateless_mode(monkeypatch):
 
     assert "stateless mode" in result.lower()
     assert "get_gmail_message_content" in result
+
+
+@pytest.mark.asyncio
+async def test_get_gmail_message_full_stateless_override_allows_disk(
+    monkeypatch, tmp_path
+):
+    """Local escape hatch: the env flag re-enables disk delivery under stateless mode."""
+    import core.attachment_storage as attachment_storage
+
+    monkeypatch.setattr(attachment_storage, "STORAGE_DIR", tmp_path)
+    monkeypatch.setattr(attachment_storage, "_attachment_storage", None)
+    monkeypatch.setattr("core.config.get_transport_mode", lambda: "stdio")
+    monkeypatch.setattr("auth.oauth_config.is_stateless_mode", lambda: True)
+    monkeypatch.setenv("WORKSPACE_ALLOW_FULL_MESSAGE_ON_DISK", "true")
+
+    service = _build_service(
+        message_responses={
+            ("msg-13", "metadata"): _metadata_response("msg-13"),
+            ("msg-13", "raw"): {"raw": _encode("full body via override")},
+        }
+    )
+
+    result = await _unwrap(get_gmail_message_full)(
+        service=service,
+        message_id="msg-13",
+        user_google_email="user@example.com",
+        deliver_as="eml",
+    )
+
+    assert "stateless mode" not in result.lower()
+    assert "--- FULL MESSAGE EXPORT ---" in result
+    with open(_saved_path(result), "rb") as fh:
+        assert fh.read().decode() == "full body via override"
 
 
 @pytest.mark.asyncio

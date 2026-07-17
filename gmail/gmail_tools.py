@@ -1570,6 +1570,8 @@ async def get_gmail_message_full(
         str: A summary (subject, sender, recipients, size) plus the download URL or file
             path for the saved file. The message body itself is NOT included in the response.
     """
+    import os
+
     from auth.oauth_config import is_stateless_mode
     from core.attachment_storage import get_attachment_storage, get_attachment_url
     from core.config import get_transport_mode
@@ -1579,13 +1581,20 @@ async def get_gmail_message_full(
         f"Email: '{user_google_email}', deliver_as='{deliver_as}'"
     )
 
-    # This tool exists to write the full message to disk; stateless deployments
-    # have no persistent storage (and the callback-served URL is per-process), so
-    # there is nothing sensible to return. Steer callers to the inline tool.
-    if is_stateless_mode():
+    # This tool writes the full message to disk; stateless deployments normally have
+    # no persistent storage (and the callback-served URL is per-process), so there is
+    # nothing sensible to return. LOCAL OVERRIDE: a single-worker self-hosted instance
+    # does have working disk + in-process attachment routing, so allow an explicit
+    # opt-in to use it anyway. (Not part of upstream PR #939, which keeps the strict
+    # guard.)
+    allow_on_disk = (
+        os.getenv("WORKSPACE_ALLOW_FULL_MESSAGE_ON_DISK", "false").lower() == "true"
+    )
+    if is_stateless_mode() and not allow_on_disk:
         return (
             "Error: get_gmail_message_full is unavailable in stateless mode "
-            "(no persistent file storage). Use get_gmail_message_content instead "
+            "(no persistent file storage). Set WORKSPACE_ALLOW_FULL_MESSAGE_ON_DISK=true "
+            "to enable it on a single-worker deployment, or use get_gmail_message_content "
             "(note it truncates bodies at 20,000 characters)."
         )
 
