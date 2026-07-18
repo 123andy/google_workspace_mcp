@@ -816,7 +816,8 @@ cp .env.oauth21 .env
 | <sub>`get_gmail_message_content`</sub> | <sub>Core</sub> | <sub>Retrieve message content</sub> |
 | <sub>`get_gmail_messages_content_batch`</sub> | <sub>Core</sub> | <sub>Batch retrieve message content</sub> |
 | <sub>`send_gmail_message`</sub> | <sub>Core</sub> | <sub>Send emails</sub> |
-| <sub>`send_draft`</sub> | <sub>Core</sub> | <sub>Send an existing draft by ID (compose-then-send split)</sub> |
+| <sub>`send_draft`</sub> | <sub>Core</sub> | <sub>Send an existing draft by draft ID or (edit-proof) thread ID</sub> |
+| <sub>`list_drafts`</sub> | <sub>Extended</sub> | <sub>List drafts with IDs + metadata (recover/dedup/select)</sub> |
 | <sub>`get_gmail_message_full`</sub> | <sub>Extended</sub> | <sub>Export complete untruncated message to a file/URL</sub> |
 | <sub>`get_gmail_thread_content`</sub> | <sub>Extended</sub> | <sub>Get full thread content</sub> |
 | <sub>`modify_gmail_message_labels`</sub> | <sub>Extended</sub> | <sub>Modify message labels</sub> |

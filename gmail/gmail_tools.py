@@ -2881,33 +2881,83 @@ async def send_draft(
     service,
     user_google_email: str,
     draft_id: Annotated[
-        str,
+        Optional[str],
         Field(
             description=(
                 "The ID of an existing Gmail draft to send (as returned by "
-                "draft_gmail_message). The draft is sent exactly as composed — including "
-                "its recipients, body, and attachments."
+                "draft_gmail_message). NOTE: a draft_id goes stale if the draft is edited "
+                "in the Gmail UI afterward — prefer thread_id for a handle that survives "
+                "edits. Provide exactly one of draft_id or thread_id."
             ),
         ),
-    ],
+    ] = None,
+    thread_id: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Send the unique draft in this Gmail thread. Unlike draft_id, a thread_id "
+                "is stable across edits made to the draft in the Gmail UI, so this is the "
+                "robust way to send a draft the user may have edited. Errors if the thread "
+                "has zero or more than one draft. Provide exactly one of draft_id or thread_id."
+            ),
+        ),
+    ] = None,
 ) -> str:
     """
-    Sends an existing Gmail draft by its ID.
+    Sends an existing Gmail draft, by draft_id or (edit-proof) thread_id.
 
     This is the "commit" half of a compose-then-send split: a draft is composed
-    separately (draft_gmail_message, which can attach Drive files and reply within a
-    thread), reviewed, and then sent here. Sending requires the gmail.compose scope
-    (drafts.send is not covered by gmail.send). Drafts live in the account, so a draft
-    composed under one profile can be sent here as long as this profile authenticates
-    as the same Google account.
+    separately (draft_gmail_message, which can attach Drive files, reply, or forward),
+    reviewed, and then sent here. Sending requires the gmail.compose scope (drafts.send
+    is not covered by gmail.send). Drafts live in the account, so a draft composed under
+    one profile can be sent here as long as this profile authenticates as the same
+    Google account.
+
+    **Edit safety:** a draft's draft_id and message_id both change if the draft is edited
+    in the Gmail UI, but its thread_id does not. Pass thread_id to send whatever the
+    current draft in that thread is — the reliable choice when a human may have edited it.
 
     Args:
-        draft_id (str): The unique ID of the Gmail draft to send.
+        draft_id (Optional[str]): The draft to send. Stale if the draft was edited.
+        thread_id (Optional[str]): Send the unique draft in this thread (edit-proof).
         user_google_email (str): The user's Google email address. Required.
 
     Returns:
         str: Confirmation with the sent message's ID and thread ID.
     """
+    if bool(draft_id) == bool(thread_id):
+        raise UserInputError(
+            "Provide exactly one of 'draft_id' or 'thread_id'. Prefer 'thread_id' — it "
+            "survives edits made to the draft in the Gmail UI."
+        )
+
+    if thread_id:
+        # Re-resolve the live draft in the thread at send time. drafts.list returns each
+        # draft's message.threadId, so we can match without extra get() calls.
+        logger.info(
+            f"[send_draft] Resolving draft in thread '{thread_id}' for '{user_google_email}'"
+        )
+        drafts_resp = await asyncio.to_thread(
+            service.users().drafts().list(userId="me", maxResults=500).execute
+        )
+        matches = [
+            d
+            for d in drafts_resp.get("drafts", [])
+            if d.get("message", {}).get("threadId") == thread_id
+        ]
+        if not matches:
+            raise UserInputError(
+                f"No draft found in thread '{thread_id}'. It may have already been sent "
+                "or discarded."
+            )
+        if len(matches) > 1:
+            ids = ", ".join(d.get("id", "?") for d in matches)
+            raise UserInputError(
+                f"Thread '{thread_id}' has {len(matches)} drafts ({ids}); ambiguous. "
+                "Pass a specific draft_id."
+            )
+        draft_id = matches[0].get("id")
+
     logger.info(
         f"[send_draft] Invoked. Draft ID: '{draft_id}', Email: '{user_google_email}'"
     )
@@ -2916,12 +2966,101 @@ async def send_draft(
         service.users().drafts().send(userId="me", body={"id": draft_id}).execute
     )
     message_id = sent.get("id")
-    thread_id = sent.get("threadId")
+    sent_thread_id = sent.get("threadId")
     logger.info(f"[send_draft] Draft {draft_id} sent as message {message_id}.")
     return (
         f"Draft {draft_id} sent for {user_google_email}. "
-        f"Message ID: {message_id}, Thread ID: {thread_id}."
+        f"Message ID: {message_id}, Thread ID: {sent_thread_id}."
     )
+
+
+@server.tool(
+    title="List Gmail Drafts",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("list_drafts", is_read_only=True, service_type="gmail")
+@require_google_service("gmail", "gmail_read")
+async def list_drafts(
+    service,
+    user_google_email: str,
+    max_results: Annotated[
+        int,
+        Field(
+            description="Maximum number of drafts to return (default 25).",
+        ),
+    ] = 25,
+) -> str:
+    """
+    Lists the user's Gmail drafts with identifying metadata.
+
+    For each draft returns its Draft ID, **Thread ID** (the edit-proof handle to pass to
+    send_draft), recipient, subject, and a snippet — enough to disambiguate drafts that
+    share a subject and to recover a draft not created in this session. Useful before
+    send_draft (to pick/confirm the right draft, or detect duplicates in a thread).
+
+    Args:
+        max_results (int): Maximum number of drafts to return. Defaults to 25.
+        user_google_email (str): The user's Google email address. Required.
+
+    Returns:
+        str: A list of drafts with Draft ID, Thread ID, To, Subject, and snippet.
+    """
+    logger.info(
+        f"[list_drafts] Invoked. Email: '{user_google_email}', max_results={max_results}"
+    )
+
+    drafts_resp = await asyncio.to_thread(
+        service.users().drafts().list(userId="me", maxResults=max_results).execute
+    )
+    drafts = drafts_resp.get("drafts", [])
+    if not drafts:
+        return "No drafts found."
+
+    lines = [f"Found {len(drafts)} draft(s):"]
+    for d in drafts:
+        draft_id = d.get("id")
+        thread_id = d.get("message", {}).get("threadId")
+        subject = "(no subject)"
+        to = ""
+        snippet = ""
+        try:
+            meta = await asyncio.to_thread(
+                service.users()
+                .drafts()
+                .get(
+                    userId="me",
+                    id=draft_id,
+                    format="metadata",
+                    metadataHeaders=["Subject", "To"],
+                )
+                .execute
+            )
+            message = meta.get("message", {})
+            headers = _extract_headers(
+                message.get("payload", {}), ["Subject", "To"]
+            )
+            subject = headers.get("Subject") or subject
+            to = headers.get("To", "")
+            snippet = message.get("snippet", "")
+        except Exception as exc:  # metadata is best-effort; still list the ids
+            logger.debug(f"[list_drafts] Could not read metadata for {draft_id}: {exc}")
+
+        lines.append(
+            f"- Draft ID: {draft_id} | Thread ID: {thread_id}\n"
+            f"    To: {to or '(none)'} | Subject: {subject}\n"
+            f"    {snippet[:140]}"
+        )
+
+    lines.append(
+        "\nTo send one: send_draft(thread_id='<Thread ID>') (survives Gmail-UI edits) "
+        "or send_draft(draft_id='<Draft ID>')."
+    )
+    return "\n".join(lines)
 
 
 @server.tool(
@@ -3256,10 +3395,22 @@ async def draft_gmail_message(
         num_retries=GOOGLE_API_WRITE_RETRIES,
     )
     draft_id = created_draft.get("id")
+    created_message = created_draft.get("message", {})
+    message_id = created_message.get("id")
+    result_thread_id = created_message.get("threadId")
     attachment_info = _format_attachment_result(
         attached_count, requested_attachment_count
     )
-    return f"Draft created{attachment_info}! Draft ID: {draft_id}"
+    # Return the thread_id too: it's the only handle that survives a later edit in the
+    # Gmail UI (the draft_id and message_id both rotate on edit), so send_draft can
+    # re-resolve the live draft by thread. See send_draft.
+    return (
+        f"Draft created{attachment_info}! Draft ID: {draft_id}, "
+        f"Message ID: {message_id}, Thread ID: {result_thread_id}. "
+        f"To send later, prefer send_draft(thread_id='{result_thread_id}') — it survives "
+        f"edits made to the draft in Gmail; send_draft(draft_id='{draft_id}') works only "
+        f"if the draft is not edited first."
+    )
 
 
 def _format_thread_content(
