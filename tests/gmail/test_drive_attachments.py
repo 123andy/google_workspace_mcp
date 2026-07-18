@@ -29,8 +29,9 @@ def test_drive_attachment_downloaded_as_binary():
         {"name": "report.pdf", "mimeType": "application/pdf"},
         media=b"%PDF-bytes",
     )
-    with patch("gmail.gmail_tools.build", return_value=drive), patch(
-        "gmail.gmail_tools.get_transport_mode", return_value="streamable-http"
+    with (
+        patch("gmail.gmail_tools.build", return_value=drive),
+        patch("gmail.gmail_tools.get_transport_mode", return_value="streamable-http"),
     ):
         resolved, links = asyncio.run(
             _resolve_drive_attachments(Mock(), [{"drive_file_id": "f1"}])
@@ -48,8 +49,9 @@ def test_native_drive_file_exported_to_pdf():
         {"name": "Spec", "mimeType": "application/vnd.google-apps.document"},
         export=b"%PDF-export",
     )
-    with patch("gmail.gmail_tools.build", return_value=drive), patch(
-        "gmail.gmail_tools.get_transport_mode", return_value="streamable-http"
+    with (
+        patch("gmail.gmail_tools.build", return_value=drive),
+        patch("gmail.gmail_tools.get_transport_mode", return_value="streamable-http"),
     ):
         resolved, links = asyncio.run(
             _resolve_drive_attachments(Mock(), [{"drive_file_id": "doc1"}])
@@ -70,8 +72,9 @@ def test_drive_attachment_as_link_goes_to_body():
             "webViewLink": "https://drive.google.com/file/d/deck1/view",
         }
     )
-    with patch("gmail.gmail_tools.build", return_value=drive), patch(
-        "gmail.gmail_tools.get_transport_mode", return_value="streamable-http"
+    with (
+        patch("gmail.gmail_tools.build", return_value=drive),
+        patch("gmail.gmail_tools.get_transport_mode", return_value="streamable-http"),
     ):
         resolved, links = asyncio.run(
             _resolve_drive_attachments(
@@ -80,14 +83,14 @@ def test_drive_attachment_as_link_goes_to_body():
         )
 
     assert resolved == []  # nothing attached as bytes
-    assert links == [{"name": "Deck", "url": "https://drive.google.com/file/d/deck1/view"}]
+    assert links == [
+        {"name": "Deck", "url": "https://drive.google.com/file/d/deck1/view"}
+    ]
 
 
 def test_local_path_rejected_in_remote_mode():
     """A local 'path' attachment becomes an error entry when running remotely."""
-    with patch(
-        "gmail.gmail_tools.get_transport_mode", return_value="streamable-http"
-    ):
+    with patch("gmail.gmail_tools.get_transport_mode", return_value="streamable-http"):
         resolved, links = asyncio.run(
             _resolve_drive_attachments(Mock(), [{"path": "/tmp/secret.pdf"}])
         )

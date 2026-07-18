@@ -92,7 +92,11 @@ class _HTMLTextExtractor(HTMLParser):
         self._skip = False
 
     def handle_starttag(self, tag, attrs):
-        self._skip = tag in ("script", "style")
+        if tag in ("script", "style"):
+            self._skip = True
+            return
+        if tag == "br" and not self._skip:
+            self._text.append(" ")
 
     def handle_endtag(self, tag):
         if tag in ("script", "style"):
@@ -1116,7 +1120,9 @@ async def _resolve_drive_attachments(
                     .get_media(fileId=drive_file_id, supportsAllDrives=True)
                     .execute
                 )
-                resolved_mime = att.get("mime_type") or source_mime or "application/octet-stream"
+                resolved_mime = (
+                    att.get("mime_type") or source_mime or "application/octet-stream"
+                )
         except Exception as exc:
             logger.exception("Failed to download Drive file %s", drive_file_id)
             resolved.append(_build_attachment_error_entry(att, exc))
@@ -1145,7 +1151,7 @@ def _append_drive_links_to_body(
         # the recipient's mail client (a Drive file can be named e.g. "><script>...).
         items = "".join(
             f'<li><a href="{html.escape(ln["url"], quote=True)}">'
-            f'{html.escape(ln["name"])}</a></li>'
+            f"{html.escape(ln['name'])}</a></li>"
             for ln in link_lines
         )
         return f"{body}<p>Attached Drive files:</p><ul>{items}</ul>"
@@ -2527,6 +2533,7 @@ async def send_gmail_message(
         in_reply_to (Optional[str]): Optional RFC Message-ID of the message being replied to (e.g., '<message123@gmail.com>').
         references (Optional[str]): Optional chain of RFC Message-IDs for proper threading (e.g., '<msg1@gmail.com> <msg2@gmail.com>').
         include_signature (bool): Whether to append Gmail signature HTML from send-as settings.
+            Also honored when forwarding (the signature is appended after the quoted message).
             When include_signature is true and Gmail signature retrieval fails for benign reasons
             (e.g., missing gmail.settings.basic scope), the send proceeds without a signature.
             Non-benign failures such as quota/rate-limit or API errors raise ToolError and abort
@@ -2627,6 +2634,7 @@ async def send_gmail_message(
             forward_message=body,
             forward_message_format=body_format,
             include_attachments=include_forwarded_attachments,
+            include_signature=include_signature,
             cc=cc,
             bcc=bcc,
             from_name=from_name,
@@ -2716,7 +2724,6 @@ async def send_gmail_message(
     return f"Email sent! Message ID: {message_id}"
 
 
-# Internal implementation function for testing
 async def _build_forward_message(
     service,
     message_id: str,
@@ -2725,7 +2732,7 @@ async def _build_forward_message(
     forward_message: Optional[str] = None,
     forward_message_format: Literal["plain", "html"] = "plain",
     include_attachments: bool = True,
-) -> Tuple[str, str, str, List[Dict[str, Any]]]:
+) -> tuple[str, str, str, List[Dict[str, Any]]]:
     """Fetch a message and build a forward of it.
 
     Returns ``(forward_subject, forward_body, body_format, attachments)`` where
@@ -2805,6 +2812,7 @@ async def _forward_gmail_message_impl(
     forward_message: Optional[str] = None,
     forward_message_format: Literal["plain", "html"] = "plain",
     include_attachments: bool = True,
+    include_signature: bool = True,
     cc: Optional[str] = None,
     bcc: Optional[str] = None,
     from_name: Optional[str] = None,
@@ -2814,21 +2822,33 @@ async def _forward_gmail_message_impl(
     """Build and send a forward of an existing Gmail message.
 
     Shared by send_gmail_message's forward path. An explicit ``subject`` overrides
-    the auto-derived 'Fwd: <original subject>'.
+    the auto-derived 'Fwd: <original subject>'. When ``include_signature`` is true
+    the sender's Gmail signature is appended after the quoted message, matching
+    Gmail's default forward layout.
     """
-    forward_subject, forward_body, body_format, attachments_to_send = (
-        await _build_forward_message(
-            service,
-            message_id,
-            subject=subject,
-            forward_message=forward_message,
-            forward_message_format=forward_message_format,
-            include_attachments=include_attachments,
-        )
+    (
+        forward_subject,
+        forward_body,
+        body_format,
+        attachments_to_send,
+    ) = await _build_forward_message(
+        service,
+        message_id,
+        subject=subject,
+        forward_message=forward_message,
+        forward_message_format=forward_message_format,
+        include_attachments=include_attachments,
     )
 
     # Prepare and send the message
     sender_email = from_email or user_google_email
+    if include_signature:
+        signature_html = await _get_send_as_signature_html_for_tool(
+            service, from_email=sender_email
+        )
+        forward_body = _append_signature_to_body(
+            forward_body, body_format, signature_html
+        )
     raw_message, _, attached_count, attachment_errors = _prepare_gmail_message(
         subject=forward_subject,
         body=forward_body,
@@ -2875,9 +2895,9 @@ async def _forward_gmail_message_impl(
         openWorldHint=True,
     ),
 )
-@handle_http_errors("send_draft", service_type="gmail")
-@require_google_service("gmail", "gmail_compose")
-async def send_draft(
+@handle_http_errors("send_gmail_draft", service_type="gmail")
+@require_google_service("gmail", GMAIL_COMPOSE_SCOPE)
+async def send_gmail_draft(
     service,
     user_google_email: str,
     draft_id: Annotated[
@@ -2933,18 +2953,29 @@ async def send_draft(
 
     if thread_id:
         # Re-resolve the live draft in the thread at send time. drafts.list returns each
-        # draft's message.threadId, so we can match without extra get() calls.
+        # draft's message.threadId, so we can match without extra get() calls. Paginate so
+        # accounts with many drafts don't yield a false "no draft found"; stop early once
+        # the result is already ambiguous.
         logger.info(
-            f"[send_draft] Resolving draft in thread '{thread_id}' for '{user_google_email}'"
+            f"[send_gmail_draft] Resolving draft in thread '{thread_id}' for '{user_google_email}'"
         )
-        drafts_resp = await asyncio.to_thread(
-            service.users().drafts().list(userId="me", maxResults=500).execute
-        )
-        matches = [
-            d
-            for d in drafts_resp.get("drafts", [])
-            if d.get("message", {}).get("threadId") == thread_id
-        ]
+        matches = []
+        page_token = None
+        while True:
+            drafts_resp = await asyncio.to_thread(
+                service.users()
+                .drafts()
+                .list(userId="me", maxResults=500, pageToken=page_token)
+                .execute
+            )
+            matches.extend(
+                d
+                for d in drafts_resp.get("drafts", [])
+                if d.get("message", {}).get("threadId") == thread_id
+            )
+            page_token = drafts_resp.get("nextPageToken")
+            if len(matches) > 1 or not page_token:
+                break
         if not matches:
             raise UserInputError(
                 f"No draft found in thread '{thread_id}'. It may have already been sent "
@@ -2959,15 +2990,16 @@ async def send_draft(
         draft_id = matches[0].get("id")
 
     logger.info(
-        f"[send_draft] Invoked. Draft ID: '{draft_id}', Email: '{user_google_email}'"
+        f"[send_gmail_draft] Invoked. Draft ID: '{draft_id}', Email: '{user_google_email}'"
     )
 
     sent = await asyncio.to_thread(
-        service.users().drafts().send(userId="me", body={"id": draft_id}).execute
+        service.users().drafts().send(userId="me", body={"id": draft_id}).execute,
+        num_retries=GOOGLE_API_WRITE_RETRIES,
     )
     message_id = sent.get("id")
     sent_thread_id = sent.get("threadId")
-    logger.info(f"[send_draft] Draft {draft_id} sent as message {message_id}.")
+    logger.info(f"[send_gmail_draft] Draft {draft_id} sent as message {message_id}.")
     return (
         f"Draft {draft_id} sent for {user_google_email}. "
         f"Message ID: {message_id}, Thread ID: {sent_thread_id}."
@@ -2999,9 +3031,9 @@ async def list_drafts(
     Lists the user's Gmail drafts with identifying metadata.
 
     For each draft returns its Draft ID, **Thread ID** (the edit-proof handle to pass to
-    send_draft), recipient, subject, and a snippet — enough to disambiguate drafts that
-    share a subject and to recover a draft not created in this session. Useful before
-    send_draft (to pick/confirm the right draft, or detect duplicates in a thread).
+    send_gmail_draft), recipient, subject, and a snippet — enough to disambiguate drafts
+    that share a subject and to recover a draft not created in this session. Useful before
+    send_gmail_draft (to pick/confirm the right draft, or detect duplicates in a thread).
 
     Args:
         max_results (int): Maximum number of drafts to return. Defaults to 25.
@@ -3041,9 +3073,7 @@ async def list_drafts(
                 .execute
             )
             message = meta.get("message", {})
-            headers = _extract_headers(
-                message.get("payload", {}), ["Subject", "To"]
-            )
+            headers = _extract_headers(message.get("payload", {}), ["Subject", "To"])
             subject = headers.get("Subject") or subject
             to = headers.get("To", "")
             snippet = message.get("snippet", "")
@@ -3057,8 +3087,8 @@ async def list_drafts(
         )
 
     lines.append(
-        "\nTo send one: send_draft(thread_id='<Thread ID>') (survives Gmail-UI edits) "
-        "or send_draft(draft_id='<Draft ID>')."
+        "\nTo send one: send_gmail_draft(thread_id='<Thread ID>') (survives Gmail-UI "
+        "edits) or send_gmail_draft(draft_id='<Draft ID>')."
     )
     return "\n".join(lines)
 
@@ -3158,7 +3188,7 @@ async def draft_gmail_message(
     forward_message_id: Annotated[
         Optional[str],
         Field(
-            description="Set to a Gmail message ID to draft a FORWARD of that message. The original subject, quoted body, and (optionally) attachments are carried over; 'body' becomes an optional note prepended above the forward. The result is a normal draft — nothing is sent until send_draft is called.",
+            description="Set to a Gmail message ID to draft a FORWARD of that message. The original subject, quoted body, and (optionally) attachments are carried over; 'body' becomes an optional note prepended above the forward. The result is a normal draft — nothing is sent until send_gmail_draft is called.",
         ),
     ] = None,
     include_forwarded_attachments: Annotated[
@@ -3175,12 +3205,12 @@ async def draft_gmail_message(
 
     To draft a forward, pass forward_message_id: the original subject, quoted body, and
     (optionally) attachments are carried over, and 'body' (if any) becomes a note
-    prepended above the forward. The draft is not sent until send_draft is called.
+    prepended above the forward. The draft is not sent until send_gmail_draft is called.
 
     Args:
         user_google_email (str): The user's Google email address. Required for authentication.
-        subject (str): Email subject.
-        body (str): Email body (plain text).
+        subject (Optional[str]): Email subject. Optional when forwarding (defaults to 'Fwd: <original subject>').
+        body (Optional[str]): Email body. When forwarding, an optional note prepended above the quoted original.
         body_format (Literal['plain', 'html']): Email body format. Defaults to 'plain'.
         to (Optional[str]): Optional recipient email address. Can be left empty for drafts.
         cc (Optional[str]): Optional CC email address.
@@ -3209,6 +3239,7 @@ async def draft_gmail_message(
                 it as a binary attachment
               - 'filename'/'mime_type' (optional): overrides for the binary case
         include_signature (bool): Whether to append Gmail signature HTML from send-as settings.
+            Also honored when forwarding (the signature is appended after the quoted message).
             When include_signature is true and Gmail signature retrieval fails for benign reasons
             (e.g., missing gmail.settings.basic scope), the draft proceeds without a signature.
             Non-benign failures such as quota/rate-limit or API errors raise ToolError and abort
@@ -3216,9 +3247,15 @@ async def draft_gmail_message(
         quote_original (bool): Whether to include the original message as a quoted reply.
             Requires thread_id to be provided. When enabled, fetches the original message
             and appends it below the signature. Defaults to False.
+        forward_message_id (Optional[str]): Gmail message ID to draft a FORWARD of. The
+            original subject, quoted body, and (optionally) attachments are carried over,
+            and 'body' becomes a note prepended above the forward.
+        include_forwarded_attachments (bool): When forwarding, whether to carry over the
+            original message's attachments. Ignored unless forward_message_id is set.
 
     Returns:
-        str: Confirmation message with the created draft's ID.
+        str: Confirmation with the created draft's ID, message ID, and thread ID (pass the
+            thread ID to send_gmail_draft — it survives edits made to the draft).
 
     Examples:
         # Create a new draft
@@ -3283,18 +3320,29 @@ async def draft_gmail_message(
 
     if forward_message_id:
         # Forward draft: build the subject, quoted body, and carried-over attachments
-        # from the original ('body' becomes an optional prepended note). Reply/quote/
-        # signature composition does not apply to a forward.
-        subject, draft_body, body_format, forwarded_attachments = (
-            await _build_forward_message(
-                service,
-                forward_message_id,
-                subject=subject,
-                forward_message=body,
-                forward_message_format=body_format,
-                include_attachments=include_forwarded_attachments,
-            )
+        # from the original ('body' becomes an optional prepended note). Reply/quote
+        # composition does not apply to a forward; the signature is appended after
+        # the quoted message, matching Gmail's default forward layout.
+        (
+            subject,
+            draft_body,
+            body_format,
+            forwarded_attachments,
+        ) = await _build_forward_message(
+            service,
+            forward_message_id,
+            subject=subject,
+            forward_message=body,
+            forward_message_format=body_format,
+            include_attachments=include_forwarded_attachments,
         )
+        if include_signature:
+            signature_html = await _get_send_as_signature_html_for_tool(
+                service, from_email=sender_email
+            )
+            draft_body = _append_signature_to_body(
+                draft_body, body_format, signature_html
+            )
     else:
         subject = subject or ""
         draft_body = body or ""
@@ -3374,8 +3422,11 @@ async def draft_gmail_message(
         )
     )
 
-    # Drive links are delivered in the body, not as MIME parts, so don't count them.
-    requested_attachment_count = len(attachments or []) - len(drive_link_lines)
+    # Count explicit attachments plus any carried over from a forward; Drive links
+    # are delivered in the body, not as MIME parts, so don't count them.
+    requested_attachment_count = (
+        len(attachments or []) - len(drive_link_lines) + len(forwarded_attachments)
+    )
     if requested_attachment_count > 0 and attached_count == 0:
         details = (
             f" Details: {'; '.join(attachment_errors)}" if attachment_errors else ""
@@ -3384,10 +3435,25 @@ async def draft_gmail_message(
             "No valid attachments were added. Verify each attachment path/content and retry."
             f"{details}"
         )
+    # Forwarded attachments were already fetched, so a partial attach means one was
+    # dropped at MIME-build time — fail loudly rather than draft a partial forward
+    # (mirrors the send-forward path).
+    if forwarded_attachments and attached_count != requested_attachment_count:
+        details = (
+            f" Details: {'; '.join(attachment_errors)}" if attachment_errors else ""
+        )
+        raise UserInputError(
+            "Failed to include all requested attachment(s): "
+            f"{attached_count}/{requested_attachment_count} attached.{details}"
+        )
 
-    # Create a draft instead of sending. Keep reply threading in the raw
-    # headers; setting message.threadId here can create Gmail UI-hidden drafts.
+    # Create a draft instead of sending. Gmail requires message.threadId plus
+    # RFC-compliant In-Reply-To/References headers to add a draft to a thread.
+    # If we could not derive the headers, fall back to an unthreaded draft
+    # instead of sending an invalid thread request.
     draft_body = {"message": {"raw": raw_message}}
+    if thread_id and in_reply_to and references:
+        draft_body["message"]["threadId"] = thread_id
 
     # Create the draft
     created_draft = await asyncio.to_thread(
@@ -3402,15 +3468,19 @@ async def draft_gmail_message(
         attached_count, requested_attachment_count
     )
     # Return the thread_id too: it's the only handle that survives a later edit in the
-    # Gmail UI (the draft_id and message_id both rotate on edit), so send_draft can
-    # re-resolve the live draft by thread. See send_draft.
-    return (
-        f"Draft created{attachment_info}! Draft ID: {draft_id}, "
-        f"Message ID: {message_id}, Thread ID: {result_thread_id}. "
-        f"To send later, prefer send_draft(thread_id='{result_thread_id}') — it survives "
-        f"edits made to the draft in Gmail; send_draft(draft_id='{draft_id}') works only "
-        f"if the draft is not edited first."
-    )
+    # Gmail UI (the draft_id and message_id both rotate on edit), so send_gmail_draft can
+    # re-resolve the live draft by thread. See send_gmail_draft.
+    result = f"Draft created{attachment_info}! Draft ID: {draft_id}"
+    if message_id:
+        result += f", Message ID: {message_id}"
+    if result_thread_id:
+        result += (
+            f", Thread ID: {result_thread_id}. To send later, prefer "
+            f"send_gmail_draft(thread_id='{result_thread_id}') — it survives edits made to "
+            f"the draft in Gmail; send_gmail_draft(draft_id='{draft_id}') works only if the "
+            f"draft is not edited first."
+        )
+    return result
 
 
 def _format_thread_content(

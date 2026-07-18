@@ -1003,9 +1003,7 @@ async def _initiate_resumable_upload_session(
 
     status = int(response.status)
     if status not in (200, 201):
-        raise Exception(
-            f"Failed to initiate resumable upload session (HTTP {status})."
-        )
+        raise Exception(f"Failed to initiate resumable upload session (HTTP {status}).")
     upload_url = response.get("location")
     if not upload_url:
         raise Exception(
@@ -1101,7 +1099,9 @@ async def create_drive_file(
             },
             content_length=content_length,
         )
-        logger.info(f"[create_drive_file] Returned resumable upload URL for '{file_name}'.")
+        logger.info(
+            f"[create_drive_file] Returned resumable upload URL for '{file_name}'."
+        )
         return (
             f"Resumable upload session created for new file '{file_name}' "
             f"(folder '{folder_id}', for {user_google_email}).\n\n"
@@ -2084,7 +2084,11 @@ async def update_drive_file(
                 "pass 'content', 'file_path', or 'file_url'."
             )
         # Apply any metadata-only changes first, then return the upload URL.
-        if "body" in query_params or "addParents" in query_params or "removeParents" in query_params:
+        if (
+            "body" in query_params
+            or "addParents" in query_params
+            or "removeParents" in query_params
+        ):
             await asyncio.to_thread(
                 service.files().update(**query_params).execute, num_retries=0
             )

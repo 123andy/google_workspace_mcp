@@ -217,7 +217,9 @@ async def _fetch_drive(claims: dict, credentials: Credentials) -> DownloadResult
     return DownloadResult(filename=filename, media_type=media_type, stream=body())
 
 
-async def _fetch_gmail_message(claims: dict, credentials: Credentials) -> DownloadResult:
+async def _fetch_gmail_message(
+    claims: dict, credentials: Credentials
+) -> DownloadResult:
     """Fetch a COMPLETE Gmail message (not an attachment) by message id.
 
     ``fmt`` selects the representation: ``eml`` = the raw RFC 5322 message (byte-exact,

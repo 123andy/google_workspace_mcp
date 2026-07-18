@@ -11,6 +11,7 @@ from core.utils import UserInputError
 from gmail.gmail_tools import (
     _extract_message_bodies,
     _format_body_content,
+    _html_to_text,
     get_gmail_message_content,
     get_gmail_message_full,
     get_gmail_messages_content_batch,
@@ -156,6 +157,12 @@ class TestFormatBodyContentTextMode:
         long_html = "<p>" + "x" * 25000 + "</p>"
         result = _format_body_content("", long_html)
         assert "[Content truncated...]" in result
+
+    def test_html_to_text_separates_br_text(self):
+        assert _html_to_text("<div>Best,<br>Alice</div>") == "Best, Alice"
+
+    def test_html_to_text_ignores_br_inside_skipped_tags(self):
+        assert _html_to_text("<script>x<br>y</script><p>Visible</p>") == "Visible"
 
 
 class TestFormatBodyContentHtmlMode:
@@ -842,7 +849,9 @@ async def test_get_gmail_message_full_no_body_errors(stdio_storage):
 
 
 @pytest.mark.asyncio
-async def test_get_gmail_message_full_txt_converts_html_when_no_plaintext(stdio_storage):
+async def test_get_gmail_message_full_txt_converts_html_when_no_plaintext(
+    stdio_storage,
+):
     service = _build_service(
         message_responses={
             ("msg-9", "metadata"): _metadata_response("msg-9"),
