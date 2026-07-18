@@ -1141,8 +1141,12 @@ def _append_drive_links_to_body(
     if not link_lines:
         return body
     if body_format == "html":
+        # Escape the sender-influenced Drive filename/URL to avoid HTML injection in
+        # the recipient's mail client (a Drive file can be named e.g. "><script>...).
         items = "".join(
-            f'<li><a href="{ln["url"]}">{ln["name"]}</a></li>' for ln in link_lines
+            f'<li><a href="{html.escape(ln["url"], quote=True)}">'
+            f'{html.escape(ln["name"])}</a></li>'
+            for ln in link_lines
         )
         return f"{body}<p>Attached Drive files:</p><ul>{items}</ul>"
     lines = "\n".join(f"- {ln['name']}: {ln['url']}" for ln in link_lines)
@@ -2834,6 +2838,64 @@ async def _forward_gmail_message_impl(
         else ""
     )
     return f"Email forwarded{attachment_info}! Message ID: {sent_message_id}"
+
+
+@server.tool(
+    title="Send Gmail Draft",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("send_draft", service_type="gmail")
+@require_google_service("gmail", "gmail_compose")
+async def send_draft(
+    service,
+    user_google_email: str,
+    draft_id: Annotated[
+        str,
+        Field(
+            description=(
+                "The ID of an existing Gmail draft to send (as returned by "
+                "draft_gmail_message). The draft is sent exactly as composed — including "
+                "its recipients, body, and attachments."
+            ),
+        ),
+    ],
+) -> str:
+    """
+    Sends an existing Gmail draft by its ID.
+
+    This is the "commit" half of a compose-then-send split: a draft is composed
+    separately (draft_gmail_message, which can attach Drive files and reply within a
+    thread), reviewed, and then sent here. Sending requires the gmail.compose scope
+    (drafts.send is not covered by gmail.send). Drafts live in the account, so a draft
+    composed under one profile can be sent here as long as this profile authenticates
+    as the same Google account.
+
+    Args:
+        draft_id (str): The unique ID of the Gmail draft to send.
+        user_google_email (str): The user's Google email address. Required.
+
+    Returns:
+        str: Confirmation with the sent message's ID and thread ID.
+    """
+    logger.info(
+        f"[send_draft] Invoked. Draft ID: '{draft_id}', Email: '{user_google_email}'"
+    )
+
+    sent = await asyncio.to_thread(
+        service.users().drafts().send(userId="me", body={"id": draft_id}).execute
+    )
+    message_id = sent.get("id")
+    thread_id = sent.get("threadId")
+    logger.info(f"[send_draft] Draft {draft_id} sent as message {message_id}.")
+    return (
+        f"Draft {draft_id} sent for {user_google_email}. "
+        f"Message ID: {message_id}, Thread ID: {thread_id}."
+    )
 
 
 @server.tool(
