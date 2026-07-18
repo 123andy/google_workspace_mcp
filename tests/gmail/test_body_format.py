@@ -510,6 +510,9 @@ def stdio_storage(monkeypatch, tmp_path):
     monkeypatch.setattr(attachment_storage, "_attachment_storage", None)
     monkeypatch.setattr("core.config.get_transport_mode", lambda: "stdio")
     monkeypatch.setattr("auth.oauth_config.is_stateless_mode", lambda: False)
+    monkeypatch.setattr(
+        "core.attachment_signing.signed_attachment_urls_enabled", lambda: False
+    )
     return tmp_path
 
 
@@ -635,6 +638,9 @@ async def test_get_gmail_message_full_http_returns_url(monkeypatch, tmp_path):
     monkeypatch.setattr("core.config.get_transport_mode", lambda: "streamable-http")
     monkeypatch.setattr("auth.oauth_config.is_stateless_mode", lambda: False)
     monkeypatch.setattr(
+        "core.attachment_signing.signed_attachment_urls_enabled", lambda: False
+    )
+    monkeypatch.setattr(
         attachment_storage,
         "get_attachment_url",
         lambda file_id: f"https://example.test/attachments/{file_id}",
@@ -659,9 +665,11 @@ async def test_get_gmail_message_full_http_returns_url(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_get_gmail_message_full_blocked_in_stateless_mode(monkeypatch):
+async def test_get_gmail_message_full_blocked_in_stateless_without_signed(monkeypatch):
     monkeypatch.setattr("auth.oauth_config.is_stateless_mode", lambda: True)
-    monkeypatch.delenv("WORKSPACE_ALLOW_FULL_MESSAGE_ON_DISK", raising=False)
+    monkeypatch.setattr(
+        "core.attachment_signing.signed_attachment_urls_enabled", lambda: False
+    )
     service = _build_service(
         message_responses={("msg-6", "metadata"): _metadata_response("msg-6")}
     )
@@ -678,36 +686,86 @@ async def test_get_gmail_message_full_blocked_in_stateless_mode(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_get_gmail_message_full_stateless_override_allows_disk(
-    monkeypatch, tmp_path
-):
-    """Local escape hatch: the env flag re-enables disk delivery under stateless mode."""
-    import core.attachment_storage as attachment_storage
+async def test_get_gmail_message_full_returns_signed_url(monkeypatch):
+    """When signed URLs are enabled, the tool returns a signed URL and never fetches
+    or streams the body itself (works under stateless mode)."""
+    import auth.oauth21_session_store as sess
+    import core.attachment_cred_cache as cred_cache
+    import core.attachment_signing as signing
 
-    monkeypatch.setattr(attachment_storage, "STORAGE_DIR", tmp_path)
-    monkeypatch.setattr(attachment_storage, "_attachment_storage", None)
-    monkeypatch.setattr("core.config.get_transport_mode", lambda: "stdio")
     monkeypatch.setattr("auth.oauth_config.is_stateless_mode", lambda: True)
-    monkeypatch.setenv("WORKSPACE_ALLOW_FULL_MESSAGE_ON_DISK", "true")
+    monkeypatch.setattr(signing, "signed_attachment_urls_enabled", lambda: True)
+    monkeypatch.setattr(signing, "clamp_ttl_to_expiry", lambda expiry: 600)
 
+    captured = {}
+
+    async def fake_build_download_url(**kwargs):
+        captured.update(kwargs)
+        return "https://example.test/attachments/signed/TOKEN123"
+
+    monkeypatch.setattr(signing, "build_download_url", fake_build_download_url)
+
+    async def fake_stash(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(cred_cache, "stash_credentials", fake_stash)
+
+    creds = Mock()
+    creds.expiry = "future"
+    store = Mock()
+    store.get_credentials.return_value = creds
+    monkeypatch.setattr(sess, "get_oauth21_session_store", lambda: store)
+
+    # Only metadata is fetched; a raw/full body fetch would KeyError this service.
     service = _build_service(
-        message_responses={
-            ("msg-13", "metadata"): _metadata_response("msg-13"),
-            ("msg-13", "raw"): {"raw": _encode("full body via override")},
-        }
+        message_responses={("msg-sign", "metadata"): _metadata_response("msg-sign")}
     )
 
     result = await _unwrap(get_gmail_message_full)(
         service=service,
-        message_id="msg-13",
+        message_id="msg-sign",
         user_google_email="user@example.com",
         deliver_as="eml",
     )
 
-    assert "stateless mode" not in result.lower()
-    assert "--- FULL MESSAGE EXPORT ---" in result
-    with open(_saved_path(result), "rb") as fh:
-        assert fh.read().decode() == "full body via override"
+    assert "https://example.test/attachments/signed/TOKEN123" in result
+    assert "signed URL" in result
+    assert captured["source"] == "gmail_message"
+    assert captured["ref"] == {"mid": "msg-sign", "fmt": "eml"}
+
+
+@pytest.mark.asyncio
+async def test_fetch_gmail_message_eml_decodes_raw(monkeypatch):
+    import core.signed_download as sd
+
+    raw = _unpadded("From: a@b\r\n\r\nfull raw message")
+    fake = Mock()
+    fake.users().messages().get().execute.return_value = {"raw": raw}
+    monkeypatch.setattr(sd, "build", lambda *a, **k: fake)
+
+    res = await sd._fetch_gmail_message(
+        {"mid": "m", "fmt": "eml", "fn": "x.eml", "mt": "message/rfc822"}, Mock()
+    )
+
+    assert res.content == b"From: a@b\r\n\r\nfull raw message"
+    assert res.filename == "x.eml"
+    assert res.media_type == "message/rfc822"
+
+
+@pytest.mark.asyncio
+async def test_fetch_gmail_message_html_extracts_body(monkeypatch):
+    import core.signed_download as sd
+
+    fake = Mock()
+    fake.users().messages().get().execute.return_value = {
+        "payload": _payload(text="", html="<p>Rich body</p>")
+    }
+    monkeypatch.setattr(sd, "build", lambda *a, **k: fake)
+
+    res = await sd._fetch_gmail_message({"mid": "m", "fmt": "html"}, Mock())
+
+    assert res.content.decode() == "<p>Rich body</p>"
+    assert res.media_type == "text/html"
 
 
 @pytest.mark.asyncio

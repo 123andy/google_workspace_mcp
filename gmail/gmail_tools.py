@@ -1557,7 +1557,10 @@ async def get_gmail_message_full(
     it. The "html"/"txt" formats decode the body as UTF-8 and drop undecodable bytes, so
     they may not be byte-identical for messages in other charsets.
 
-    This tool writes to disk and is therefore unavailable in stateless mode.
+    Delivery: when signed attachment URLs are enabled the tool returns a short-lived
+    signed URL that streams the message from Gmail on demand (works in stateless mode);
+    otherwise it saves to local storage and returns a URL/path. It is unavailable only in
+    stateless mode with signed URLs disabled (there is nowhere to put the message).
 
     Args:
         message_id (str): The unique ID of the Gmail message to retrieve.
@@ -1570,9 +1573,13 @@ async def get_gmail_message_full(
         str: A summary (subject, sender, recipients, size) plus the download URL or file
             path for the saved file. The message body itself is NOT included in the response.
     """
-    import os
-
     from auth.oauth_config import is_stateless_mode
+    from core.attachment_signing import (
+        build_download_url,
+        clamp_ttl_to_expiry,
+        format_ttl,
+        signed_attachment_urls_enabled,
+    )
     from core.attachment_storage import get_attachment_storage, get_attachment_url
     from core.config import get_transport_mode
 
@@ -1581,24 +1588,7 @@ async def get_gmail_message_full(
         f"Email: '{user_google_email}', deliver_as='{deliver_as}'"
     )
 
-    # This tool writes the full message to disk; stateless deployments normally have
-    # no persistent storage (and the callback-served URL is per-process), so there is
-    # nothing sensible to return. LOCAL OVERRIDE: a single-worker self-hosted instance
-    # does have working disk + in-process attachment routing, so allow an explicit
-    # opt-in to use it anyway. (Not part of upstream PR #939, which keeps the strict
-    # guard.)
-    allow_on_disk = (
-        os.getenv("WORKSPACE_ALLOW_FULL_MESSAGE_ON_DISK", "false").lower() == "true"
-    )
-    if is_stateless_mode() and not allow_on_disk:
-        return (
-            "Error: get_gmail_message_full is unavailable in stateless mode "
-            "(no persistent file storage). Set WORKSPACE_ALLOW_FULL_MESSAGE_ON_DISK=true "
-            "to enable it on a single-worker deployment, or use get_gmail_message_content "
-            "(note it truncates bodies at 20,000 characters)."
-        )
-
-    # Fetch headers first for the summary.
+    # Fetch headers first for the summary / filename.
     message_metadata = await asyncio.to_thread(
         service.users()
         .messages()
@@ -1614,6 +1604,74 @@ async def get_gmail_message_full(
         message_metadata.get("payload", {}), GMAIL_METADATA_HEADERS
     )
     subject = headers.get("Subject", "message") or "message"
+    file_extension = {"eml": ".eml", "html": ".html", "txt": ".txt"}[deliver_as]
+    file_mime = {
+        "eml": "message/rfc822",
+        "html": "text/html",
+        "txt": "text/plain",
+    }[deliver_as]
+
+    # Design A: signed-URL delivery. When enabled, hand back a short-lived signed URL
+    # and let the /attachments/signed route re-fetch the complete message from Gmail
+    # and stream it on demand — nothing on disk, nothing through the model context.
+    # This is the path stateless deployments use (see the "gmail_message" fetcher in
+    # core.signed_download); it also removes any need for local disk.
+    if signed_attachment_urls_enabled():
+        from auth.oauth21_session_store import get_oauth21_session_store
+
+        creds = None
+        try:
+            creds = get_oauth21_session_store().get_credentials(user_google_email)
+        except Exception as cred_exc:
+            logger.debug(
+                f"[get_gmail_message_full] Could not recover credentials: {cred_exc}"
+            )
+
+        eff_ttl = clamp_ttl_to_expiry(creds.expiry) if creds else 0
+        if creds and eff_ttl > 0:
+            download_url = await build_download_url(
+                source="gmail_message",
+                user_email=user_google_email,
+                ref={"mid": message_id, "fmt": deliver_as},
+                filename=f"{subject[:80]}{file_extension}",
+                mime_type=file_mime,
+                ttl_seconds=eff_ttl,
+            )
+            try:
+                from core.attachment_cred_cache import stash_credentials
+
+                await stash_credentials(user_google_email, creds, ttl_seconds=eff_ttl)
+            except Exception as cache_exc:  # best-effort; same-process path still works
+                logger.debug(
+                    f"[get_gmail_message_full] Could not pre-cache credentials: {cache_exc}"
+                )
+            result_lines = _format_message_header_lines(headers)
+            result_lines.append("\n--- FULL MESSAGE EXPORT (signed URL) ---")
+            result_lines.append(f"Format: {deliver_as}")
+            result_lines.append(f"\n📎 Download URL: {download_url}")
+            result_lines.append(
+                "\nThe server streams the complete message directly from Gmail when this "
+                f"URL is fetched; the link is signed to you and expires in {format_ttl(eff_ttl)}. "
+                "Content is NOT included in this response."
+            )
+            logger.info(
+                "[get_gmail_message_full] Returning signed streaming URL (no download)"
+            )
+            return "\n".join(result_lines)
+        logger.info(
+            "[get_gmail_message_full] Signed URL unavailable (no recoverable credentials "
+            "or token too near expiry); falling back to the disk path."
+        )
+
+    # Disk-backed delivery (stateful deployments). Unavailable in stateless mode with
+    # signed URLs off — there is nowhere to put the full message.
+    if is_stateless_mode():
+        return (
+            "Error: get_gmail_message_full is unavailable in stateless mode unless "
+            "signed URLs are enabled (WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS=true). Use "
+            "get_gmail_message_content instead (note it truncates bodies at 20,000 "
+            "characters)."
+        )
 
     notes: List[str] = []
 
