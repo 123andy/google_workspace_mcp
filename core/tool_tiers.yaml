@@ -14,6 +14,7 @@ gmail:
     - list_gmail_labels
     - manage_gmail_label
     - draft_gmail_message
+    - list_drafts
     - list_gmail_filters
     - manage_gmail_filter
 

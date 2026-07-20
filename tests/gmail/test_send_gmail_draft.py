@@ -5,7 +5,7 @@ from unittest.mock import Mock
 import pytest
 
 from core.utils import UserInputError
-from gmail.gmail_tools import send_gmail_draft
+from gmail.gmail_tools import list_drafts, send_gmail_draft
 
 
 def _unwrap(tool):
@@ -120,3 +120,38 @@ async def test_send_gmail_draft_thread_resolution_paginates():
 
     service.users().drafts().send.assert_called_with(userId="me", body={"id": "d2"})
     assert "sent2" in result
+
+
+@pytest.mark.asyncio
+async def test_list_drafts_returns_ids_and_metadata():
+    service = Mock()
+    service.users().drafts().list().execute.return_value = {
+        "drafts": [{"id": "d1", "message": {"id": "m1", "threadId": "t1"}}]
+    }
+    get_request = Mock()
+    get_request.execute.return_value = {
+        "message": {
+            "snippet": "Hello there world",
+            "payload": {
+                "headers": [
+                    {"name": "Subject", "value": "Quarterly"},
+                    {"name": "To", "value": "ann@example.com"},
+                ]
+            },
+        }
+    }
+    service.users().drafts().get.return_value = get_request
+
+    result = await _unwrap(list_drafts)(
+        service=service, user_google_email="user@example.com"
+    )
+
+    assert "d1" in result and "t1" in result
+    assert "Quarterly" in result
+    assert "ann@example.com" in result
+    assert "Hello there world" in result
+    # users.drafts.get must be called without the unsupported metadataHeaders
+    # kwarg (the API rejects it); pin the exact signature so it can't regress.
+    service.users().drafts().get.assert_called_once_with(
+        userId="me", id="d1", format="metadata"
+    )

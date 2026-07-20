@@ -2881,6 +2881,96 @@ async def _forward_gmail_message_impl(
 
 
 @server.tool(
+    title="List Gmail Drafts",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("list_drafts", is_read_only=True, service_type="gmail")
+@require_google_service("gmail", "gmail_read")
+async def list_drafts(
+    service,
+    user_google_email: str,
+    max_results: Annotated[
+        int,
+        Field(
+            description="Maximum number of drafts to return (default 25).",
+        ),
+    ] = 25,
+) -> str:
+    """
+    Lists the user's Gmail drafts with identifying metadata.
+
+    For each draft returns its Draft ID, **Thread ID** (the edit-proof handle to pass to
+    send_gmail_draft), recipient, subject, and a snippet — enough to disambiguate drafts
+    that share a subject and to recover a draft not created in this session. Useful before
+    send_gmail_draft (to pick/confirm the right draft, or detect duplicates in a thread).
+
+    Args:
+        max_results (int): Maximum number of drafts to return. Defaults to 25.
+        user_google_email (str): The user's Google email address. Required.
+
+    Returns:
+        str: A list of drafts with Draft ID, Thread ID, To, Subject, and snippet.
+    """
+    logger.info(
+        f"[list_drafts] Invoked. Email: '{user_google_email}', max_results={max_results}"
+    )
+
+    drafts_resp = await asyncio.to_thread(
+        service.users().drafts().list(userId="me", maxResults=max_results).execute
+    )
+    drafts = drafts_resp.get("drafts", [])
+    if not drafts:
+        return "No drafts found."
+
+    lines = [f"Found {len(drafts)} draft(s):"]
+    for d in drafts:
+        draft_id = d.get("id")
+        thread_id = d.get("message", {}).get("threadId")
+        subject = "(no subject)"
+        to = ""
+        snippet = ""
+        try:
+            # users.drafts.get does NOT support the metadataHeaders parameter
+            # (unlike users.messages.get); passing it makes the googleapiclient
+            # reject the call, so metadata would silently never populate. Ask for
+            # format="metadata" (all headers) and filter to Subject/To client-side.
+            meta = await asyncio.to_thread(
+                service.users()
+                .drafts()
+                .get(
+                    userId="me",
+                    id=draft_id,
+                    format="metadata",
+                )
+                .execute
+            )
+            message = meta.get("message", {})
+            headers = _extract_headers(message.get("payload", {}), ["Subject", "To"])
+            subject = headers.get("Subject") or subject
+            to = headers.get("To", "")
+            snippet = message.get("snippet", "")
+        except Exception as exc:  # metadata is best-effort; still list the ids
+            logger.debug(f"[list_drafts] Could not read metadata for {draft_id}: {exc}")
+
+        lines.append(
+            f"- Draft ID: {draft_id} | Thread ID: {thread_id}\n"
+            f"    To: {to or '(none)'} | Subject: {subject}\n"
+            f"    {snippet[:140]}"
+        )
+
+    lines.append(
+        "\nTo send one: send_gmail_draft(thread_id='<Thread ID>') (survives Gmail-UI "
+        "edits) or send_gmail_draft(draft_id='<Draft ID>')."
+    )
+    return "\n".join(lines)
+
+
+@server.tool(
     title="Send Gmail Draft",
     annotations=ToolAnnotations(
         readOnlyHint=False,
