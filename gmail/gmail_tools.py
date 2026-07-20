@@ -3061,6 +3061,10 @@ async def list_drafts(
         to = ""
         snippet = ""
         try:
+            # users.drafts.get does NOT support the metadataHeaders parameter
+            # (unlike users.messages.get); passing it makes the googleapiclient
+            # reject the call, so metadata would silently never populate. Ask for
+            # format="metadata" (all headers) and filter to Subject/To client-side.
             meta = await asyncio.to_thread(
                 service.users()
                 .drafts()
@@ -3068,7 +3072,6 @@ async def list_drafts(
                     userId="me",
                     id=draft_id,
                     format="metadata",
-                    metadataHeaders=["Subject", "To"],
                 )
                 .execute
             )

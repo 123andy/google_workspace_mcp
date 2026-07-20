@@ -150,3 +150,8 @@ async def test_list_drafts_returns_ids_and_metadata():
     assert "Quarterly" in result
     assert "ann@example.com" in result
     assert "Hello there world" in result
+    # users.drafts.get must be called without the unsupported metadataHeaders
+    # kwarg (the API rejects it); pin the exact signature so it can't regress.
+    service.users().drafts().get.assert_called_once_with(
+        userId="me", id="d1", format="metadata"
+    )
