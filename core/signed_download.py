@@ -217,8 +217,78 @@ async def _fetch_drive(claims: dict, credentials: Credentials) -> DownloadResult
     return DownloadResult(filename=filename, media_type=media_type, stream=body())
 
 
+async def _fetch_gmail_message(claims: dict, credentials: Credentials) -> DownloadResult:
+    """Fetch a COMPLETE Gmail message (not an attachment) by message id.
+
+    ``fmt`` selects the representation: ``eml`` = the raw RFC 5322 message (byte-exact,
+    all headers/parts/inline attachments), ``html`` = the raw HTML body, ``txt`` =
+    plaintext (HTML converted to text as fallback). The message id is stable, so the
+    filename/MIME are signed into the token (``fn``/``mt``). The whole message arrives
+    in a single API response, so the result is buffered.
+    """
+    from gmail.gmail_tools import _extract_message_bodies, _html_to_text
+
+    message_id = claims.get("mid")
+    fmt = claims.get("fmt") or "eml"
+    if not message_id:
+        raise SignedDownloadError("Gmail message token missing mid")
+
+    gmail = build("gmail", "v1", credentials=credentials)
+
+    if fmt == "eml":
+        try:
+            msg = await asyncio.to_thread(
+                gmail.users()
+                .messages()
+                .get(userId="me", id=message_id, format="raw")
+                .execute
+            )
+        except Exception as exc:
+            raise SignedDownloadError(f"Gmail message fetch failed: {exc}") from exc
+        raw = msg.get("raw", "")
+        if not raw:
+            raise SignedDownloadError("Gmail message has no raw content")
+        try:
+            content = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
+        except (binascii.Error, ValueError) as exc:
+            raise SignedDownloadError(f"Gmail message decode failed: {exc}") from exc
+        default_mt = "message/rfc822"
+    else:
+        try:
+            msg = await asyncio.to_thread(
+                gmail.users()
+                .messages()
+                .get(userId="me", id=message_id, format="full")
+                .execute
+            )
+        except Exception as exc:
+            raise SignedDownloadError(f"Gmail message fetch failed: {exc}") from exc
+        bodies = _extract_message_bodies(msg.get("payload", {}))
+        text_stripped = bodies.get("text", "").strip()
+        html_stripped = bodies.get("html", "").strip()
+        if fmt == "html":
+            body = html_stripped or text_stripped
+            default_mt = "text/html"
+        else:  # txt
+            if text_stripped:
+                body = text_stripped
+            elif html_stripped:
+                body = _html_to_text(html_stripped).strip()
+            else:
+                body = ""
+            default_mt = "text/plain"
+        if not body:
+            raise SignedDownloadError("Gmail message has no readable body content")
+        content = body.encode("utf-8")
+
+    filename = claims.get("fn") or f"message.{fmt}"
+    media_type = claims.get("mt") or default_mt
+    return DownloadResult(filename=filename, media_type=media_type, content=content)
+
+
 _FETCHERS: dict[str, Callable[[dict, Credentials], Awaitable[DownloadResult]]] = {
     "gmail": _fetch_gmail,
+    "gmail_message": _fetch_gmail_message,
     "drive": _fetch_drive,
 }
 
