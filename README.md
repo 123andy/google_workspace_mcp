@@ -261,6 +261,8 @@ uv run main.py --transport streamable-http --tools gmail drive calendar
 | `WORKSPACE_MCP_TOOL_TIER` | | `core`, `extended`, or `complete`; empty means all tools |
 | `WORKSPACE_MCP_READ_ONLY` | | `true`, `1`, or `yes` to request read-only scopes and filter write tools |
 | `WORKSPACE_MCP_PERMISSIONS` | | Space-separated `service:level` entries, e.g. `gmail:send drive:readonly`; mutually exclusive with tools and read-only |
+| `WORKSPACE_MCP_ALLOWED_SHARE_DOMAINS` | | Comma-separated domains; when set, the Drive sharing tools only grant access to users, groups, and domains in the list — `anyone`/link sharing is rejected. See [Restricting Drive sharing to trusted domains](docs/granular-tool-selection.md#restricting-drive-sharing-to-trusted-domains) |
+| `WORKSPACE_MCP_SHARE_RESTRICTED_MESSAGE` | | Optional text appended to share-restriction rejections and the sharing tools' descriptions — e.g. point users at an unrestricted endpoint. Only meaningful with `WORKSPACE_MCP_ALLOWED_SHARE_DOMAINS` |
 | **🔑 OAuth 2.1 & Multi-User** | | |
 | `MCP_ENABLE_OAUTH21` | | `true` to enable OAuth 2.1 multi-user support. Required for remote or shared HTTP endpoints (`--transport streamable-http`); optional for local-only legacy HTTP, which binds to `127.0.0.1` by default. |
 | `EXTERNAL_OAUTH21_PROVIDER` | | `true` for external OAuth flow with bearer tokens |

@@ -8,6 +8,7 @@ remote content download, and import-time format conversion.
 import asyncio
 import io
 import logging
+import os
 import re
 from pathlib import Path
 from tempfile import SpooledTemporaryFile
@@ -107,6 +108,135 @@ def validate_share_type(share_type: str) -> None:
         raise ValueError(
             f"Invalid share_type '{share_type}'. Must be one of: {', '.join(sorted(VALID_SHARE_TYPES))}"
         )
+
+
+# ─── Share-domain allowlist (WORKSPACE_MCP_ALLOWED_SHARE_DOMAINS) ───────────────
+#
+# When set, the Drive sharing tools refuse to grant access to targets outside
+# the listed domains ('anyone' access is always refused). This is tool-layer
+# enforcement: Google offers no OAuth scope that separates create/edit from
+# share (both live under drive.file), so a scope-level guarantee is impossible.
+
+ALLOWED_SHARE_DOMAINS_ENV = "WORKSPACE_MCP_ALLOWED_SHARE_DOMAINS"
+SHARE_RESTRICTED_MESSAGE_ENV = "WORKSPACE_MCP_SHARE_RESTRICTED_MESSAGE"
+
+
+def get_allowed_share_domains() -> Optional[List[str]]:
+    """
+    Parse WORKSPACE_MCP_ALLOWED_SHARE_DOMAINS into a normalized domain list.
+
+    Returns:
+        Optional[List[str]]: Lowercased domains, or None when the variable is
+        unset/empty (sharing unrestricted). Matching is case-insensitive and
+        exact — "example.com" does not cover "sub.example.com"; list subdomains
+        explicitly.
+    """
+    raw = os.getenv(ALLOWED_SHARE_DOMAINS_ENV, "")
+    domains = [d.strip().lower().lstrip("@") for d in raw.split(",")]
+    domains = [d for d in domains if d]
+    return domains or None
+
+
+def share_restriction_message(domains: List[str]) -> str:
+    """
+    Build the rejection/annotation text for the share-domain allowlist.
+
+    Always states the config-derived restriction; the optional
+    WORKSPACE_MCP_SHARE_RESTRICTED_MESSAGE is appended (never a replacement),
+    so operator guidance can add routing hints without understating the rule.
+    """
+    message = (
+        f"Sharing on this server is restricted to these domains: {', '.join(domains)}."
+    )
+    extra = os.getenv(SHARE_RESTRICTED_MESSAGE_ENV, "").strip()
+    return f"{message} {extra}" if extra else message
+
+
+def validate_share_target(share_type: str, identifier: Optional[str]) -> None:
+    """
+    Enforce the share-domain allowlist for a prospective sharing target.
+
+    Args:
+        share_type: One of VALID_SHARE_TYPES.
+        identifier: Email address (user/group) or domain name (domain);
+            ignored for 'anyone'.
+
+    Raises:
+        ValueError: If the allowlist is configured and the target is 'anyone',
+            a domain outside the allowlist, or an email whose domain is outside
+            the allowlist. No-op when the allowlist is unset.
+    """
+    domains = get_allowed_share_domains()
+    if domains is None:
+        return
+
+    if share_type == "anyone":
+        raise ValueError(
+            "Cannot grant 'anyone' (public/link) access. "
+            + share_restriction_message(domains)
+        )
+
+    if share_type == "domain":
+        target = (identifier or "").strip().lower().lstrip("@")
+        if target not in domains:
+            raise ValueError(
+                f"Cannot share with domain '{identifier}'. "
+                + share_restriction_message(domains)
+            )
+        return
+
+    # user / group: match on the part after '@'. Note this is address-level
+    # enforcement — a group address in an allowed domain may still contain
+    # external members.
+    email = (identifier or "").strip().lower()
+    local_part, sep, email_domain = email.rpartition("@")
+    if not sep or not local_part or email_domain not in domains:
+        raise ValueError(
+            f"Cannot share with '{identifier}'. " + share_restriction_message(domains)
+        )
+
+
+def validate_existing_permission_target(permission: Dict[str, Any]) -> None:
+    """
+    Enforce the share-domain allowlist against an EXISTING permission.
+
+    Used by the 'update' path: without this, an already-present external
+    permission could be escalated (e.g. reader → writer) even though granting
+    it fresh would be rejected.
+
+    Args:
+        permission: A Drive permission resource with at least
+            type + emailAddress/domain fields.
+
+    Raises:
+        ValueError: If the allowlist is configured and the permission's target
+            falls outside it. No-op when the allowlist is unset.
+    """
+    permission_type = permission.get("type", "user")
+    if permission_type == "domain":
+        validate_share_target("domain", permission.get("domain"))
+    else:
+        validate_share_target(permission_type, permission.get("emailAddress"))
+
+
+def share_restriction_doc_note() -> str:
+    """
+    Docstring suffix advertising the allowlist in the tool description, so
+    clients can route external-sharing requests elsewhere before a failed call
+    (the operator message may name an alternative endpoint).
+
+    Returns "" when the allowlist is unset. Intended to be evaluated once at
+    import/registration time — the env vars are static for the process.
+    """
+    domains = get_allowed_share_domains()
+    if domains is None:
+        return ""
+    return (
+        "\n\n    RESTRICTED: "
+        + share_restriction_message(domains)
+        + " Requests to share outside these domains (including 'anyone with"
+        " the link' access) are rejected."
+    )
 
 
 RFC3339_PATTERN = re.compile(
