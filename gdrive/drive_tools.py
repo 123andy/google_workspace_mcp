@@ -69,17 +69,42 @@ from gdrive.drive_helpers import (
     list_all_permissions,
     derive_shared_state,
     format_permission_info,
+    get_allowed_share_domains,
     get_drive_image_url,
     has_explicit_trashed_clause,
     resolve_drive_item,
     resolve_file_type_mime,
     resolve_folder_id,
+    share_restriction_doc_note,
+    share_restriction_message,
+    validate_existing_permission_target,
     validate_expiration_time,
     validate_share_role,
+    validate_share_target,
     validate_share_type,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _with_share_restriction_note(func):
+    """Add the share-domain-allowlist note (when configured) to a sharing
+    tool's docstring. Must be the innermost decorator: the outer decorators
+    re-derive/copy __doc__ from the wrapped function, carrying the amended
+    text into the registered tool description. FastMCP's docstring parser
+    keeps only the text above "Args:" as the description (the rest becomes
+    parameter schema docs), so the note is inserted there, not appended."""
+    note = share_restriction_doc_note()
+    doc = func.__doc__
+    if note and doc:
+        marker = "\n    Args:"
+        if marker in doc:
+            head, _, tail = doc.partition(marker)
+            func.__doc__ = f"{head.rstrip()}{note}\n{marker}{tail}"
+        else:
+            func.__doc__ = doc + note
+    return func
+
 
 # Organizer lookups share a Google API service; its HTTP transport is not thread-safe.
 SHARED_DRIVE_ORGANIZER_CONCURRENCY_LIMIT = 1
@@ -2734,6 +2759,7 @@ async def get_drive_shareable_link(
 )
 @handle_http_errors("manage_drive_access", is_read_only=False, service_type="drive")
 @require_google_service("drive", "drive_file")
+@_with_share_restriction_note
 async def manage_drive_access(
     service,
     user_google_email: str,
@@ -2810,6 +2836,7 @@ async def manage_drive_access(
         effective_role = role or "reader"
         validate_share_role(effective_role)
         validate_share_type(share_type)
+        validate_share_target(share_type, share_with)
 
         if share_type in ("user", "group") and not share_with:
             raise ValueError(f"share_with is required for share_type '{share_type}'")
@@ -2912,6 +2939,13 @@ async def manage_drive_access(
                 failure_count += 1
                 continue
 
+            try:
+                validate_share_target(r_share_type, identifier)
+            except ValueError as e:
+                results.append(f"  - {identifier}: Failed - {e}")
+                failure_count += 1
+                continue
+
             r_perm_body: Dict[str, Any] = {
                 "type": r_share_type,
                 "role": r_role,
@@ -2987,18 +3021,24 @@ async def manage_drive_access(
         file_id = resolved_file_id
 
         effective_role = role
-        if not effective_role:
+        share_domains_active = get_allowed_share_domains() is not None
+        if not effective_role or share_domains_active:
             current_permission = await asyncio.to_thread(
                 service.permissions()
                 .get(
                     fileId=file_id,
                     permissionId=permission_id,
                     supportsAllDrives=True,
-                    fields="role",
+                    fields="role, type, emailAddress, domain",
                 )
                 .execute
             )
-            effective_role = current_permission.get("role")
+            # The allowlist must also cover updates — otherwise an existing
+            # external permission could be escalated (e.g. reader → writer).
+            if share_domains_active:
+                validate_existing_permission_target(current_permission)
+            if not effective_role:
+                effective_role = current_permission.get("role")
 
         update_body: Dict[str, Any] = {"role": effective_role}
         if expiration_time:
@@ -3057,6 +3097,7 @@ async def manage_drive_access(
     # action == "transfer_owner"
     if not new_owner_email:
         raise ValueError("new_owner_email is required for 'transfer_owner' action")
+    validate_share_target("user", new_owner_email)
 
     resolved_file_id, file_metadata = await resolve_drive_item(
         service, file_id, extra_fields="name, owners"
@@ -3191,6 +3232,7 @@ async def copy_drive_file(
     "set_drive_file_permissions", is_read_only=False, service_type="drive"
 )
 @require_google_service("drive", "drive_file")
+@_with_share_restriction_note
 async def set_drive_file_permissions(
     service,
     user_google_email: str,
@@ -3242,6 +3284,14 @@ async def set_drive_file_permissions(
         raise ValueError(
             f"Invalid link_sharing '{link_sharing}'. Must be one of: {', '.join(sorted(valid_link_sharing))}"
         )
+
+    if link_sharing is not None and link_sharing != "off":
+        share_domains = get_allowed_share_domains()
+        if share_domains is not None:
+            raise ValueError(
+                f"link_sharing '{link_sharing}' would grant 'anyone with the"
+                " link' access. " + share_restriction_message(share_domains)
+            )
 
     resolved_file_id, file_metadata = await resolve_drive_item(
         service, file_id, extra_fields="name, webViewLink"

@@ -275,6 +275,8 @@ Office files (`.docx`, `.xlsx`, `.pptx`) are ZIP archives, so the ceiling above 
 
 Advanced OAuth 2.1 deployments affected by concurrent client token refreshes can tune FastMCP's early-refresh threshold and client-facing access-token lifetime. See [`.env.oauth21`](.env.oauth21) for the bounded settings, recommended values, and security tradeoffs. These settings reduce how often the race occurs; they do not add a grace period to FastMCP's one-time-use refresh-token rotation.
 
+**Domain-restricted Drive sharing** (this fork): `WORKSPACE_MCP_ALLOWED_SHARE_DOMAINS` (comma-separated) limits `manage_drive_access` to users, groups and domains in the list and makes `set_drive_file_permissions` reject link sharing; `WORKSPACE_MCP_SHARE_RESTRICTED_MESSAGE` appends operator routing text to rejections and to the tools' descriptions. Unset leaves behaviour unchanged. See [docs/share-domain-allowlist.md](docs/share-domain-allowlist.md).
+
 **Short sign-in URLs** (this fork): the ~800-character Google authorization URL in an auth prompt is replaced by `{external_base}/auth/{handle}` (~60 chars), the same claim-check trick as `/dl`. The full URL is held Fernet-encrypted in the shared KV store under a random 128-bit handle with the OAuth state's TTL (10 min); `/auth/{handle}` 302-redirects to it. The stored value is validated as an `https://accounts.google.com` URL on both store and load, so the route cannot become an open redirect. Falls back to the full URL when no store is usable. `WORKSPACE_MCP_SHORT_AUTH_URLS=false` disables it.
 
 ## Security Best Practices
