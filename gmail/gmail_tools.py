@@ -14,7 +14,7 @@ import mimetypes
 import html
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Annotated, Optional, List, Dict, Literal, Any
+from typing import Annotated, Optional, List, Dict, Literal, Any, Tuple
 from urllib.parse import unquote, urlparse, urlunsplit
 
 from email.message import EmailMessage
@@ -26,6 +26,7 @@ from mcp.types import ToolAnnotations
 
 from pydantic import Field
 from googleapiclient.errors import HttpError
+from googleapiclient.discovery import build
 
 from auth.oauth_config import is_stateless_mode
 from auth.service_decorator import require_google_service
@@ -39,6 +40,7 @@ from core.config import (
     WORKSPACE_EXTERNAL_URL,
     WORKSPACE_MCP_BASE_URI,
     WORKSPACE_MCP_PORT,
+    get_transport_mode,
 )
 from core.http_utils import ssrf_safe_stream
 from core.utils import (
@@ -1203,6 +1205,132 @@ async def _resolve_url_attachments(
     return resolved
 
 
+async def _resolve_drive_attachments(
+    service,
+    attachments: Optional[List[Dict[str, Any]]],
+) -> Tuple[Optional[List[Dict[str, Any]]], List[Dict[str, str]]]:
+    """Resolve Drive-sourced attachments and guard local-path attachments.
+
+    Gmail has no per-attachment upload resource, so the bytes must be part of the
+    MIME message. Rather than rely on a server-local ``path`` (which is meaningless
+    when the server runs remotely), this lets the caller reference a Drive file the
+    server can already read on their behalf. Each attachment dict may carry:
+
+    * ``drive_file_id``: the server downloads the file from Drive (binary files via
+      ``get_media``; native Docs/Sheets/Slides are exported to PDF) and attaches it as
+      binary. With ``as_link: true`` the file is **not** attached — its share link is
+      returned to be appended to the body instead.
+    * ``path`` (local file): rejected in remote (streamable-http) mode — it resolves on
+      the server, not the caller.
+
+    Returns ``(resolved_attachments, link_lines)`` where ``link_lines`` are
+    ``"name: url"`` strings for any ``as_link`` Drive references.
+    """
+    if not attachments:
+        return attachments, []
+
+    remote = get_transport_mode() == "streamable-http"
+    drive_service = None
+    resolved: List[Dict[str, Any]] = []
+    link_lines: List[Dict[str, str]] = []
+
+    for att in attachments:
+        drive_file_id = att.get("drive_file_id")
+
+        if not drive_file_id:
+            if att.get("path") and remote:
+                resolved.append(
+                    _build_attachment_error_entry(
+                        att,
+                        ValueError(
+                            "Local file attachments ('path') are unavailable in remote "
+                            "(streamable-http) mode. Use 'drive_file_id' to attach a "
+                            "Drive file, 'content' (base64), or 'url'."
+                        ),
+                    )
+                )
+                continue
+            resolved.append(att)
+            continue
+
+        if drive_service is None:
+            drive_service = build("drive", "v3", http=service._http)
+
+        try:
+            meta = await asyncio.to_thread(
+                drive_service.files()
+                .get(
+                    fileId=drive_file_id,
+                    fields="name, mimeType, webViewLink",
+                    supportsAllDrives=True,
+                )
+                .execute
+            )
+        except Exception as exc:
+            logger.exception("Failed to read Drive file %s", drive_file_id)
+            resolved.append(_build_attachment_error_entry(att, exc))
+            continue
+
+        name = att.get("filename") or meta.get("name") or "attachment"
+        source_mime = meta.get("mimeType", "")
+
+        if att.get("as_link"):
+            link = meta.get("webViewLink") or (
+                f"https://drive.google.com/open?id={drive_file_id}"
+            )
+            link_lines.append({"name": name, "url": link})
+            continue
+
+        try:
+            if source_mime.startswith("application/vnd.google-apps."):
+                # Native Google files can't be downloaded directly; export to PDF.
+                data = await asyncio.to_thread(
+                    drive_service.files()
+                    .export(fileId=drive_file_id, mimeType="application/pdf")
+                    .execute
+                )
+                resolved_mime = "application/pdf"
+                if not name.lower().endswith(".pdf"):
+                    name = f"{name}.pdf"
+            else:
+                data = await asyncio.to_thread(
+                    drive_service.files()
+                    .get_media(fileId=drive_file_id, supportsAllDrives=True)
+                    .execute
+                )
+                resolved_mime = att.get("mime_type") or source_mime or "application/octet-stream"
+        except Exception as exc:
+            logger.exception("Failed to download Drive file %s", drive_file_id)
+            resolved.append(_build_attachment_error_entry(att, exc))
+            continue
+
+        entry = {
+            "_resolved_bytes": data,
+            "filename": name,
+            "mime_type": resolved_mime,
+        }
+        if "content_id" in att:
+            entry["content_id"] = att["content_id"]
+        resolved.append(entry)
+
+    return resolved, link_lines
+
+
+def _append_drive_links_to_body(
+    body: str, link_lines: List[Dict[str, str]], body_format: str
+) -> str:
+    """Append Drive share links to the message body (format-aware)."""
+    if not link_lines:
+        return body
+    if body_format == "html":
+        items = "".join(
+            f'<li><a href="{ln["url"]}">{ln["name"]}</a></li>' for ln in link_lines
+        )
+        return f"{body}<p>Attached Drive files:</p><ul>{items}</ul>"
+    lines = "\n".join(f"- {ln['name']}: {ln['url']}" for ln in link_lines)
+    return f"{body}\n\nAttached Drive files:\n{lines}"
+
+
 def _prepare_gmail_message(
     subject: str,
     body: str,
@@ -1731,6 +1859,275 @@ async def get_gmail_message_content(
 
 
 @server.tool(
+    title="Get Gmail Message Full",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("get_gmail_message_full", is_read_only=True, service_type="gmail")
+@require_google_service("gmail", "gmail_read")
+async def get_gmail_message_full(
+    service,
+    message_id: str,
+    user_google_email: str,
+    deliver_as: Annotated[
+        Literal["eml", "html", "txt"],
+        Field(
+            description=(
+                "Output format for the saved file. "
+                "'eml' (default) saves the complete raw RFC 5322 message (all headers, "
+                "parts, and inline attachments). "
+                "'html' saves the raw HTML body. "
+                "'txt' saves the plaintext body (HTML converted to text as fallback)."
+            ),
+        ),
+    ] = "eml",
+) -> str:
+    """
+    Retrieves the COMPLETE, untruncated content of a Gmail message and saves it to
+    local storage, returning a URL/path instead of the body text.
+
+    Unlike get_gmail_message_content (which caps body output at 20,000 chars and returns
+    it inline), this tool never truncates and never streams the body through the model
+    context. It writes the full message to disk and hands back a short-lived download URL
+    (HTTP transport) or file path (stdio transport), so large emails can be fetched and
+    processed out-of-band.
+
+    For byte-exact fidelity prefer deliver_as="eml": it is the raw message as Gmail stores
+    it. The "html"/"txt" formats decode the body as UTF-8 and drop undecodable bytes, so
+    they may not be byte-identical for messages in other charsets.
+
+    Delivery: when signed attachment URLs are enabled the tool returns a short-lived
+    signed URL that streams the message from Gmail on demand (works in stateless mode);
+    otherwise it saves to local storage and returns a URL/path. It is unavailable only in
+    stateless mode with signed URLs disabled (there is nowhere to put the message).
+
+    Args:
+        message_id (str): The unique ID of the Gmail message to retrieve.
+        user_google_email (str): The user's Google email address. Required.
+        deliver_as (Literal["eml", "html", "txt"]): Output format for the saved file.
+            "eml" (default) saves the complete raw RFC 5322 message.
+            "html" saves the raw HTML body. "txt" saves the plaintext body.
+
+    Returns:
+        str: A summary (subject, sender, recipients, size) plus the download URL or file
+            path for the saved file. The message body itself is NOT included in the response.
+    """
+    from auth.oauth_config import is_stateless_mode
+    from core.attachment_signing import (
+        build_download_url,
+        clamp_ttl_to_expiry,
+        format_ttl,
+        signed_attachment_urls_enabled,
+    )
+    from core.attachment_storage import get_attachment_storage, get_attachment_url
+    from core.config import get_transport_mode
+
+    logger.info(
+        f"[get_gmail_message_full] Invoked. Message ID: '{message_id}', "
+        f"Email: '{user_google_email}', deliver_as='{deliver_as}'"
+    )
+
+    # Fetch headers first for the summary / filename.
+    message_metadata = await asyncio.to_thread(
+        service.users()
+        .messages()
+        .get(
+            userId="me",
+            id=message_id,
+            format="metadata",
+            metadataHeaders=GMAIL_METADATA_HEADERS,
+        )
+        .execute
+    )
+    headers = _extract_headers(
+        message_metadata.get("payload", {}), GMAIL_METADATA_HEADERS
+    )
+    subject = headers.get("Subject", "message") or "message"
+    file_extension = {"eml": ".eml", "html": ".html", "txt": ".txt"}[deliver_as]
+    file_mime = {
+        "eml": "message/rfc822",
+        "html": "text/html",
+        "txt": "text/plain",
+    }[deliver_as]
+
+    # Design A: signed-URL delivery. When enabled, hand back a short-lived signed URL
+    # and let the /attachments/signed route re-fetch the complete message from Gmail
+    # and stream it on demand — nothing on disk, nothing through the model context.
+    # This is the path stateless deployments use (see the "gmail_message" fetcher in
+    # core.signed_download); it also removes any need for local disk.
+    if signed_attachment_urls_enabled():
+        from auth.oauth21_session_store import get_oauth21_session_store
+
+        creds = None
+        try:
+            creds = get_oauth21_session_store().get_credentials(user_google_email)
+        except Exception as cred_exc:
+            logger.debug(
+                f"[get_gmail_message_full] Could not recover credentials: {cred_exc}"
+            )
+
+        eff_ttl = clamp_ttl_to_expiry(creds.expiry) if creds else 0
+        if creds and eff_ttl > 0:
+            download_url = await build_download_url(
+                source="gmail_message",
+                user_email=user_google_email,
+                ref={"mid": message_id, "fmt": deliver_as},
+                filename=f"{subject[:80]}{file_extension}",
+                mime_type=file_mime,
+                ttl_seconds=eff_ttl,
+            )
+            try:
+                from core.attachment_cred_cache import stash_credentials
+
+                await stash_credentials(user_google_email, creds, ttl_seconds=eff_ttl)
+            except Exception as cache_exc:  # best-effort; same-process path still works
+                logger.debug(
+                    f"[get_gmail_message_full] Could not pre-cache credentials: {cache_exc}"
+                )
+            result_lines = _format_message_header_lines(headers)
+            result_lines.append("\n--- FULL MESSAGE EXPORT (signed URL) ---")
+            result_lines.append(f"Format: {deliver_as}")
+            result_lines.append(f"\n📎 Download URL: {download_url}")
+            result_lines.append(
+                "\nThe server streams the complete message directly from Gmail when this "
+                f"URL is fetched; the link is signed to you and expires in {format_ttl(eff_ttl)}. "
+                "Content is NOT included in this response."
+            )
+            logger.info(
+                "[get_gmail_message_full] Returning signed streaming URL (no download)"
+            )
+            return "\n".join(result_lines)
+        logger.info(
+            "[get_gmail_message_full] Signed URL unavailable (no recoverable credentials "
+            "or token too near expiry); falling back to the disk path."
+        )
+
+    # Disk-backed delivery (stateful deployments). Unavailable in stateless mode with
+    # signed URLs off — there is nowhere to put the full message.
+    if is_stateless_mode():
+        return (
+            "Error: get_gmail_message_full is unavailable in stateless mode unless "
+            "signed URLs are enabled (WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS=true). Use "
+            "get_gmail_message_content instead (note it truncates bodies at 20,000 "
+            "characters)."
+        )
+
+    notes: List[str] = []
+
+    if deliver_as == "eml":
+        message_raw = await asyncio.to_thread(
+            service.users()
+            .messages()
+            .get(userId="me", id=message_id, format="raw")
+            .execute
+        )
+        raw_data = message_raw.get("raw", "")
+        if not raw_data:
+            return "Error: message has no raw content to export."
+        padded_raw = raw_data + "=" * (-len(raw_data) % 4)
+        try:
+            content_bytes = base64.urlsafe_b64decode(padded_raw)
+        except (binascii.Error, ValueError) as exc:
+            return f"Error: failed to decode raw MIME content: {exc}"
+        mime_type = "message/rfc822"
+        extension = ".eml"
+    else:
+        message_full = await asyncio.to_thread(
+            service.users()
+            .messages()
+            .get(userId="me", id=message_id, format="full")
+            .execute
+        )
+        bodies = _extract_message_bodies(message_full.get("payload", {}))
+        # Preserve the body exactly — the export must be complete — so use .strip()
+        # only to test for emptiness, never to trim the content that gets saved.
+        text_body = bodies.get("text", "")
+        html_body = bodies.get("html", "")
+
+        if deliver_as == "html":
+            if html_body.strip():
+                content_str = html_body
+                mime_type = "text/html"
+                extension = ".html"
+            elif text_body.strip():
+                # No HTML part; fall back to plaintext and label it honestly.
+                content_str = text_body
+                mime_type = "text/plain"
+                extension = ".txt"
+                notes.append(
+                    "No HTML body present; exported the plaintext body instead."
+                )
+            else:
+                content_str = ""
+                mime_type = "text/html"
+                extension = ".html"
+        else:  # txt
+            if text_body.strip():
+                content_str = text_body
+            elif html_body.strip():
+                content_str = _html_to_text(html_body)
+            else:
+                content_str = ""
+            mime_type = "text/plain"
+            extension = ".txt"
+
+        if not content_str.strip():
+            return "Error: message has no readable body content to export."
+        content_bytes = content_str.encode("utf-8")
+
+    # Encode + write on a worker thread so a large export doesn't block the event loop.
+    # Cap the sender-controlled subject so a pathologically long Subject can't overflow
+    # the filesystem's filename limit, and surface a clean error if the write fails.
+    storage = get_attachment_storage()
+
+    def _save_export():
+        return storage.save_attachment(
+            base64_data=base64.urlsafe_b64encode(content_bytes).decode("ascii"),
+            filename=f"{subject[:80]}{extension}",
+            mime_type=mime_type,
+        )
+
+    try:
+        saved = await asyncio.to_thread(_save_export)
+    except OSError as exc:
+        logger.error(f"[get_gmail_message_full] Failed to save message: {exc}")
+        return f"Error: failed to save message to storage: {exc}"
+    size_bytes = len(content_bytes)
+    size_kb = size_bytes / 1024
+
+    result_lines = _format_message_header_lines(headers)
+    result_lines.append("\n--- FULL MESSAGE EXPORT ---")
+    result_lines.append(f"Format: {deliver_as}")
+    result_lines.append(f"Size: {size_kb:.1f} KB ({size_bytes} bytes)")
+    result_lines.append(f"Saved filename: {Path(saved.path).name}")
+    for note in notes:
+        result_lines.append(f"Note: {note}")
+
+    if get_transport_mode() == "stdio":
+        result_lines.append(f"\n📎 Saved to: {saved.path}")
+        result_lines.append(
+            "\nThe full message has been written to disk and can be read directly "
+            "from the file path (its content is NOT included above)."
+        )
+    else:
+        download_url = get_attachment_url(saved.file_id)
+        result_lines.append(f"\n📎 Download URL: {download_url}")
+        result_lines.append(
+            "\nFetch the full message from the URL above (content is NOT included "
+            "in this response). The file will expire after 1 hour."
+        )
+
+    logger.info(
+        f"[get_gmail_message_full] Saved {size_kb:.1f} KB ({deliver_as}) to {saved.path}"
+    )
+    return "\n".join(result_lines)
+
+
+@server.tool(
     title="Get Gmail Messages Content Batch",
     annotations=ToolAnnotations(
         readOnlyHint=True,
@@ -1967,6 +2364,83 @@ async def get_gmail_attachment_content(
     logger.info(
         f"[get_gmail_attachment_content] Invoked. Message ID: '{message_id}', Email: '{user_google_email}'"
     )
+
+    # Design A: signed-URL streaming. When enabled, hand the client a short-lived
+    # signed URL instead of downloading the bytes here. The /attachments/signed
+    # route verifies the token, recovers this user's credentials, and streams the
+    # bytes straight from Gmail on demand — no base64 through the model, nothing on
+    # disk. This is the path the stateless hosted gateway needs; base64 is slow and
+    # token-hungry, and we never even fetch the attachment in this process.
+    from core.attachment_signing import (
+        signed_attachment_urls_enabled,
+        build_download_url,
+        clamp_ttl_to_expiry,
+        format_ttl,
+    )
+
+    if signed_attachment_urls_enabled():
+        # We do NOT resolve the filename here. Gmail attachment ids are ephemeral and
+        # rotate between fetches, so the id in this request usually no longer matches
+        # the message payload — and resolving by size would require downloading the
+        # bytes, which this design avoids. Instead the /attachments/signed route
+        # resolves the filename by byte size after it streams, where the size is
+        # known and stable. (Stable-id sources like Drive can sign filename/mime into
+        # the token via mint_attachment_token's filename/mime_type params instead.)
+        # Recover this owner's credentials up front. We use them to (a) stash a
+        # snapshot in the shared cache so the /attachments/signed route can recover
+        # them by email on any replica, and (b) CLAMP the URL/cache TTL to the
+        # token's remaining life. In OAuth 2.1 proxy mode the recovered token has no
+        # refresh_token, so a URL must not outlive the snapshot it depends on.
+        from auth.oauth21_session_store import get_oauth21_session_store
+
+        creds = None
+        try:
+            creds = get_oauth21_session_store().get_credentials(user_google_email)
+        except Exception as cred_exc:
+            logger.debug(
+                f"[get_gmail_attachment_content] Could not recover credentials: {cred_exc}"
+            )
+
+        # Only hand out a signed URL the route can actually serve: the owner's
+        # credentials must be recoverable (so the route can fetch + stream), and the
+        # URL must fit inside the credential's remaining life (eff_ttl > 0). If
+        # neither holds, fall through to the normal download path below rather than
+        # returning a URL that is guaranteed to 401.
+        eff_ttl = clamp_ttl_to_expiry(creds.expiry) if creds else 0
+        if creds and eff_ttl > 0:
+            download_url = await build_download_url(
+                source="gmail",
+                user_email=user_google_email,
+                ref={"mid": message_id, "aid": attachment_id},
+                ttl_seconds=eff_ttl,
+            )
+
+            try:
+                from core.attachment_cred_cache import stash_credentials
+
+                await stash_credentials(user_google_email, creds, ttl_seconds=eff_ttl)
+            except Exception as cache_exc:  # best-effort; same-process path still works
+                logger.debug(
+                    f"[get_gmail_attachment_content] Could not pre-cache credentials: {cache_exc}"
+                )
+            logger.info(
+                "[get_gmail_attachment_content] Returning signed streaming URL (no download)"
+            )
+            return "\n".join(
+                [
+                    "Attachment ready — streamed on demand (no base64, nothing stored).",
+                    f"Message ID: {message_id}",
+                    f"\n📎 Download URL: {download_url}",
+                    "\nThe server streams the bytes directly from Gmail when this URL is "
+                    f"fetched; the link is signed to you and expires in {format_ttl(eff_ttl)}.",
+                    "\nNote: Attachment IDs are ephemeral. Always use IDs from the most "
+                    "recent message fetch.",
+                ]
+            )
+        logger.info(
+            "[get_gmail_attachment_content] Signed URL unavailable (no recoverable "
+            "credentials or token too near expiry); falling back to download."
+        )
 
     # Download attachment content first, then optionally re-fetch message metadata
     # to resolve filename and MIME type for the saved file.
@@ -2237,8 +2711,8 @@ async def send_gmail_message(
         body_format (Literal['plain', 'html']): Body format (and prepended note format when forwarding). Defaults to 'plain'.
         forward_message_id (Optional[str]): Gmail message ID to forward. When set, the tool forwards that message.
         include_forwarded_attachments (bool): Whether to carry over the original attachments when forwarding. Defaults to True.
-        attachments (Optional[List[Dict[str, str]]]): Optional list of attachments. Each dict can contain:
-            Option 1 - File path (auto-encodes):
+        attachments (Optional[List[Dict[str, Any]]]): Optional list of attachments. Each dict can contain:
+            Option 1 - Local file path (auto-encodes; local/stdio mode only — rejected when the server runs remotely):
               - 'path' (required): File path to attach
               - 'filename' (optional): Override filename
               - 'mime_type' (optional): Override MIME type (auto-detected if not provided)
@@ -2246,6 +2720,13 @@ async def send_gmail_message(
               - 'content' (required): Standard base64-encoded file content (not urlsafe)
               - 'filename' (required): Name of the file
               - 'mime_type' (optional): MIME type (defaults to 'application/octet-stream')
+            Option 3 - Google Drive file (works remotely; the server reads Drive on your behalf):
+              - 'drive_file_id' (required): ID of a Drive file to attach
+              - 'as_link' (optional, default false): if true, the file's share link is added to
+                the message body instead of attaching the bytes; if false/omitted, the server
+                downloads the file (native Docs/Sheets/Slides are exported to PDF) and attaches
+                it as a binary attachment
+              - 'filename'/'mime_type' (optional): overrides for the binary case
         cc (Optional[str]): Optional CC email address.
         bcc (Optional[str]): Optional BCC email address.
         from_name (Optional[str]): Optional sender display name. If provided, the From header will be formatted as 'Name <email>'.
@@ -2257,6 +2738,7 @@ async def send_gmail_message(
         in_reply_to (Optional[str]): Optional RFC Message-ID of the message being replied to (e.g., '<message123@gmail.com>').
         references (Optional[str]): Optional chain of RFC Message-IDs for proper threading (e.g., '<msg1@gmail.com> <msg2@gmail.com>').
         include_signature (bool): Whether to append Gmail signature HTML from send-as settings.
+            Also honored when forwarding (the signature is appended after the quoted message).
             When include_signature is true and Gmail signature retrieval fails for benign reasons
             (e.g., missing gmail.settings.basic scope), the send proceeds without a signature.
             Non-benign failures such as quota/rate-limit or API errors raise ToolError and abort
@@ -2357,6 +2839,7 @@ async def send_gmail_message(
             forward_message=body,
             forward_message_format=body_format,
             include_attachments=include_forwarded_attachments,
+            include_signature=include_signature,
             cc=cc,
             bcc=bcc,
             from_name=from_name,
@@ -2389,7 +2872,14 @@ async def send_gmail_message(
             send_body_content, body_format, signature_html
         )
 
-    resolved_attachments = await _resolve_url_attachments(attachments)
+    resolved_attachments, drive_link_lines = await _resolve_drive_attachments(
+        service, attachments
+    )
+    resolved_attachments = await _resolve_url_attachments(resolved_attachments)
+    if drive_link_lines:
+        send_body_content = _append_drive_links_to_body(
+            send_body_content, drive_link_lines, body_format
+        )
     raw_message, thread_id_final, attached_count, attachment_errors = (
         _prepare_gmail_message(
             subject=subject,
@@ -2407,7 +2897,8 @@ async def send_gmail_message(
         )
     )
 
-    requested_attachment_count = len(attachments or [])
+    # Drive links are delivered in the body, not as MIME parts, so don't count them.
+    requested_attachment_count = len(attachments or []) - len(drive_link_lines)
     if requested_attachment_count > 0 and attached_count == 0:
         details = (
             f" Details: {'; '.join(attachment_errors)}" if attachment_errors else ""
@@ -2438,34 +2929,28 @@ async def send_gmail_message(
     return f"Email sent! Message ID: {message_id}"
 
 
-# Internal implementation function for testing
-async def _forward_gmail_message_impl(
+async def _build_forward_message(
     service,
     message_id: str,
-    to: str,
+    *,
     subject: Optional[str] = None,
     forward_message: Optional[str] = None,
     forward_message_format: Literal["plain", "html"] = "plain",
     include_attachments: bool = True,
-    cc: Optional[str] = None,
-    bcc: Optional[str] = None,
-    from_name: Optional[str] = None,
-    from_email: Optional[str] = None,
-    user_google_email: str = "",
-) -> str:
-    """Build and send a forward of an existing Gmail message.
+) -> tuple[str, str, str, List[Dict[str, Any]]]:
+    """Fetch a message and build a forward of it.
 
-    Shared by send_gmail_message's forward path. An explicit ``subject`` overrides
-    the auto-derived 'Fwd: <original subject>'.
+    Returns ``(forward_subject, forward_body, body_format, attachments)`` where
+    ``attachments`` are standard-base64 ``content`` dicts ready for
+    ``_prepare_gmail_message``. Shared by both the send-forward and draft-forward
+    paths. An explicit ``subject`` overrides the auto-derived 'Fwd: <original>'.
     """
-    # Fetch the original message with full payload
     original_message = await asyncio.to_thread(
         service.users()
         .messages()
         .get(userId="me", id=message_id, format="full")
         .execute
     )
-
     payload = original_message.get("payload", {})
 
     forward_subject, forward_body, body_format = _build_forward_content(
@@ -2476,14 +2961,12 @@ async def _forward_gmail_message_impl(
         subject_override=subject,
     )
 
-    # Handle attachments
-    attachments_to_send = []
+    attachments_to_send: List[Dict[str, Any]] = []
     if include_attachments:
         attachment_metadata = _extract_attachments(payload)
         failed_attachments = []
         for att in attachment_metadata:
             try:
-                # Download attachment content
                 attachment_data = await asyncio.to_thread(
                     service.users()
                     .messages()
@@ -2515,16 +2998,62 @@ async def _forward_gmail_message_impl(
                 )
                 failed_attachments.append(att["filename"])
 
-        # Fail loudly rather than silently delivering an incomplete forward when
-        # the caller asked for the original attachments to be preserved.
+        # Fail loudly rather than silently building an incomplete forward when the
+        # caller asked for the original attachments to be preserved.
         if failed_attachments:
             raise Exception(
                 "Failed to include requested attachment(s): "
                 + ", ".join(failed_attachments)
             )
 
+    return forward_subject, forward_body, body_format, attachments_to_send
+
+
+async def _forward_gmail_message_impl(
+    service,
+    message_id: str,
+    to: str,
+    subject: Optional[str] = None,
+    forward_message: Optional[str] = None,
+    forward_message_format: Literal["plain", "html"] = "plain",
+    include_attachments: bool = True,
+    include_signature: bool = True,
+    cc: Optional[str] = None,
+    bcc: Optional[str] = None,
+    from_name: Optional[str] = None,
+    from_email: Optional[str] = None,
+    user_google_email: str = "",
+) -> str:
+    """Build and send a forward of an existing Gmail message.
+
+    Shared by send_gmail_message's forward path. An explicit ``subject`` overrides
+    the auto-derived 'Fwd: <original subject>'. When ``include_signature`` is true
+    the sender's Gmail signature is appended after the quoted message, matching
+    Gmail's default forward layout.
+    """
+    (
+        forward_subject,
+        forward_body,
+        body_format,
+        attachments_to_send,
+    ) = await _build_forward_message(
+        service,
+        message_id,
+        subject=subject,
+        forward_message=forward_message,
+        forward_message_format=forward_message_format,
+        include_attachments=include_attachments,
+    )
+
     # Prepare and send the message
     sender_email = from_email or user_google_email
+    if include_signature:
+        signature_html = await _get_send_as_signature_html_for_tool(
+            service, from_email=sender_email
+        )
+        forward_body = _append_signature_to_body(
+            forward_body, body_format, signature_html
+        )
     raw_message, _, attached_count, attachment_errors = _prepare_gmail_message(
         subject=forward_subject,
         body=forward_body,
@@ -2563,6 +3092,252 @@ async def _forward_gmail_message_impl(
 
 
 @server.tool(
+    title="List Gmail Drafts",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("list_drafts", is_read_only=True, service_type="gmail")
+@require_google_service("gmail", "gmail_read")
+async def list_drafts(
+    service,
+    user_google_email: str,
+    max_results: Annotated[
+        int,
+        Field(
+            description="Maximum number of drafts to return (default 25).",
+        ),
+    ] = 25,
+) -> str:
+    """
+    Lists the user's Gmail drafts with identifying metadata.
+
+    For each draft returns its Draft ID, **Thread ID** (the edit-proof handle to pass to
+    send_gmail_draft), recipient, subject, and a snippet — enough to disambiguate drafts
+    that share a subject and to recover a draft not created in this session. Useful before
+    send_gmail_draft (to pick/confirm the right draft, or detect duplicates in a thread).
+
+    Args:
+        max_results (int): Maximum number of drafts to return. Defaults to 25.
+        user_google_email (str): The user's Google email address. Required.
+
+    Returns:
+        str: A list of drafts with Draft ID, Thread ID, To, Subject, and snippet.
+    """
+    logger.info(
+        f"[list_drafts] Invoked. Email: '{user_google_email}', max_results={max_results}"
+    )
+
+    drafts_resp = await asyncio.to_thread(
+        service.users().drafts().list(userId="me", maxResults=max_results).execute
+    )
+    drafts = drafts_resp.get("drafts", [])
+    if not drafts:
+        return "No drafts found."
+
+    lines = [f"Found {len(drafts)} draft(s):"]
+    for d in drafts:
+        draft_id = d.get("id")
+        thread_id = d.get("message", {}).get("threadId")
+        subject = "(no subject)"
+        to = ""
+        snippet = ""
+        try:
+            # users.drafts.get does NOT support the metadataHeaders parameter
+            # (unlike users.messages.get); passing it makes the googleapiclient
+            # reject the call, so metadata would silently never populate. Ask for
+            # format="metadata" (all headers) and filter to Subject/To client-side.
+            meta = await asyncio.to_thread(
+                service.users()
+                .drafts()
+                .get(
+                    userId="me",
+                    id=draft_id,
+                    format="metadata",
+                )
+                .execute
+            )
+            message = meta.get("message", {})
+            headers = _extract_headers(message.get("payload", {}), ["Subject", "To"])
+            subject = headers.get("Subject") or subject
+            to = headers.get("To", "")
+            snippet = message.get("snippet", "")
+        except Exception as exc:  # metadata is best-effort; still list the ids
+            logger.debug(f"[list_drafts] Could not read metadata for {draft_id}: {exc}")
+
+        lines.append(
+            f"- Draft ID: {draft_id} | Thread ID: {thread_id}\n"
+            f"    To: {to or '(none)'} | Subject: {subject}\n"
+            f"    {snippet[:140]}"
+        )
+
+    lines.append(
+        "\nTo send one: send_gmail_draft(thread_id='<Thread ID>') (survives Gmail-UI "
+        "edits) or send_gmail_draft(draft_id='<Draft ID>')."
+    )
+    return "\n".join(lines)
+
+
+async def _draft_exists(service, draft_id: str) -> bool:
+    """True if draft_id still resolves to a live draft (else False on 404)."""
+    try:
+        await asyncio.to_thread(
+            service.users()
+            .drafts()
+            .get(userId="me", id=draft_id, format="minimal")
+            .execute
+        )
+        return True
+    except HttpError as e:
+        # 404 = draft gone; 400 = malformed/invalid id. Either way the draft_id is
+        # unusable, so report it missing and let the caller fall back to thread_id.
+        if e.resp.status in (400, 404):
+            return False
+        raise
+
+
+@server.tool(
+    title="Send Gmail Draft",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("send_gmail_draft", service_type="gmail")
+@require_google_service("gmail", GMAIL_COMPOSE_SCOPE)
+async def send_gmail_draft(
+    service,
+    user_google_email: str,
+    draft_id: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Primary handle for the draft to send (as returned by draft_gmail_message). "
+                "In practice the most stable handle — it survives body edits on Gmail web and "
+                "mobile; only a rare discard-recreate rotates it. Pass this when you have it. "
+                "Provide draft_id, thread_id, or both (both = draft_id preferred, thread_id "
+                "used only as a fallback if draft_id no longer resolves)."
+            ),
+        ),
+    ] = None,
+    thread_id: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Fallback handle: send the unique draft in this Gmail thread when draft_id is "
+                "absent or no longer resolves. CAVEAT: a draft's thread_id changes if the user "
+                "edits its SUBJECT (Gmail re-threads by subject), so a subject edit can move the "
+                "draft out of this thread and this lookup will miss it — draft_id is preferred. "
+                "Errors if the thread has more than one draft. Provide draft_id, thread_id, or both."
+            ),
+        ),
+    ] = None,
+) -> str:
+    """
+    Sends an existing Gmail draft, by draft_id or (edit-proof) thread_id.
+
+    This is the "commit" half of a compose-then-send split: a draft is composed
+    separately (draft_gmail_message, which can reply or forward), reviewed, and then
+    sent here. Sending requires the gmail.compose scope (drafts.send is not covered by
+    gmail.send).
+
+    **Edit safety (measured):** message_id rotates on *every* edit — never cache it.
+    draft_id is the most stable handle (unchanged across web/mobile body edits, subject
+    changes, and attachments in testing); only a rare discard-recreate rotates it.
+    thread_id is stable for body/attachment edits but MOVES if the subject is edited
+    (Gmail re-threads by subject). So prefer draft_id; thread_id is only a fallback and
+    can miss a draft whose subject changed.
+
+    Args:
+        draft_id (Optional[str]): Primary handle for the draft to send.
+        thread_id (Optional[str]): Fallback — send the unique draft in this thread.
+        user_google_email (str): The user's Google email address. Required.
+
+    Returns:
+        str: Confirmation with the sent message's ID and thread ID.
+    """
+    if not draft_id and not thread_id:
+        raise UserInputError("Provide 'draft_id', 'thread_id', or both.")
+
+    resolved_id = None
+
+    # Prefer draft_id — empirically the most stable handle across edits (web + mobile).
+    if draft_id and await _draft_exists(service, draft_id):
+        resolved_id = draft_id
+
+    # Fall back to a thread scan when draft_id is missing or no longer resolves. drafts.list
+    # returns each draft's message.threadId, so we can match without extra get() calls.
+    # NOTE: thread_id moves if the user edited the draft's SUBJECT, so this can legitimately
+    # find nothing even though the draft still exists — hence draft_id is preferred. Paginate
+    # so accounts with many drafts don't yield a false "no draft found"; stop early once
+    # the result is already ambiguous.
+    if resolved_id is None and thread_id:
+        logger.info(
+            f"[send_gmail_draft] Resolving draft in thread '{thread_id}' for '{user_google_email}'"
+        )
+        matches = []
+        page_token = None
+        while True:
+            drafts_resp = await asyncio.to_thread(
+                service.users()
+                .drafts()
+                .list(userId="me", maxResults=500, pageToken=page_token)
+                .execute
+            )
+            matches.extend(
+                d
+                for d in drafts_resp.get("drafts", [])
+                if d.get("message", {}).get("threadId") == thread_id
+            )
+            page_token = drafts_resp.get("nextPageToken")
+            if len(matches) > 1 or not page_token:
+                break
+        if len(matches) > 1:
+            ids = ", ".join(d.get("id", "?") for d in matches)
+            raise UserInputError(
+                f"Thread '{thread_id}' has {len(matches)} drafts ({ids}); ambiguous. "
+                "Pass a specific draft_id."
+            )
+        if matches:
+            resolved_id = matches[0].get("id")
+
+    if resolved_id is None:
+        hint = (
+            " If the draft's subject was edited it may have moved to a different thread — "
+            "pass draft_id instead."
+            if thread_id and not draft_id
+            else ""
+        )
+        raise UserInputError(
+            f"No draft found for the given handle(s). It may have already been sent "
+            f"or discarded.{hint}"
+        )
+
+    draft_id = resolved_id
+
+    logger.info(
+        f"[send_gmail_draft] Invoked. Draft ID: '{draft_id}', Email: '{user_google_email}'"
+    )
+
+    sent = await asyncio.to_thread(
+        service.users().drafts().send(userId="me", body={"id": draft_id}).execute,
+        num_retries=GOOGLE_API_WRITE_RETRIES,
+    )
+    message_id = sent.get("id")
+    sent_thread_id = sent.get("threadId")
+    logger.info(f"[send_gmail_draft] Draft {draft_id} sent as message {message_id}.")
+    return (
+        f"Draft {draft_id} sent for {user_google_email}. "
+        f"Message ID: {message_id}, Thread ID: {sent_thread_id}."
+    )
+
+
+@server.tool(
     title="Draft Gmail Message",
     annotations=ToolAnnotations(
         readOnlyHint=False,
@@ -2576,8 +3351,18 @@ async def _forward_gmail_message_impl(
 async def draft_gmail_message(
     service,
     user_google_email: str,
-    subject: Annotated[str, Field(description="Email subject.")],
-    body: Annotated[str, Field(description="Email body (plain text).")],
+    subject: Annotated[
+        Optional[str],
+        Field(
+            description="Email subject. Optional when forwarding (defaults to 'Fwd: <original subject>').",
+        ),
+    ] = None,
+    body: Annotated[
+        Optional[str],
+        Field(
+            description="Email body (plain text or HTML). When forwarding, an optional note prepended above the quoted original.",
+        ),
+    ] = None,
     body_format: Annotated[
         Literal["plain", "html"],
         Field(
@@ -2644,15 +3429,27 @@ async def draft_gmail_message(
             description="Whether to include the original message as a quoted reply. Requires thread_id. Defaults to false.",
         ),
     ] = False,
+    forward_message_id: Annotated[
+        Optional[str],
+        Field(
+            description="Set to a Gmail message ID to draft a FORWARD of that message. The original subject, quoted body, and (optionally) attachments are carried over; 'body' becomes an optional note prepended above the forward. The result is a normal draft — nothing is sent until send_gmail_draft is called.",
+        ),
+    ] = None,
+    include_forwarded_attachments: Annotated[
+        bool,
+        Field(
+            description="When forwarding, whether to carry over the original message's attachments. Ignored unless forward_message_id is set.",
+        ),
+    ] = True,
 ) -> str:
     """
-    Creates a draft email in the user's Gmail account. Supports both new drafts and reply drafts with optional attachments.
+    Creates a draft email in the user's Gmail account. Supports new drafts, reply drafts, and forward drafts, with optional attachments.
     Supports Gmail's "Send As" feature to draft from configured alias addresses.
 
     Args:
         user_google_email (str): The user's Google email address. Required for authentication.
-        subject (str): Email subject.
-        body (str): Email body (plain text).
+        subject (Optional[str]): Email subject. Optional when forwarding (defaults to 'Fwd: <original subject>').
+        body (Optional[str]): Email body. When forwarding, an optional note prepended above the quoted original.
         body_format (Literal['plain', 'html']): Email body format. Defaults to 'plain'.
         to (Optional[str]): Optional recipient email address. Can be left empty for drafts.
         cc (Optional[str]): Optional CC email address.
@@ -2664,8 +3461,8 @@ async def draft_gmail_message(
         thread_id (Optional[str]): Optional Gmail thread ID to reply within. When provided, creates a reply draft.
         in_reply_to (Optional[str]): Optional RFC Message-ID of the message being replied to (e.g., '<message123@gmail.com>').
         references (Optional[str]): Optional chain of RFC Message-IDs for proper threading (e.g., '<msg1@gmail.com> <msg2@gmail.com>').
-        attachments (List[Dict[str, str]]): Optional list of attachments. Each dict can contain:
-            Option 1 - File path (auto-encodes):
+        attachments (List[Dict[str, Any]]): Optional list of attachments. Each dict can contain:
+            Option 1 - Local file path (auto-encodes; local/stdio mode only — rejected when the server runs remotely):
               - 'path' (required): File path to attach
               - 'filename' (optional): Override filename
               - 'mime_type' (optional): Override MIME type (auto-detected if not provided)
@@ -2673,7 +3470,15 @@ async def draft_gmail_message(
               - 'content' (required): Standard base64-encoded file content (not urlsafe)
               - 'filename' (required): Name of the file
               - 'mime_type' (optional): MIME type (defaults to 'application/octet-stream')
+            Option 3 - Google Drive file (works remotely; the server reads Drive on your behalf):
+              - 'drive_file_id' (required): ID of a Drive file to attach
+              - 'as_link' (optional, default false): if true, the file's share link is added to
+                the message body instead of attaching the bytes; if false/omitted, the server
+                downloads the file (native Docs/Sheets/Slides are exported to PDF) and attaches
+                it as a binary attachment
+              - 'filename'/'mime_type' (optional): overrides for the binary case
         include_signature (bool): Whether to append Gmail signature HTML from send-as settings.
+            Also honored when forwarding (the signature is appended after the quoted message).
             When include_signature is true and Gmail signature retrieval fails for benign reasons
             (e.g., missing gmail.settings.basic scope), the draft proceeds without a signature.
             Non-benign failures such as quota/rate-limit or API errors raise ToolError and abort
@@ -2681,9 +3486,15 @@ async def draft_gmail_message(
         quote_original (bool): Whether to include the original message as a quoted reply.
             Requires thread_id to be provided. When enabled, fetches the original message
             and appends it below the signature. Defaults to False.
+        forward_message_id (Optional[str]): Gmail message ID to draft a FORWARD of. The
+            original subject, quoted body, and (optionally) attachments are carried over,
+            and 'body' becomes a note prepended above the forward.
+        include_forwarded_attachments (bool): When forwarding, whether to carry over the
+            original message's attachments. Ignored unless forward_message_id is set.
 
     Returns:
-        str: Confirmation message with the created draft's ID.
+        str: Confirmation with the created draft's ID, message ID, and thread ID (pass the
+            thread ID to send_gmail_draft — it survives edits made to the draft).
 
     Examples:
         # Create a new draft
@@ -2744,52 +3555,95 @@ async def draft_gmail_message(
     # Prepare the email message
     # Use from_email (Send As alias) if provided, otherwise default to authenticated user
     sender_email = from_email or user_google_email
-    draft_body = body
-    signature_html = ""
-    if include_signature:
-        signature_html = await _get_send_as_signature_html_for_tool(
-            service, from_email=sender_email
-        )
+    forwarded_attachments: List[Dict[str, Any]] = []
 
-    reply_context = None
-    if thread_id and (quote_original or not in_reply_to or not references or not to):
-        reply_context = await _fetch_thread_reply_context(
-            service,
-            thread_id,
-            in_reply_to=in_reply_to,
-            include_bodies=quote_original,
-        )
-
-    if thread_id and (not in_reply_to or not references):
-        thread_message_ids = (
-            reply_context.get("message_ids", []) if reply_context else []
-        )
-        in_reply_to, references = _derive_reply_headers(
-            thread_message_ids, in_reply_to, references
-        )
-
-    target_reply = reply_context.get("target") if reply_context else None
-    if thread_id and not to and target_reply:
-        to = target_reply.get("reply_to") or target_reply.get("from") or to
-    if thread_id and not subject.strip() and target_reply:
-        subject = target_reply.get("subject") or subject
-
-    if quote_original and target_reply:
-        draft_body = _build_quoted_reply_body(
+    if forward_message_id:
+        # Forward draft: build the subject, quoted body, and carried-over attachments
+        # from the original ('body' becomes an optional prepended note). Reply/quote
+        # composition does not apply to a forward; the signature is appended after
+        # the quoted message, matching Gmail's default forward layout.
+        (
+            subject,
             draft_body,
             body_format,
-            signature_html,
-            {
-                "sender": target_reply.get("from") or "unknown",
-                "date": target_reply.get("date", ""),
-                "text_body": target_reply.get("text_body", ""),
-                "html_body": target_reply.get("html_body", ""),
-            },
+            forwarded_attachments,
+        ) = await _build_forward_message(
+            service,
+            forward_message_id,
+            subject=subject,
+            forward_message=body,
+            forward_message_format=body_format,
+            include_attachments=include_forwarded_attachments,
         )
+        if include_signature:
+            signature_html = await _get_send_as_signature_html_for_tool(
+                service, from_email=sender_email
+            )
+            draft_body = _append_signature_to_body(
+                draft_body, body_format, signature_html
+            )
     else:
-        draft_body = _append_signature_to_body(draft_body, body_format, signature_html)
+        subject = subject or ""
+        draft_body = body or ""
+        signature_html = ""
+        if include_signature:
+            signature_html = await _get_send_as_signature_html_for_tool(
+                service, from_email=sender_email
+            )
 
-    resolved_attachments = await _resolve_url_attachments(attachments)
+        reply_context = None
+        if thread_id and (
+            quote_original or not in_reply_to or not references or not to
+        ):
+            reply_context = await _fetch_thread_reply_context(
+                service,
+                thread_id,
+                in_reply_to=in_reply_to,
+                include_bodies=quote_original,
+            )
+
+        if thread_id and (not in_reply_to or not references):
+            thread_message_ids = (
+                reply_context.get("message_ids", []) if reply_context else []
+            )
+            in_reply_to, references = _derive_reply_headers(
+                thread_message_ids, in_reply_to, references
+            )
+
+        target_reply = reply_context.get("target") if reply_context else None
+        if thread_id and not to and target_reply:
+            to = target_reply.get("reply_to") or target_reply.get("from") or to
+        if thread_id and not subject.strip() and target_reply:
+            subject = target_reply.get("subject") or subject
+
+        if quote_original and target_reply:
+            draft_body = _build_quoted_reply_body(
+                draft_body,
+                body_format,
+                signature_html,
+                {
+                    "sender": target_reply.get("from") or "unknown",
+                    "date": target_reply.get("date", ""),
+                    "text_body": target_reply.get("text_body", ""),
+                    "html_body": target_reply.get("html_body", ""),
+                },
+            )
+        else:
+            draft_body = _append_signature_to_body(
+                draft_body, body_format, signature_html
+            )
+
+    resolved_attachments, drive_link_lines = await _resolve_drive_attachments(
+        service, attachments
+    )
+    resolved_attachments = await _resolve_url_attachments(resolved_attachments)
+    # Attachments carried over from a forwarded message lead the list.
+    if forwarded_attachments:
+        resolved_attachments = forwarded_attachments + (resolved_attachments or [])
+    if drive_link_lines:
+        draft_body = _append_drive_links_to_body(
+            draft_body, drive_link_lines, body_format
+        )
     raw_message, _thread_id_final, attached_count, attachment_errors = (
         _prepare_gmail_message(
             subject=subject,
@@ -2807,7 +3661,11 @@ async def draft_gmail_message(
         )
     )
 
-    requested_attachment_count = len(attachments or [])
+    # Count explicit attachments plus any carried over from a forward. Drive links
+    # are delivered in the body, not as MIME parts, so don't count them.
+    requested_attachment_count = (
+        len(attachments or []) - len(drive_link_lines) + len(forwarded_attachments)
+    )
     if requested_attachment_count > 0 and attached_count == 0:
         details = (
             f" Details: {'; '.join(attachment_errors)}" if attachment_errors else ""
@@ -2815,6 +3673,17 @@ async def draft_gmail_message(
         raise UserInputError(
             "No valid attachments were added. Verify each attachment path/content and retry."
             f"{details}"
+        )
+    # Forwarded attachments were already fetched, so a partial attach means one was
+    # dropped at MIME-build time — fail loudly rather than draft a partial forward
+    # (mirrors the send-forward path).
+    if forwarded_attachments and attached_count != requested_attachment_count:
+        details = (
+            f" Details: {'; '.join(attachment_errors)}" if attachment_errors else ""
+        )
+        raise UserInputError(
+            "Failed to include all requested attachment(s): "
+            f"{attached_count}/{requested_attachment_count} attached.{details}"
         )
 
     # Create a draft instead of sending. Gmail requires message.threadId plus
@@ -2831,10 +3700,26 @@ async def draft_gmail_message(
         num_retries=GOOGLE_API_WRITE_RETRIES,
     )
     draft_id = created_draft.get("id")
+    created_message = created_draft.get("message", {})
+    message_id = created_message.get("id")
+    result_thread_id = created_message.get("threadId")
     attachment_info = _format_attachment_result(
         attached_count, requested_attachment_count
     )
-    return f"Draft created{attachment_info}! Draft ID: {draft_id}"
+    # Return the thread_id too: it's the only handle that survives a later edit in the
+    # Gmail UI (the draft_id and message_id both rotate on edit), so send_gmail_draft can
+    # re-resolve the live draft by thread. See send_gmail_draft.
+    result = f"Draft created{attachment_info}! Draft ID: {draft_id}"
+    if message_id:
+        result += f", Message ID: {message_id}"
+    if result_thread_id:
+        result += (
+            f", Thread ID: {result_thread_id}. To send later, prefer "
+            f"send_gmail_draft(thread_id='{result_thread_id}') — it survives edits made to "
+            f"the draft in Gmail; send_gmail_draft(draft_id='{draft_id}') works only if the "
+            f"draft is not edited first."
+        )
+    return result
 
 
 def _format_thread_content(

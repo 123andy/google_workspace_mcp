@@ -17,6 +17,13 @@ logger = logging.getLogger(__name__)
 # Global registry of enabled tools
 _enabled_tools: Optional[Set[str]] = None
 
+# Global per-tool-name blocklist (set by main.py for --exclude-tools).
+# Composes with the normal selectors: whatever set of tools was otherwise
+# selected, these named tools are additionally removed at the tool layer.
+# Unlike _enabled_tools / --only-tools, this does NOT change requested OAuth
+# scopes — the token keeps the scopes of the remaining tools.
+_excluded_tools: Optional[Set[str]] = None
+
 
 def set_enabled_tools(tool_names: Optional[Set[str]]):
     """Set the globally enabled tools."""
@@ -27,6 +34,17 @@ def set_enabled_tools(tool_names: Optional[Set[str]]):
 def get_enabled_tools() -> Optional[Set[str]]:
     """Get the set of enabled tools, or None if all tools are enabled."""
     return _enabled_tools
+
+
+def set_excluded_tools(tool_names: Optional[Set[str]]):
+    """Set the globally excluded tools (blocklist), or None to clear."""
+    global _excluded_tools
+    _excluded_tools = set(tool_names) if tool_names is not None else None
+
+
+def get_excluded_tools() -> Optional[Set[str]]:
+    """Get the set of excluded tools, or None if no exclusion is active."""
+    return _excluded_tools
 
 
 def is_tool_enabled(tool_name: str) -> bool:
@@ -107,10 +125,12 @@ def filter_server_tools(server) -> int:
     Returns the number of tools removed so callers can report it.
     """
     enabled_tools = get_enabled_tools()
+    excluded_tools = get_excluded_tools()
     oauth21_enabled = is_oauth21_enabled()
     permissions_mode = is_permissions_mode()
     if (
         enabled_tools is None
+        and excluded_tools is None
         and not oauth21_enabled
         and not is_read_only_mode()
         and not permissions_mode
@@ -182,6 +202,24 @@ def filter_server_tools(server) -> int:
                         required_scopes,
                     )
                     tools_to_remove.add(tool_name)
+
+    # 5. Per-tool-name blocklist (--exclude-tools)
+    # Composes with every other selector above: drop the named tools at the tool
+    # layer regardless of how they were selected. This intentionally does NOT
+    # touch OAuth scopes — the remaining tools (which may share a scope with an
+    # excluded tool) keep that scope on the token.
+    if excluded_tools is not None:
+        excluded_count = 0
+        for tool_name in tool_components:
+            if tool_name in excluded_tools and tool_name not in tools_to_remove:
+                tools_to_remove.add(tool_name)
+                excluded_count += 1
+        if excluded_count > 0:
+            logger.info(
+                "Exclude-tools: removing %d tools (%s)",
+                excluded_count,
+                ", ".join(sorted(excluded_tools & set(tool_components))),
+            )
 
     for tool_name in tools_to_remove:
         try:

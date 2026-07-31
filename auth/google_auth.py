@@ -383,6 +383,48 @@ def _is_pkce_verifier_not_needed_error(error: Exception) -> bool:
     )
 
 
+def short_auth_urls_enabled() -> bool:
+    """True (default) when the sign-in link is a short ``/auth/{handle}`` redirect.
+
+    The full Google authorization URL runs ~800 chars (scopes + PKCE challenge +
+    state + redirect_uri); rendering it as a hyperlink hides the length but a
+    plain-text client still shows the whole thing and a model can corrupt it on
+    retype. When enabled, the full URL is stored server-side (``core.auth_handles``)
+    and the user gets ``{origin}/auth/{handle}`` (~60 chars) instead. Set
+    ``WORKSPACE_MCP_SHORT_AUTH_URLS=false`` to always emit the full URL (e.g. a
+    multi-replica deployment deliberately running without a shared storage
+    backend). Falls back to the full URL automatically when no store is usable.
+    """
+    return os.getenv("WORKSPACE_MCP_SHORT_AUTH_URLS", "true").lower() == "true"
+
+
+async def _build_sign_in_link(auth_url: str, redirect_uri: str) -> str:
+    """Return a short ``/auth/{handle}`` link for ``auth_url``.
+
+    Falls back to the full ``auth_url`` on any failure (feature disabled, no
+    store, unparseable redirect_uri) — the raw URL always works.
+    """
+    if not short_auth_urls_enabled():
+        return auth_url
+    try:
+        from core.auth_handles import store_auth_url_ref
+
+        # Match the OAuth state's default lifetime (store_oauth_state: 600s) —
+        # the link is useless once the state it points at has expired.
+        handle = await store_auth_url_ref(auth_url, ttl_seconds=600)
+        if not handle:
+            return auth_url
+        # Build the short link on the same externally-reachable origin Google
+        # redirects back to; that host is guaranteed to serve /auth/{handle}.
+        parsed = urlparse(redirect_uri)
+        if not parsed.scheme or not parsed.netloc:
+            return auth_url
+        return f"{parsed.scheme}://{parsed.netloc}/auth/{handle}"
+    except Exception as e:
+        logger.debug(f"Short auth URL unavailable; using full URL: {e}")
+        return auth_url
+
+
 async def _determine_oauth_prompt(
     user_google_email: Optional[str],
     required_scopes: List[str],
@@ -570,6 +612,11 @@ async def start_auth_flow(
             auth_kwargs["login_hint"] = user_google_email
         auth_url, _ = flow.authorization_url(**auth_kwargs)
 
+        # The user-facing sign-in link — a short /auth/{handle} redirect when
+        # possible, else the full auth_url. Browser auto-open below still uses
+        # the full auth_url (no redirect hop needed on the local machine).
+        sign_in_url = await _build_sign_in_link(auth_url, redirect_uri)
+
         browser_opened = False
         should_open_browser = (
             get_transport_mode() == "stdio" and not is_oauth21_enabled()
@@ -614,10 +661,10 @@ async def start_auth_flow(
                 [
                     f"**ACTION REQUIRED: Google sign-in needed for {user_display_name}**\n",
                     f"You're authenticated at the gateway as **{user_google_email}**. To authorize Google access:",
-                    f"1. Open this URL and sign in to Google as **{user_google_email}** — it must be that exact account (your verified gateway identity):",
-                    f"   Authorization URL: {auth_url}",
+                    f"1. [Sign in with Google as **{user_google_email}**]({sign_in_url}) — it must be that exact account (your verified gateway identity).",
                     "2. After authorizing, retry your original request.",
                     f"\nOnly the Google account matching your gateway identity (**{user_google_email}**) can be authorized — signing in with a different account is rejected.",
+                    "\n**LLM: present the sign-in link to the user as a markdown hyperlink (e.g. [Sign in with Google](...)); only print the raw URL if the user directly asks for it.**",
                 ]
             )
 
@@ -625,14 +672,12 @@ async def start_auth_flow(
             message_lines = [
                 f"**ACTION REQUIRED: Google Authentication Needed for {user_display_name}**\n",
                 "1. The authorization page has been **automatically opened in your browser**. Please complete the authorization there.",
-                "   If it did not appear, open this URL manually:",
-                f"   Authorization URL: {auth_url}",
+                f"   If it did not appear, use this link: [Sign in with Google]({sign_in_url})",
             ]
         else:
             message_lines = [
                 f"**ACTION REQUIRED: Google Authentication Needed for {user_display_name}**\n",
-                f"1. Open this URL in your browser to authorize {service_name} access using all required permissions:",
-                f"   Authorization URL: {auth_url}",
+                f"1. [Sign in with Google]({sign_in_url}) to authorize {service_name} access using all required permissions.",
             ]
         session_info_for_llm = ""
 
@@ -651,6 +696,9 @@ async def start_auth_flow(
 
         message_lines.append(
             f"\nThe application will use the new credentials. If '{user_google_email}' was provided, it must match the authenticated account."
+        )
+        message_lines.append(
+            "\n**LLM: present the sign-in link to the user as a markdown hyperlink (e.g. [Sign in with Google](...)); only print the raw URL if the user directly asks for it.**"
         )
         return "\n".join(message_lines)
 

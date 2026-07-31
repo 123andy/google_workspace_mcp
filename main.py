@@ -435,6 +435,32 @@ def main():
             "Mutually exclusive with --read-only and --tools."
         ),
     )
+    parser.add_argument(
+        "--only-tools",
+        nargs="+",
+        metavar="TOOL_NAME",
+        help=(
+            "Expose exactly the named tools (per-tool-name allowlist) and request "
+            "only the OAuth scopes those specific tools require. "
+            "Example: --only-tools send_gmail_message manage_drive_access. "
+            "Mutually exclusive with --tools, --tool-tier, --permissions, and --read-only."
+        ),
+    )
+    parser.add_argument(
+        "--exclude-tools",
+        nargs="+",
+        metavar="TOOL_NAME",
+        help=(
+            "Remove the named tools (per-tool-name blocklist) from whatever set "
+            "the other selectors produced. COMPOSES with --permissions, --tools, "
+            "--tool-tier, and the default (it is NOT mutually exclusive with them). "
+            "Unlike --only-tools, this does NOT drop any OAuth scopes: the token "
+            "keeps the scopes of the remaining tools, so use it to drop a tool "
+            "whose scope is shared with tools you keep. "
+            "Example: --permissions drive:full --exclude-tools manage_drive_access "
+            "set_drive_file_permissions."
+        ),
+    )
     args = parser.parse_args()
 
     # Env var fallbacks for plugin users who configure via userConfig.
@@ -549,6 +575,23 @@ def main():
             file=sys.stderr,
         )
         sys.exit(1)
+    if args.only_tools is not None and (
+        args.tools is not None
+        or args.tool_tier is not None
+        or args.permissions is not None
+        or args.read_only
+        or args.exclude_tools is not None
+    ):
+        print(
+            "Error: --only-tools cannot be combined with --tools, --tool-tier, "
+            "--permissions, --read-only, or --exclude-tools "
+            "(via CLI flag or WORKSPACE_MCP_* env var). "
+            "--only-tools is an exact per-tool allowlist and selects scopes on its "
+            "own — excluding one of its tools would drop it from the surface while "
+            "still requesting its scope, so just omit it from --only-tools instead.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     validate_streamable_http_auth(args.transport)
     resolve_callback_port_for_transport(args.transport)
@@ -608,7 +651,23 @@ def main():
 
     # Determine which tools to import based on arguments
     perms = None
-    if args.permissions:
+    if args.only_tools is not None:
+        from core.tool_tier_loader import ToolTierLoader
+
+        requested = list(dict.fromkeys(args.only_tools))  # de-dup, keep order
+        loader = ToolTierLoader()
+        known_tools = loader.get_all_tool_names()  # the new public helper
+        unknown = [t for t in requested if t not in known_tools]
+        if unknown:
+            print(
+                f"Error: unknown tool name(s) for --only-tools: {', '.join(unknown)}. "
+                f"Each must be a registered tool name (see core/tool_tiers.yaml).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        tools_to_import = sorted(loader.get_services_for_tools(requested))
+        set_enabled_tool_names(set(requested))
+    elif args.permissions:
         # Granular permissions mode — parse and activate before tool selection
         from auth.permissions import parse_permissions_arg, set_permissions
 
@@ -667,9 +726,14 @@ def main():
 
     wrap_server_tool_method(server)
 
-    from auth.scopes import set_enabled_tools, set_read_only
+    from auth.scopes import set_enabled_tools, set_read_only, set_explicit_scopes
 
     set_enabled_tools(list(tools_to_import))
+    # Clear any explicit-scope override left from a prior in-process run; only the
+    # --only-tools branch below sets it. Without this reset, a second main() call
+    # in the same process (tests, or an embedded re-init) that does NOT use
+    # --only-tools would reuse the stale exact-scope grant and request wrong scopes.
+    set_explicit_scopes(None)
     if args.read_only:
         set_read_only(True)
 
@@ -699,6 +763,52 @@ def main():
     for tool, exc in failed:
         ui.step(f"{tool.title()} failed to load", state="fail")
         ui.detail(str(exc))
+
+    if args.only_tools is not None:
+        from core.tool_registry import get_tool_components
+
+        components = get_tool_components(server)
+        minimal_scopes = set()
+        missing = []
+        for name in args.only_tools:
+            obj = components.get(name)
+            if obj is None:
+                missing.append(name)
+                continue
+            fn = getattr(obj, "fn", obj)
+            minimal_scopes.update(getattr(fn, "_required_google_scopes", []) or [])
+        if missing:
+            print(
+                f"Error: --only-tools selected tool(s) did not register: "
+                f"{', '.join(missing)}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        set_explicit_scopes(minimal_scopes)
+        safe_print(
+            f"🎯 only-tools: {len(args.only_tools)} tools, "
+            f"{len(minimal_scopes)} minimal scopes"
+        )
+
+    # Per-tool-name blocklist (--exclude-tools). Runs for every selection mode:
+    # it composes with whatever was selected above by trimming tools at the tool
+    # layer WITHOUT touching the requested OAuth scopes.
+    if args.exclude_tools is not None:
+        from core.tool_tier_loader import ToolTierLoader
+        from core.tool_registry import set_excluded_tools
+
+        excluded = list(dict.fromkeys(args.exclude_tools))  # de-dup, keep order
+        known_tools = ToolTierLoader().get_all_tool_names()
+        unknown = [t for t in excluded if t not in known_tools]
+        if unknown:
+            print(
+                f"Error: unknown tool name(s) for --exclude-tools: {', '.join(unknown)}. "
+                f"Each must be a registered tool name (see core/tool_tiers.yaml).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        set_excluded_tools(set(excluded))
+        safe_print(f"🚫 exclude-tools: {len(excluded)} tools removed")
 
     if perms:
         ui.blank()

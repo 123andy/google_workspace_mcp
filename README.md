@@ -281,3 +281,26 @@ MIT - see [`LICENSE`](LICENSE). The license is 21 lines and says what it means.
 Validations:
 [![MCP Badge](https://lobehub.com/badge/mcp/taylorwilsdon-google_workspace_mcp)](https://lobehub.com/mcp/taylorwilsdon-google_workspace_mcp)
 
+
+---
+
+## Fork additions (scientist-hq)
+
+This is the **scientist-hq fork** (branch `integration2` = upstream `main` + the fork feature set).
+Everything below is fork-only until upstreamed; each feature is off by default and a no-op unless
+its flag/env is set. Upstream PRs in flight: [#887](https://github.com/taylorwilsdon/google_workspace_mcp/pull/887)
+(tool flags), [#888](https://github.com/taylorwilsdon/google_workspace_mcp/pull/888) (signed URLs),
+[#891](https://github.com/taylorwilsdon/google_workspace_mcp/pull/891) (gateway identity),
+[#943](https://github.com/taylorwilsdon/google_workspace_mcp/pull/943) (compose-then-send drafts).
+
+| Feature | Switch | Docs |
+|---|---|---|
+| `--only-tools` (allowlist + minimal scopes) / `--exclude-tools` (blocklist, scopes untouched) | CLI flags | [docs/granular-tool-selection.md](docs/granular-tool-selection.md) |
+| Share-domain allowlist — Drive sharing restricted to listed domains; `anyone`/link access rejected | `WORKSPACE_MCP_ALLOWED_SHARE_DOMAINS`, `WORKSPACE_MCP_SHARE_RESTRICTED_MESSAGE` | [docs/granular-tool-selection.md](docs/granular-tool-selection.md#restricting-drive-sharing-to-trusted-domains) |
+| Signed streaming URLs for attachments/exports, short `/dl/{handle}` claim-check form | `WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS`, `WORKSPACE_MCP_SHORT_SIGNED_URLS`, `WORKSPACE_MCP_ATTACHMENT_SIGNING_KEY` | fork PR [#888](https://github.com/taylorwilsdon/google_workspace_mcp/pull/888) |
+| Trusted-gateway identity — per-request principal from a signed gateway assertion | `TRUST_GATEWAY_IDENTITY`, `GATEWAY_IDENTITY_JWKS_URL` | [docs/trusted-gateway-identity.md](docs/trusted-gateway-identity.md) |
+| Postgres credential store (Fernet-encrypted) + Postgres KV backend for the OAuth proxy / caches | `WORKSPACE_MCP_CREDENTIAL_STORE_BACKEND=postgres`, `WORKSPACE_MCP_CREDENTIAL_POSTGRES_DSN`, `WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND=postgres`, `WORKSPACE_MCP_OAUTH_PROXY_POSTGRES_DSN` | `core/storage.py`, `auth/credential_store.py` |
+| Compose-then-send drafts: `send_gmail_draft` (draft_id-first), draft-forward; `list_drafts` | tools | upstream PR [#943](https://github.com/taylorwilsdon/google_workspace_mcp/pull/943) |
+| Short `/auth/{handle}` sign-in links (markdown-rendered auth URLs) | on with signed URLs | `core/auth_handles.py` |
+| Remote-safe Drive uploads (`return_upload_url`) + Gmail Drive attachments (ports of upstream [#871](https://github.com/taylorwilsdon/google_workspace_mcp/pull/871)/[#873](https://github.com/taylorwilsdon/google_workspace_mcp/pull/873)) | tool params | those PRs |
+| Untruncated message export delivered as a signed URL — grafted onto upstream's `get_gmail_message_content(full=True)` | on with signed URLs | fork docs |

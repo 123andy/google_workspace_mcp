@@ -5,6 +5,7 @@ This module provides MCP tools for interacting with Google Drive API.
 """
 
 import asyncio
+import json
 import logging
 import io
 import base64
@@ -50,17 +51,42 @@ from gdrive.drive_helpers import (
     build_drive_list_params,
     check_public_link_permission,
     format_permission_info,
+    get_allowed_share_domains,
     get_drive_image_url,
     has_explicit_trashed_clause,
     resolve_drive_item,
     resolve_file_type_mime,
     resolve_folder_id,
+    share_restriction_doc_note,
+    share_restriction_message,
+    validate_existing_permission_target,
     validate_expiration_time,
     validate_share_role,
+    validate_share_target,
     validate_share_type,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _with_share_restriction_note(func):
+    """Add the share-domain-allowlist note (when configured) to a sharing
+    tool's docstring. Must be the innermost decorator: the outer decorators
+    re-derive/copy __doc__ from the wrapped function, carrying the amended
+    text into the registered tool description. FastMCP's docstring parser
+    keeps only the text above "Args:" as the description (the rest becomes
+    parameter schema docs), so the note is inserted there, not appended."""
+    note = share_restriction_doc_note()
+    doc = func.__doc__
+    if note and doc:
+        marker = "\n    Args:"
+        if marker in doc:
+            head, _, tail = doc.partition(marker)
+            func.__doc__ = f"{head.rstrip()}{note}\n{marker}{tail}"
+        else:
+            func.__doc__ = doc + note
+    return func
+
 
 SHARED_DRIVE_ORGANIZER_CONCURRENCY_LIMIT = 10
 
@@ -466,6 +492,80 @@ async def get_drive_file_download_url(
             output_mime_type = export_mime_type
             if not output_filename.endswith(".pdf"):
                 output_filename = f"{Path(output_filename).stem}.pdf"
+
+    # Design A: signed-URL streaming. Drive file ids are stable, so we resolve the
+    # filename/MIME above and sign them straight into the token; the /attachments/
+    # signed route streams the bytes (get_media / export_media) on demand. No base64
+    # through the model, nothing on disk — the path the stateless hosted gateway
+    # needs. We early-return before downloading anything in this process.
+    from core.attachment_signing import (
+        signed_attachment_urls_enabled,
+        build_download_url,
+        clamp_ttl_to_expiry,
+        format_ttl,
+    )
+
+    if signed_attachment_urls_enabled():
+        ref = {"fid": file_id}
+        if export_mime_type:
+            ref["emt"] = export_mime_type  # native Google file → export, not get_media
+
+        # Recover the owner's credentials up front: stash a snapshot so the route can
+        # recover them by email on any replica, and CLAMP the URL/cache TTL to the
+        # token's remaining life. In OAuth 2.1 proxy mode the recovered token has no
+        # refresh_token, so a URL must not outlive the snapshot it depends on.
+        from auth.oauth21_session_store import get_oauth21_session_store
+
+        creds = None
+        try:
+            creds = get_oauth21_session_store().get_credentials(user_google_email)
+        except Exception as cred_exc:
+            logger.debug(
+                f"[get_drive_file_download_url] Could not recover credentials: {cred_exc}"
+            )
+
+        # Only hand out a signed URL the route can actually serve: the owner's
+        # credentials must be recoverable, and the URL must fit inside the
+        # credential's remaining life (eff_ttl > 0). Otherwise fall through to the
+        # normal download path rather than returning a URL guaranteed to 401.
+        eff_ttl = clamp_ttl_to_expiry(creds.expiry) if creds else 0
+        if creds and eff_ttl > 0:
+            download_url = await build_download_url(
+                source="drive",
+                user_email=user_google_email,
+                ref=ref,
+                filename=output_filename,
+                mime_type=output_mime_type,
+                ttl_seconds=eff_ttl,
+            )
+
+            try:
+                from core.attachment_cred_cache import stash_credentials
+
+                await stash_credentials(user_google_email, creds, ttl_seconds=eff_ttl)
+            except Exception as cache_exc:
+                logger.debug(
+                    f"[get_drive_file_download_url] Could not pre-cache credentials: {cache_exc}"
+                )
+
+            logger.info(
+                "[get_drive_file_download_url] Returning signed streaming URL (no download)"
+            )
+            return "\n".join(
+                [
+                    "File ready — streamed on demand (no base64, nothing stored).",
+                    f"File: {file_name}",
+                    f"File ID: {file_id}",
+                    f"MIME Type: {output_mime_type}",
+                    f"\n📎 Download URL: {download_url}",
+                    "\nThe server streams the bytes directly from Drive when this URL is "
+                    f"fetched; the link is signed to you and expires in {format_ttl(eff_ttl)}.",
+                ]
+            )
+        logger.info(
+            "[get_drive_file_download_url] Signed URL unavailable (no recoverable "
+            "credentials or token too near expiry); falling back to download."
+        )
 
     # Download the file
     request_obj = (
@@ -892,6 +992,75 @@ async def create_drive_folder(
     )
 
 
+def _is_remote_transport() -> bool:
+    """True when the server is reachable over the network (streamable-http).
+
+    In that mode the client and server are different machines, so server-side
+    file ingestion (``file://`` paths, and by extension fetching bytes the client
+    holds) is misleading: those paths/URLs resolve on the *server*, not the caller.
+    """
+    return get_transport_mode() == "streamable-http"
+
+
+async def _initiate_resumable_upload_session(
+    service,
+    *,
+    mime_type: str,
+    file_metadata: Optional[Dict[str, Any]] = None,
+    file_id: Optional[str] = None,
+    content_length: Optional[int] = None,
+) -> str:
+    """Initiate a Drive resumable upload session and return the session URL.
+
+    ``file_id`` absent -> ``POST`` (create a new file); present -> ``PATCH`` (replace
+    the content of an existing file). The returned ``Location`` URL is pre-authorized:
+    the caller can ``PUT`` the bytes straight to Google with no Authorization header,
+    so the payload never flows through this server. Uses the request user's authorized
+    transport (``service._http``) for the initiation call only.
+    """
+    base = "https://www.googleapis.com/upload/drive/v3/files"
+    if file_id:
+        url = f"{base}/{file_id}?uploadType=resumable&supportsAllDrives=true"
+        method = "PATCH"
+    else:
+        url = f"{base}?uploadType=resumable&supportsAllDrives=true"
+        method = "POST"
+
+    headers = {
+        "Content-Type": "application/json; charset=UTF-8",
+        "X-Upload-Content-Type": mime_type,
+    }
+    if content_length is not None:
+        headers["X-Upload-Content-Length"] = str(content_length)
+
+    response, _ = await asyncio.to_thread(
+        service._http.request,
+        url,
+        method=method,
+        body=json.dumps(file_metadata or {}),
+        headers=headers,
+    )
+
+    status = int(response.status)
+    if status not in (200, 201):
+        raise Exception(f"Failed to initiate resumable upload session (HTTP {status}).")
+    upload_url = response.get("location")
+    if not upload_url:
+        raise Exception(
+            "Resumable upload session was created but Google returned no session URL."
+        )
+    return upload_url
+
+
+def _format_resumable_upload_instructions(upload_url: str, mime_type: str) -> str:
+    return (
+        f"Upload URL (no Authorization header required):\n{upload_url}\n\n"
+        f"Upload the bytes with a single PUT request, e.g.:\n"
+        f"  curl -X PUT -H 'Content-Type: {mime_type}' --data-binary @<file> '{upload_url}'\n\n"
+        f"The session is single-use and expires roughly one week after creation."
+    )
+
+
 @server.tool(
     title="Create Drive File",
     annotations=ToolAnnotations(
@@ -913,10 +1082,23 @@ async def create_drive_file(
     fileUrl: Optional[str] = None,  # Now explicitly Optional
     base64_content: Optional[str] = None,
     content_mime_type: Optional[str] = None,
+    return_upload_url: bool = False,
+    content_length: Optional[int] = None,
 ) -> str:
     """
     Creates a new file in Google Drive, supporting creation within shared drives.
-    Accepts direct text content, inline base64 bytes, or a fileUrl to fetch content from.
+    Accepts direct text content, inline base64 bytes, a fileUrl, or — for binary/large
+    files — a pre-authorized resumable upload URL.
+
+    Ways to provide the bytes:
+    - ``content``: inline text. Works in every transport mode.
+    - ``base64_content`` (+ ``content_mime_type``): inline base64 bytes.
+    - ``fileUrl``: the server fetches the bytes. Only available in local (stdio)
+      mode; ``file://`` reads the *server's* filesystem, so it is rejected when the
+      server runs remotely (streamable-http).
+    - ``return_upload_url=True``: returns a resumable upload URL instead of creating
+      the file inline. The caller then PUTs the bytes straight to Google with no auth
+      header — the recommended way to upload binary/large files to a remote server.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -924,16 +1106,55 @@ async def create_drive_file(
         content (Optional[str]): If provided, the content to write to the file.
         folder_id (str): The ID of the parent folder. Defaults to 'root'. For shared drives, this must be a folder ID within the shared drive.
         mime_type (str): The MIME type of the file. Defaults to 'text/plain'.
-        fileUrl (Optional[str]): If provided, fetches the file content from this URL. Supports file://, http://, and https:// protocols.
+        fileUrl (Optional[str]): If provided, fetches the file content from this URL. Supports file://, http://, and https:// protocols. Unavailable in remote (streamable-http) mode.
         base64_content (Optional[str]): Standard base64-encoded file bytes.
         content_mime_type (Optional[str]): MIME type for base64_content uploads.
+        return_upload_url (bool): If True, return a resumable upload URL for the new file instead of creating it from inline content.
+        content_length (Optional[int]): Exact byte length for the resumable upload, if known (sent as X-Upload-Content-Length).
 
     Returns:
-        str: Confirmation message of the successful file creation with file link.
+        str: Confirmation of the created file, or the resumable upload URL.
     """
     logger.info(
-        f"[create_drive_file] Invoked. Email: '{user_google_email}', File Name: {file_name}, Folder ID: {folder_id}, fileUrl: {fileUrl}"
+        f"[create_drive_file] Invoked. Email: '{user_google_email}', File Name: {file_name}, Folder ID: {folder_id}, fileUrl: {fileUrl}, return_upload_url: {return_upload_url}"
     )
+
+    # Resumable upload URL path: hand back a pre-authorized session URL and stop.
+    if return_upload_url:
+        if content is not None or fileUrl is not None or base64_content is not None:
+            raise ValueError(
+                "return_upload_url cannot be combined with 'content', 'fileUrl', or "
+                "'base64_content'."
+            )
+        if mime_type == FOLDER_MIME_TYPE:
+            raise ValueError("return_upload_url is not applicable to folders.")
+        resolved_folder_id = await resolve_folder_id(service, folder_id)
+        upload_url = await _initiate_resumable_upload_session(
+            service,
+            mime_type=mime_type,
+            file_metadata={
+                "name": file_name,
+                "parents": [resolved_folder_id],
+                "mimeType": mime_type,
+            },
+            content_length=content_length,
+        )
+        logger.info(
+            f"[create_drive_file] Returned resumable upload URL for '{file_name}'."
+        )
+        return (
+            f"Resumable upload session created for new file '{file_name}' "
+            f"(folder '{folder_id}', for {user_google_email}).\n\n"
+            + _format_resumable_upload_instructions(upload_url, mime_type)
+        )
+
+    # fileUrl reads the server's filesystem / fetches server-side; misleading remotely.
+    if fileUrl is not None and _is_remote_transport():
+        raise ValueError(
+            "'fileUrl' is unavailable in remote (streamable-http) mode because it "
+            "resolves on the server, not the caller. Pass return_upload_url=True to "
+            "get a resumable upload URL to PUT your bytes to, or send text via 'content'."
+        )
 
     has_existing_content_source = content is not None or bool(fileUrl)
     if (
@@ -1783,6 +2004,8 @@ async def update_drive_file(
     file_path: Optional[str] = None,  # Local file path (DOCX, ODT, etc.)
     file_url: Optional[str] = None,  # Remote URL to fetch content from
     source_format: Optional[str] = None,  # Format hint (md, docx, txt, html, rtf, odt)
+    return_upload_url: bool = False,
+    content_length: Optional[int] = None,
 ) -> str:
     """
     Updates metadata, properties, and/or content of a Google Drive file.
@@ -1792,6 +2015,15 @@ async def update_drive_file(
     API applies the same format conversion as import_to_google_doc (markdown headings,
     tables, bold, etc.) while preserving the existing file ID, sharing, comments, and
     links. Metadata and content can be updated in a single call.
+
+    Content sources behave the same way as in ``create_drive_file``:
+    - ``content``: inline text, available in every transport mode.
+    - ``file_path``/``file_url``: server-side ingestion; only available in local
+      (stdio) mode, and rejected when the server runs remotely (streamable-http)
+      because they resolve on the server, not the caller.
+    - ``return_upload_url=True``: apply any metadata changes, then return a resumable
+      upload URL the caller PUTs the new bytes to directly (recommended for binary or
+      large content on a remote server).
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -1807,14 +2039,18 @@ async def update_drive_file(
         copy_requires_writer_permission (Optional[bool]): Whether copying requires writer permission.
         properties (Optional[dict]): Custom key-value properties for the file.
         content (Optional[str]): New text content for text-based formats (markdown, TXT, HTML).
-        file_path (Optional[str]): Local file path for binary formats (DOCX, ODT). Supports file:// URLs.
-        file_url (Optional[str]): Remote http(s) URL to fetch new content from.
+        file_path (Optional[str]): Local file path for binary formats (DOCX, ODT). Supports file:// URLs. Unavailable in remote (streamable-http) mode.
+        file_url (Optional[str]): Remote http(s) URL to fetch new content from. Unavailable in remote (streamable-http) mode.
         source_format (Optional[str]): Source format hint for conversion
             (md, markdown, docx, txt, html, rtf, odt). Auto-detected when omitted.
             Provide at most one of content/file_path/file_url.
+        return_upload_url (bool): If True, apply metadata changes and return a resumable
+            upload URL for replacing the file's content (instead of uploading inline).
+        content_length (Optional[int]): Exact byte length for the resumable upload, if known.
 
     Returns:
-        str: Confirmation message with details of the updates applied.
+        str: Confirmation message with details of the updates applied, or the
+            resumable upload URL.
     """
     logger.info(f"[update_drive_file] Updating file {file_id} for {user_google_email}")
 
@@ -1879,6 +2115,47 @@ async def update_drive_file(
     # Only include body if there are updates
     if update_body:
         query_params["body"] = update_body
+
+    # Remote-safe content replacement: hand back a pre-authorized resumable PUT URL.
+    if return_upload_url:
+        if any(x is not None for x in (content, file_path, file_url)):
+            raise ValueError(
+                "return_upload_url replaces content via a resumable PUT; do not also "
+                "pass 'content', 'file_path', or 'file_url'."
+            )
+        # Apply any metadata-only changes first, then return the upload URL.
+        if (
+            "body" in query_params
+            or "addParents" in query_params
+            or "removeParents" in query_params
+        ):
+            await asyncio.to_thread(
+                service.files().update(**query_params).execute, num_retries=0
+            )
+        upload_mime = (
+            mime_type or current_file.get("mimeType") or "application/octet-stream"
+        )
+        upload_url = await _initiate_resumable_upload_session(
+            service,
+            mime_type=upload_mime,
+            file_id=file_id,
+            content_length=content_length,
+        )
+        logger.info(f"[update_drive_file] Returned resumable upload URL for {file_id}.")
+        return (
+            f"Resumable upload session created to replace content of "
+            f"'{current_file.get('name', file_id)}' (ID {file_id}, for {user_google_email}).\n\n"
+            + _format_resumable_upload_instructions(upload_url, upload_mime)
+        )
+
+    # file_path/file_url ingest on the server is misleading when reached remotely.
+    if (file_path is not None or file_url is not None) and _is_remote_transport():
+        raise ValueError(
+            "'file_path'/'file_url' are unavailable in remote (streamable-http) mode "
+            "because they resolve on the server, not the caller. Pass "
+            "return_upload_url=True to get a resumable upload URL to PUT new content "
+            "to, or send text via 'content'."
+        )
 
     # Replacement content is uploaded with its source MIME type so Drive converts it
     # into the file's existing type — the same engine import_to_google_doc uses.
@@ -2068,6 +2345,7 @@ async def get_drive_shareable_link(
 )
 @handle_http_errors("manage_drive_access", is_read_only=False, service_type="drive")
 @require_google_service("drive", "drive_file")
+@_with_share_restriction_note
 async def manage_drive_access(
     service,
     user_google_email: str,
@@ -2144,6 +2422,7 @@ async def manage_drive_access(
         effective_role = role or "reader"
         validate_share_role(effective_role)
         validate_share_type(share_type)
+        validate_share_target(share_type, share_with)
 
         if share_type in ("user", "group") and not share_with:
             raise ValueError(f"share_with is required for share_type '{share_type}'")
@@ -2246,6 +2525,13 @@ async def manage_drive_access(
                 failure_count += 1
                 continue
 
+            try:
+                validate_share_target(r_share_type, identifier)
+            except ValueError as e:
+                results.append(f"  - {identifier}: Failed - {e}")
+                failure_count += 1
+                continue
+
             r_perm_body: Dict[str, Any] = {
                 "type": r_share_type,
                 "role": r_role,
@@ -2321,18 +2607,24 @@ async def manage_drive_access(
         file_id = resolved_file_id
 
         effective_role = role
-        if not effective_role:
+        share_domains_active = get_allowed_share_domains() is not None
+        if not effective_role or share_domains_active:
             current_permission = await asyncio.to_thread(
                 service.permissions()
                 .get(
                     fileId=file_id,
                     permissionId=permission_id,
                     supportsAllDrives=True,
-                    fields="role",
+                    fields="role, type, emailAddress, domain",
                 )
                 .execute
             )
-            effective_role = current_permission.get("role")
+            # The allowlist must also cover updates — otherwise an existing
+            # external permission could be escalated (e.g. reader → writer).
+            if share_domains_active:
+                validate_existing_permission_target(current_permission)
+            if not effective_role:
+                effective_role = current_permission.get("role")
 
         update_body: Dict[str, Any] = {"role": effective_role}
         if expiration_time:
@@ -2391,6 +2683,7 @@ async def manage_drive_access(
     # action == "transfer_owner"
     if not new_owner_email:
         raise ValueError("new_owner_email is required for 'transfer_owner' action")
+    validate_share_target("user", new_owner_email)
 
     resolved_file_id, file_metadata = await resolve_drive_item(
         service, file_id, extra_fields="name, owners"
@@ -2525,6 +2818,7 @@ async def copy_drive_file(
     "set_drive_file_permissions", is_read_only=False, service_type="drive"
 )
 @require_google_service("drive", "drive_file")
+@_with_share_restriction_note
 async def set_drive_file_permissions(
     service,
     user_google_email: str,
@@ -2576,6 +2870,14 @@ async def set_drive_file_permissions(
         raise ValueError(
             f"Invalid link_sharing '{link_sharing}'. Must be one of: {', '.join(sorted(valid_link_sharing))}"
         )
+
+    if link_sharing is not None and link_sharing != "off":
+        share_domains = get_allowed_share_domains()
+        if share_domains is not None:
+            raise ValueError(
+                f"link_sharing '{link_sharing}' would grant 'anyone with the"
+                " link' access. " + share_restriction_message(share_domains)
+            )
 
     resolved_file_id, file_metadata = await resolve_drive_item(
         service, file_id, extra_fields="name, webViewLink"

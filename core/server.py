@@ -35,7 +35,14 @@ from core.config import (
     set_transport_mode as _set_transport_mode,
     get_oauth_redirect_uri as get_oauth_redirect_uri_for_current_mode,
 )
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    FileResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.google import GoogleProvider
 from mcp.types import ToolAnnotations, Icon
@@ -332,11 +339,6 @@ auth_info_middleware = AuthInfoMiddleware()
 server.add_middleware(auth_info_middleware)
 
 
-def _parse_bool_env(value: str) -> bool:
-    """Parse environment variable string to boolean."""
-    return value.lower() in ("1", "true", "yes", "on")
-
-
 def _parse_allowed_redirect_uris(value: Optional[str]) -> Optional[List[str]]:
     """Parse a comma-separated list of OAuth client redirect URIs.
 
@@ -431,217 +433,43 @@ def configure_server_for_http():
             provider_valid_scopes: List[str] = sorted(get_current_scopes())
             provider_required_scopes: List[str] = sorted(PROTOCOL_AUTH_SCOPES)
 
-            client_storage = None
             jwt_signing_key_override = (
                 os.getenv("FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY", "").strip()
                 or None
             )
-            storage_backend = (
-                os.getenv("WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND", "")
-                .strip()
-                .lower()
+            # Derived up front: every storage backend and both provider modes
+            # need it, and a missing secret should fail loudly here rather than
+            # after a storage backend was silently skipped.
+            jwt_signing_key = validate_and_derive_jwt_key(
+                jwt_signing_key_override, config.client_secret
             )
-            valkey_host = os.getenv("WORKSPACE_MCP_OAUTH_PROXY_VALKEY_HOST", "").strip()
 
-            # Determine storage backend: valkey, disk, memory (default)
-            use_valkey = storage_backend == "valkey" or bool(valkey_host)
-            use_disk = storage_backend == "disk"
+            from core.storage import get_configured_kv_store
 
-            if use_valkey:
-                try:
-                    from key_value.aio.stores.valkey import ValkeyStore
-
-                    valkey_port_raw = os.getenv(
-                        "WORKSPACE_MCP_OAUTH_PROXY_VALKEY_PORT", "6379"
-                    ).strip()
-                    valkey_db_raw = os.getenv(
-                        "WORKSPACE_MCP_OAUTH_PROXY_VALKEY_DB", "0"
-                    ).strip()
-
-                    valkey_port = int(valkey_port_raw)
-                    valkey_db = int(valkey_db_raw)
-                    valkey_use_tls_raw = os.getenv(
-                        "WORKSPACE_MCP_OAUTH_PROXY_VALKEY_USE_TLS", ""
-                    ).strip()
-                    valkey_use_tls = (
-                        _parse_bool_env(valkey_use_tls_raw)
-                        if valkey_use_tls_raw
-                        else valkey_port == 6380
-                    )
-
-                    valkey_request_timeout_ms_raw = os.getenv(
-                        "WORKSPACE_MCP_OAUTH_PROXY_VALKEY_REQUEST_TIMEOUT_MS", ""
-                    ).strip()
-                    valkey_connection_timeout_ms_raw = os.getenv(
-                        "WORKSPACE_MCP_OAUTH_PROXY_VALKEY_CONNECTION_TIMEOUT_MS", ""
-                    ).strip()
-
-                    valkey_request_timeout_ms = (
-                        int(valkey_request_timeout_ms_raw)
-                        if valkey_request_timeout_ms_raw
-                        else None
-                    )
-                    valkey_connection_timeout_ms = (
-                        int(valkey_connection_timeout_ms_raw)
-                        if valkey_connection_timeout_ms_raw
-                        else None
-                    )
-
-                    valkey_username = (
-                        os.getenv(
-                            "WORKSPACE_MCP_OAUTH_PROXY_VALKEY_USERNAME", ""
-                        ).strip()
-                        or None
-                    )
-                    valkey_password = (
-                        os.getenv(
-                            "WORKSPACE_MCP_OAUTH_PROXY_VALKEY_PASSWORD", ""
-                        ).strip()
-                        or None
-                    )
-
-                    if not valkey_host:
-                        valkey_host = "localhost"
-
-                    client_storage = ValkeyStore(
-                        host=valkey_host,
-                        port=valkey_port,
-                        db=valkey_db,
-                        username=valkey_username,
-                        password=valkey_password,
-                    )
-
-                    # Configure TLS and timeouts on the underlying Glide client config.
-                    # ValkeyStore currently doesn't expose these settings directly.
-                    glide_config = getattr(client_storage, "_client_config", None)
-                    if glide_config is not None:
-                        glide_config.use_tls = valkey_use_tls
-
-                        is_remote_host = valkey_host not in {"localhost", "127.0.0.1"}
-                        if valkey_request_timeout_ms is None and (
-                            valkey_use_tls or is_remote_host
-                        ):
-                            # Glide defaults to 250ms if unset; increase for remote/TLS endpoints.
-                            valkey_request_timeout_ms = 5000
-                        if valkey_request_timeout_ms is not None:
-                            glide_config.request_timeout = valkey_request_timeout_ms
-
-                        if valkey_connection_timeout_ms is None and (
-                            valkey_use_tls or is_remote_host
-                        ):
-                            valkey_connection_timeout_ms = 10000
-                        if valkey_connection_timeout_ms is not None:
-                            from glide_shared.config import (
-                                AdvancedGlideClientConfiguration,
-                            )
-
-                            glide_config.advanced_config = (
-                                AdvancedGlideClientConfiguration(
-                                    connection_timeout=valkey_connection_timeout_ms
-                                )
-                            )
-
-                    jwt_signing_key = validate_and_derive_jwt_key(
-                        jwt_signing_key_override, config.client_secret
-                    )
-
+            client_storage = None
+            configured_storage = get_configured_kv_store()
+            if configured_storage is not None:
+                client_storage = configured_storage.store
+                if configured_storage.needs_encryption:
                     storage_encryption_key = derive_jwt_key(
                         high_entropy_material=jwt_signing_key.decode(),
                         salt="fastmcp-storage-encryption-key",
                     )
-
                     client_storage = FernetEncryptionWrapper(
                         key_value=client_storage,
                         fernet=Fernet(key=storage_encryption_key),
                     )
-                    logger.info(
-                        "OAuth 2.1: Using ValkeyStore for FastMCP OAuth proxy client_storage (host=%s, port=%s, db=%s, tls=%s)",
-                        valkey_host,
-                        valkey_port,
-                        valkey_db,
-                        valkey_use_tls,
-                    )
-                    if valkey_request_timeout_ms is not None:
-                        logger.info(
-                            "OAuth 2.1: Valkey request timeout set to %sms",
-                            valkey_request_timeout_ms,
-                        )
-                    if valkey_connection_timeout_ms is not None:
-                        logger.info(
-                            "OAuth 2.1: Valkey connection timeout set to %sms",
-                            valkey_connection_timeout_ms,
-                        )
-                    logger.info(
-                        "OAuth 2.1: Applied Fernet encryption wrapper to Valkey client_storage (key derived from FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY or GOOGLE_OAUTH_CLIENT_SECRET)."
-                    )
-                except ImportError as exc:
-                    logger.warning(
-                        "OAuth 2.1: Valkey client_storage requested but Valkey dependencies are not installed (%s). "
-                        "Install 'workspace-mcp[valkey]' (or 'py-key-value-aio[valkey]', which includes 'valkey-glide') "
-                        "or unset WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND/WORKSPACE_MCP_OAUTH_PROXY_VALKEY_HOST.",
-                        exc,
-                    )
-                except ValueError as exc:
-                    logger.warning(
-                        "OAuth 2.1: Invalid Valkey configuration; falling back to default storage (%s).",
-                        exc,
-                    )
-            elif use_disk:
-                try:
-                    from core.storage import make_sanitized_file_store
-
-                    disk_directory = os.getenv(
-                        "WORKSPACE_MCP_OAUTH_PROXY_DISK_DIRECTORY", ""
-                    ).strip()
-                    if not disk_directory:
-                        # Default to FASTMCP_HOME/oauth-proxy or ~/.fastmcp/oauth-proxy
-                        fastmcp_home = os.getenv("FASTMCP_HOME", "").strip()
-                        if fastmcp_home:
-                            disk_directory = os.path.join(fastmcp_home, "oauth-proxy")
-                        else:
-                            disk_directory = os.path.expanduser(
-                                "~/.fastmcp/oauth-proxy"
-                            )
-
-                    client_storage = make_sanitized_file_store(disk_directory)
-
-                    jwt_signing_key = validate_and_derive_jwt_key(
-                        jwt_signing_key_override, config.client_secret
-                    )
-
-                    storage_encryption_key = derive_jwt_key(
-                        high_entropy_material=jwt_signing_key.decode(),
-                        salt="fastmcp-storage-encryption-key",
-                    )
-
-                    client_storage = FernetEncryptionWrapper(
-                        key_value=client_storage,
-                        fernet=Fernet(key=storage_encryption_key),
-                    )
-                    logger.info(
-                        "OAuth 2.1: Using FileTreeStore for FastMCP OAuth proxy client_storage (directory=%s)",
-                        disk_directory,
-                    )
-                except ImportError as exc:
-                    logger.warning(
-                        "OAuth 2.1: Disk storage requested but dependencies not available (%s). "
-                        "Falling back to default storage.",
-                        exc,
-                    )
-            elif storage_backend == "memory":
-                from key_value.aio.stores.memory import MemoryStore
-
-                client_storage = MemoryStore()
                 logger.info(
-                    "OAuth 2.1: Using MemoryStore for FastMCP OAuth proxy client_storage"
+                    "OAuth 2.1: Using %s for FastMCP OAuth proxy client_storage (%s)%s",
+                    type(configured_storage.store).__name__,
+                    configured_storage.detail,
+                    " with Fernet encryption (key derived from "
+                    "FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY or "
+                    "GOOGLE_OAUTH_CLIENT_SECRET)"
+                    if configured_storage.needs_encryption
+                    else "",
                 )
             # else: client_storage remains None, FastMCP uses its default
-
-            # Ensure JWT signing key is always derived for all storage backends
-            if "jwt_signing_key" not in locals():
-                jwt_signing_key = validate_and_derive_jwt_key(
-                    jwt_signing_key_override, config.client_secret
-                )
 
             # Check if external OAuth provider is configured
             if config.is_external_oauth21_provider():
@@ -686,6 +514,12 @@ def configure_server_for_http():
                     client_storage=client_storage,
                     jwt_signing_key=jwt_signing_key,
                     allowed_client_redirect_uris=allowed_client_redirect_uris,
+                    # Refresh the upstream Google token ~5 min before expiry rather
+                    # than only after it lapses. This keeps the credential snapshot
+                    # captured during a request (and stashed for signed-download URLs)
+                    # fuller-lived, so TTL-clamped URLs don't collapse toward their
+                    # floor near the hourly token boundary.
+                    token_expiry_threshold_seconds=300,
                 )
                 if provider.client_registration_options is not None:
                     # Keep protocol-level auth limited to base identity scopes, but
@@ -771,6 +605,169 @@ async def serve_attachment(request: Request):
         path=str(file_path),
         filename=metadata["filename"],
         media_type=metadata["mime_type"],
+    )
+
+
+@server.custom_route("/attachments/signed/{token}", methods=["GET"])
+async def serve_signed_attachment(request: Request):
+    """Stream a Google resource from a signed capability URL (Design A).
+
+    Unlike ``/attachments/{file_id}`` (which serves a file written to disk), this
+    route stores nothing. The signed token carries the resource reference, its
+    source (Gmail attachment, Drive file, ...), and its owner; we verify the
+    signature, recover the owner's Google credentials, dispatch to the matching
+    fetcher (``core.signed_download``), and stream the bytes back. The signature
+    *is* the per-user authorization — no bearer token is needed on the request, so
+    an agent can hand the URL to any HTTP client.
+
+    Credential recovery is two-tier: the in-process OAuth 2.1 session store first,
+    then a shared short-TTL credential cache (Valkey or Postgres, whichever backs
+    the OAuth proxy storage), so the URL works even when the request lands on a
+    replica that never ran the originating tool call.
+    """
+    from core.attachment_signing import verify_attachment_token
+
+    token = request.path_params["token"]
+    claims = verify_attachment_token(token)
+    if not claims:
+        return JSONResponse(
+            {"error": "Invalid or expired download link"}, status_code=403
+        )
+    return await _stream_download_for_claims(claims)
+
+
+@server.custom_route("/dl/{handle}", methods=["GET"])
+async def serve_short_download(request: Request):
+    """Short claim-check variant of ``/attachments/signed/{token}``.
+
+    The handle is a random 128-bit capability; the claims it references live in
+    the shared KV store with the same TTL a signed token would carry (see
+    ``core.download_handles``). Everything after claim recovery is identical to
+    the JWT route.
+    """
+    from core.download_handles import load_download_ref
+
+    claims = await load_download_ref(request.path_params["handle"])
+    if not claims:
+        return JSONResponse(
+            {"error": "Invalid or expired download link"}, status_code=403
+        )
+    return await _stream_download_for_claims(claims)
+
+
+@server.custom_route("/auth/{handle}", methods=["GET"])
+async def serve_short_auth_url(request: Request):
+    """Short claim-check redirect for a Google authorization URL.
+
+    The handle is a random 128-bit capability referencing a full ~800-char
+    authorization URL stored in the shared KV store with the OAuth state's TTL
+    (see ``core.auth_handles``). We 302-redirect to it. ``load_auth_url_ref``
+    only ever returns a validated ``https://accounts.google.com`` URL, so this
+    cannot become an open redirect.
+    """
+    from core.auth_handles import load_auth_url_ref
+
+    auth_url = await load_auth_url_ref(request.path_params["handle"])
+    if not auth_url:
+        return JSONResponse(
+            {"error": "Invalid or expired sign-in link"}, status_code=403
+        )
+    return RedirectResponse(url=auth_url, status_code=302)
+
+
+async def _stream_download_for_claims(claims: dict):
+    """Recover the owner's credentials for verified claims and stream the bytes."""
+    from auth.oauth21_session_store import get_oauth21_session_store
+    from core.signed_download import get_fetcher, SignedDownloadError
+
+    user_email = claims.get("sub")
+    fetcher = get_fetcher(claims.get("src", ""))
+    if not (user_email and fetcher):
+        return JSONResponse({"error": "Malformed download link"}, status_code=403)
+
+    # Recover the owner's credentials. In-process session first (the common
+    # same-process case); then the shared short-TTL cache, which is the path that
+    # makes signed URLs work across replicas (Design A, hosted).
+    credentials = get_oauth21_session_store().get_credentials(user_email)
+    if not credentials:
+        from core.attachment_cred_cache import load_credentials
+
+        credentials = await load_credentials(user_email)
+    if not credentials:
+        return JSONResponse(
+            {"error": "No active session for this download's owner"},
+            status_code=401,
+        )
+
+    # The recovered credential may be an expired Google access token. In OAuth 2.1
+    # proxy mode it carries no refresh_token (the proxy holds upstream refresh,
+    # unreachable from this bearer-less route), so an expired token can't be renewed
+    # here. Mirror the repo's own idiom (auth/google_auth.py) and return a precise
+    # retryable 401 instead of letting a failed refresh fall through to a 502. Use
+    # `.valid` (not `.expired`): a cached record may have expiry=None, for which
+    # `.expired` is False and would slip a dead token past this guard.
+    if not credentials.valid:
+        if credentials.refresh_token:  # forward-compat; today always None (see issue)
+            from google.auth.transport.requests import Request as GoogleAuthRequest
+
+            try:
+                await asyncio.to_thread(credentials.refresh, GoogleAuthRequest())
+            except Exception:
+                logger.info(
+                    "Signed download: token refresh failed for %s; re-auth needed",
+                    user_email,
+                )
+                return JSONResponse(
+                    {"error": "credentials expired - re-authenticate"}, status_code=401
+                )
+        else:
+            logger.info(
+                "Signed download: expired non-refreshable credentials for %s; "
+                "re-auth needed",
+                user_email,
+            )
+            return JSONResponse(
+                {"error": "credentials expired - re-authenticate"}, status_code=401
+            )
+
+    try:
+        result = await fetcher(claims, credentials)
+    except SignedDownloadError as e:
+        logger.error("Signed download fetch failed: %s", e)
+        return JSONResponse(
+            {"error": "Failed to fetch the requested resource"}, status_code=502
+        )
+
+    # Build a safe Content-Disposition. The filename comes from Gmail/Drive metadata
+    # (attacker-influenceable), so strip quotes/CR/LF for the ASCII fallback to
+    # prevent header injection, and add an RFC 5987 `filename*` so non-ASCII names
+    # survive intact (percent-encoded, no injection).
+    from urllib.parse import quote as _urlquote
+
+    raw_name = result.filename or "download"
+    ascii_name = (
+        raw_name.encode("ascii", "ignore")
+        .decode()
+        .replace('"', "")
+        .replace("\\", "")
+        .replace("\r", "")
+        .replace("\n", "")
+    ) or "download"
+    headers = {
+        "Content-Disposition": (
+            f'attachment; filename="{ascii_name}"; '
+            f"filename*=UTF-8''{_urlquote(raw_name, safe='')}"
+        )
+    }
+    if result.stream is not None:
+        # Bounded-memory streaming (Drive): chunks flow straight to the client.
+        return StreamingResponse(
+            result.stream, media_type=result.media_type, headers=headers
+        )
+    return Response(
+        content=result.content,
+        media_type=result.media_type,
+        headers=headers,
     )
 
 
