@@ -16,6 +16,7 @@ from tempfile import NamedTemporaryFile, SpooledTemporaryFile
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 from pathlib import Path
+from weakref import WeakValueDictionary
 
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
@@ -39,6 +40,7 @@ from core.config import get_transport_mode
 from gdrive.drive_helpers import (
     DRIVE_QUERY_PATTERNS,
     FOLDER_MIME_TYPE,
+    GOOGLE_APPS_MIME_PREFIX,
     GOOGLE_DOCS_IMPORT_FORMATS,
     GOOGLE_DOCS_MIME_TYPE,
     GOOGLE_SHEETS_IMPORT_FORMATS,
@@ -50,6 +52,8 @@ from gdrive.drive_helpers import (
     _stream_url_with_validation,
     build_drive_list_params,
     check_public_link_permission,
+    list_all_permissions,
+    derive_shared_state,
     format_permission_info,
     get_allowed_share_domains,
     get_drive_image_url,
@@ -95,6 +99,48 @@ IMPORT_FORMATS_BY_GOOGLE_MIME_TYPE = {
     GOOGLE_SHEETS_MIME_TYPE: GOOGLE_SHEETS_IMPORT_FORMATS,
     GOOGLE_SLIDES_MIME_TYPE: GOOGLE_SLIDES_IMPORT_FORMATS,
 }
+
+CONTENT_UPDATE_MODES = ("replace", "append", "prepend")
+_CONTENT_UPDATE_LOCKS: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+
+
+def _get_content_update_lock(file_id: str) -> asyncio.Lock:
+    """Return a cached lock for updates within one event loop and process.
+
+    This does not coordinate updates across processes, replicas, or other Drive clients.
+    """
+    lock = _CONTENT_UPDATE_LOCKS.get(file_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CONTENT_UPDATE_LOCKS[file_id] = lock
+    return lock
+
+
+async def _download_file_bytes(
+    service, file_id: str, export_mime_type: Optional[str] = None
+) -> bytes:
+    """Download a Drive file's bytes, exporting native Google types when requested."""
+    request_obj = (
+        service.files().export_media(fileId=file_id, mimeType=export_mime_type)
+        if export_mime_type
+        else service.files().get_media(fileId=file_id, supportsAllDrives=True)
+    )
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request_obj)
+    loop = asyncio.get_event_loop()
+    done = False
+    while not done:
+        _status, done = await loop.run_in_executor(None, downloader.next_chunk)
+    return fh.getvalue()
+
+
+def _splice_content(existing: str, addition: str, mode: str) -> str:
+    """Join new text onto existing text, guaranteeing a newline at the seam."""
+    head, tail = (existing, addition) if mode == "append" else (addition, existing)
+    separator = (
+        "\n" if head and not head.endswith("\n") and not tail.startswith("\n") else ""
+    )
+    return f"{head}{separator}{tail}"
 
 
 @server.tool(
@@ -314,19 +360,7 @@ async def get_drive_file_content(
         "application/vnd.google-apps.presentation": "text/plain",
     }.get(mime_type)
 
-    request_obj = (
-        service.files().export_media(fileId=file_id, mimeType=export_mime_type)
-        if export_mime_type
-        else service.files().get_media(fileId=file_id)
-    )
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request_obj)
-    loop = asyncio.get_event_loop()
-    done = False
-    while not done:
-        status, done = await loop.run_in_executor(None, downloader.next_chunk)
-
-    file_content_bytes = fh.getvalue()
+    file_content_bytes = await _download_file_bytes(service, file_id, export_mime_type)
 
     # Attempt Office XML extraction only for actual Office XML files
     office_mime_types = {
@@ -568,20 +602,7 @@ async def get_drive_file_download_url(
         )
 
     # Download the file
-    request_obj = (
-        service.files().export_media(fileId=file_id, mimeType=export_mime_type)
-        if export_mime_type
-        else service.files().get_media(fileId=file_id)
-    )
-
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request_obj)
-    loop = asyncio.get_event_loop()
-    done = False
-    while not done:
-        status, done = await loop.run_in_executor(None, downloader.next_chunk)
-
-    file_content_bytes = fh.getvalue()
+    file_content_bytes = await _download_file_bytes(service, file_id, export_mime_type)
     size_bytes = len(file_content_bytes)
     size_kb = size_bytes / 1024 if size_bytes else 0
 
@@ -1757,6 +1778,13 @@ async def get_drive_file_permissions(
         )
 
         # Format the response
+        # Resolve permissions up front: Shared Drive items omit inline permissions
+        # (and the `shared` boolean) on files.get(), so fetch via permissions.list().
+        _perms_for_shared = file_metadata.get("permissions", [])
+        if file_metadata.get("driveId"):
+            _perms_for_shared = await asyncio.to_thread(
+                list_all_permissions, service, file_id
+            )
         parents = file_metadata.get("parents")
         parent_str = ", ".join(parents) if parents else "None (root or orphaned)"
         owners = file_metadata.get("owners") or []
@@ -1792,7 +1820,7 @@ async def get_drive_file_permissions(
             [
                 "",
                 "Sharing Status:",
-                f"  Shared: {file_metadata.get('shared', False)}",
+                f"  Shared: {derive_shared_state(file_metadata, _perms_for_shared)}",
             ]
         )
 
@@ -1803,8 +1831,8 @@ async def get_drive_file_permissions(
                 f"  Shared by: {sharing_user.get('displayName', 'Unknown')} ({sharing_user.get('emailAddress', 'Unknown')})"
             )
 
-        # Process permissions
-        permissions = file_metadata.get("permissions", [])
+        # Process permissions (already resolved above as _perms_for_shared)
+        permissions = _perms_for_shared
         if permissions:
             output_parts.append(f"  Number of permissions: {len(permissions)}")
             output_parts.append("  Permissions:")
@@ -1931,13 +1959,17 @@ async def check_drive_file_public_access(
         service.files()
         .get(
             fileId=file_id,
-            fields="id, name, mimeType, permissions, webViewLink, webContentLink, shared",
+            fields="id, name, mimeType, driveId, permissions, webViewLink, webContentLink, shared",
             supportsAllDrives=True,
         )
         .execute
     )
 
     permissions = file_metadata.get("permissions", [])
+    # Shared Drive items do not return inline permissions on files.get(); fall
+    # back to permissions.list() so 'anyone with link' surfaces correctly.
+    if file_metadata.get("driveId"):
+        permissions = await asyncio.to_thread(list_all_permissions, service, file_id)
 
     has_public_link = check_public_link_permission(permissions)
 
@@ -1946,7 +1978,7 @@ async def check_drive_file_public_access(
             f"File: {file_metadata['name']}",
             f"ID: {file_id}",
             f"Type: {file_metadata['mimeType']}",
-            f"Shared: {file_metadata.get('shared', False)}",
+            f"Shared: {derive_shared_state(file_metadata, permissions)}",
             "",
         ]
     )
@@ -2006,15 +2038,22 @@ async def update_drive_file(
     source_format: Optional[str] = None,  # Format hint (md, docx, txt, html, rtf, odt)
     return_upload_url: bool = False,
     content_length: Optional[int] = None,
+    mode: str = "replace",  # replace | append | prepend
 ) -> str:
     """
     Updates metadata, properties, and/or content of a Google Drive file.
 
     Providing one of ``content``, ``file_path``, or ``file_url`` replaces the file's
-    content in place. The source is uploaded with its source MIME type so the Drive
-    API applies the same format conversion as import_to_google_doc (markdown headings,
-    tables, bold, etc.) while preserving the existing file ID, sharing, comments, and
-    links. Metadata and content can be updated in a single call.
+    content in place, preserving the existing file ID, sharing, comments, and links.
+    For native Google Docs/Sheets/Slides the source is uploaded with its source MIME
+    type so the Drive API applies the same format conversion as import_to_google_doc
+    (markdown headings, tables, bold, etc.). For any other file (.md, .txt, .pdf, ...)
+    there is nothing to convert, so the bytes are written back as-is under the file's
+    own MIME type. Metadata and content can be updated in a single call.
+
+    ``mode='append'``/``'prepend'`` splice ``content`` onto the file's existing text
+    server-side, so only the new text has to be supplied — no need to send the whole
+    file back to rewrite it.
 
     Content sources behave the same way as in ``create_drive_file``:
     - ``content``: inline text, available in every transport mode.
@@ -2042,17 +2081,36 @@ async def update_drive_file(
         file_path (Optional[str]): Local file path for binary formats (DOCX, ODT). Supports file:// URLs. Unavailable in remote (streamable-http) mode.
         file_url (Optional[str]): Remote http(s) URL to fetch new content from. Unavailable in remote (streamable-http) mode.
         source_format (Optional[str]): Source format hint for conversion
-            (md, markdown, docx, txt, html, rtf, odt). Auto-detected when omitted.
+            (md, markdown, docx, txt, html, rtf, odt). Auto-detected when omitted, and
+            ignored for non-Google files, which are uploaded without conversion.
             Provide at most one of content/file_path/file_url.
         return_upload_url (bool): If True, apply metadata changes and return a resumable
             upload URL for replacing the file's content (instead of uploading inline).
+            Only valid with mode='replace'.
         content_length (Optional[int]): Exact byte length for the resumable upload, if known.
+        mode (str): How to apply the new content — 'replace' (default), 'append', or
+            'prepend'. Append/prepend require 'content' and a UTF-8 text file such as
+            .md or .txt; a newline is inserted at the seam if neither side has one.
+            For native Google Docs use insert_doc_elements, modify_doc_text, or
+            find_and_replace_doc, which edit in place instead of rewriting the file.
 
     Returns:
         str: Confirmation message with details of the updates applied, or the
             resumable upload URL.
     """
     logger.info(f"[update_drive_file] Updating file {file_id} for {user_google_email}")
+
+    if mode not in CONTENT_UPDATE_MODES:
+        raise ValueError(
+            f"Unsupported mode: '{mode}'. Supported: {', '.join(CONTENT_UPDATE_MODES)}."
+        )
+    if mode != "replace" and mime_type is not None:
+        raise ValueError(f"mime_type cannot be set when mode='{mode}'.")
+    if mode != "replace" and content is None:
+        raise ValueError(
+            f"mode='{mode}' requires 'content' (the text to add). "
+            "'file_path' and 'file_url' are only supported with mode='replace'."
+        )
 
     current_file_fields = (
         "name, description, mimeType, parents, starred, trashed, webViewLink, "
@@ -2118,6 +2176,11 @@ async def update_drive_file(
 
     # Remote-safe content replacement: hand back a pre-authorized resumable PUT URL.
     if return_upload_url:
+        if mode != "replace":
+            raise ValueError(
+                "return_upload_url replaces the file's whole content; it cannot be "
+                f"combined with mode='{mode}'. Use inline 'content' for append/prepend."
+            )
         if any(x is not None for x in (content, file_path, file_url)):
             raise ValueError(
                 "return_upload_url replaces content via a resumable PUT; do not also "
@@ -2157,37 +2220,70 @@ async def update_drive_file(
             "to, or send text via 'content'."
         )
 
-    # Replacement content is uploaded with its source MIME type so Drive converts it
-    # into the file's existing type — the same engine import_to_google_doc uses.
+    # Native Google files take replacement content through Drive's import conversion
+    # (the engine import_to_google_doc uses); any other file has nothing to convert,
+    # so its bytes stream back verbatim under the same file ID.
     replacing_content = any(x is not None for x in (content, file_path, file_url))
     remote_file_data = None
-    if replacing_content:
-        target_mime_type = mime_type or current_file.get("mimeType")
-        format_map = IMPORT_FORMATS_BY_GOOGLE_MIME_TYPE.get(target_mime_type)
-        if format_map is None:
-            supported_targets = ", ".join(
-                mime for mime in IMPORT_FORMATS_BY_GOOGLE_MIME_TYPE
-            )
-            raise ValueError(
-                "Content replacement with conversion is only supported for native "
-                f"Google Docs, Sheets, and Slides files. Current target MIME type: "
-                f"{target_mime_type or 'unknown'}. Supported target MIME types: "
-                f"{supported_targets}."
-            )
-
-        media, _source_mime_type, remote_file_data = await _resolve_import_media(
-            tool_name="update_drive_file",
-            file_name=name or current_file.get("name", ""),
-            content=content,
-            file_path=file_path,
-            file_url=file_url,
-            source_format=source_format,
-            format_map=format_map,
-        )
-        query_params["media_body"] = media
-
-    # Perform the update
+    format_map = None
+    content_update_lock = (
+        _get_content_update_lock(file_id)
+        if replacing_content and mode != "replace"
+        else None
+    )
+    if content_update_lock is not None:
+        await content_update_lock.acquire()
     try:
+        if replacing_content:
+            target_mime_type = mime_type or current_file.get("mimeType") or ""
+            format_map = IMPORT_FORMATS_BY_GOOGLE_MIME_TYPE.get(target_mime_type)
+            if format_map is None and target_mime_type.startswith(
+                GOOGLE_APPS_MIME_PREFIX
+            ):
+                supported_targets = ", ".join(
+                    mime for mime in IMPORT_FORMATS_BY_GOOGLE_MIME_TYPE
+                )
+                raise ValueError(
+                    "Content replacement is not supported for this Google Apps type "
+                    f"({target_mime_type}). Editable Google types: {supported_targets}."
+                )
+
+            if mode != "replace":
+                if format_map is not None:
+                    raise ValueError(
+                        f"mode='{mode}' is only supported for non-Google files, because a "
+                        f"native {target_mime_type} would have to be exported and re-imported "
+                        "to splice text in. Use insert_doc_elements, modify_doc_text, or "
+                        "find_and_replace_doc to edit a Google Doc in place."
+                    )
+                existing_bytes = await _download_file_bytes(service, file_id)
+                try:
+                    existing_text = existing_bytes.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ValueError(
+                        f"mode='{mode}' requires a UTF-8 text file, but "
+                        f"'{current_file.get('name', file_id)}' ({target_mime_type}) "
+                        "could not be decoded as text."
+                    ) from exc
+                content = _splice_content(existing_text, content, mode)
+
+            media, _source_mime_type, remote_file_data = await _resolve_import_media(
+                tool_name="update_drive_file",
+                file_name=name or current_file.get("name", ""),
+                content=content,
+                file_path=file_path,
+                file_url=file_url,
+                source_format=source_format,
+                format_map=format_map,
+                passthrough_mime_type=(
+                    None
+                    if format_map
+                    else (target_mime_type or "application/octet-stream")
+                ),
+            )
+            query_params["media_body"] = media
+
+        # Perform the update while append/prepend still hold the file lock.
         updated_file = await asyncio.to_thread(
             service.files().update(**query_params).execute,
             num_retries=GOOGLE_API_WRITE_RETRIES if replacing_content else 0,
@@ -2195,6 +2291,8 @@ async def update_drive_file(
     finally:
         if remote_file_data is not None:
             remote_file_data.close()
+        if content_update_lock is not None:
+            content_update_lock.release()
 
     # Build response message
     output_parts = [
@@ -2248,10 +2346,16 @@ async def update_drive_file(
     if properties:
         changes.append(f"   • Updated custom properties: {properties}")
     if replacing_content:
-        source = "content" if content is not None else (file_path or file_url)
-        changes.append(
-            f"   • Replaced content from {source} (converted to {updated_file.get('mimeType', current_file.get('mimeType', 'file type'))})"
+        result_mime_type = updated_file.get(
+            "mimeType", current_file.get("mimeType", "file type")
         )
+        written_as = "converted to" if format_map else "written as"
+        if mode == "replace":
+            source = "content" if content is not None else (file_path or file_url)
+            detail = f"Replaced content from {source}"
+        else:
+            detail = f"{'Appended' if mode == 'append' else 'Prepended'} text"
+        changes.append(f"   • {detail} ({written_as} {result_mime_type})")
 
     if changes:
         output_parts.append("")

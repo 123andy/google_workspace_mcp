@@ -6,6 +6,7 @@ based on tier configuration, replacing direct @server.tool() decorators.
 """
 
 import logging
+import os
 from typing import Set, Optional, Callable
 
 from auth.oauth_config import is_oauth21_enabled
@@ -22,7 +23,14 @@ _enabled_tools: Optional[Set[str]] = None
 # selected, these named tools are additionally removed at the tool layer.
 # Unlike _enabled_tools / --only-tools, this does NOT change requested OAuth
 # scopes — the token keeps the scopes of the remaining tools.
+# NOTE: upstream v1.24 added _disabled_tools below with the same semantics
+# (subtractive, scope-untouched). Both are honored; folding --exclude-tools
+# into the upstream mechanism is a planned follow-up, kept out of this merge.
 _excluded_tools: Optional[Set[str]] = None
+
+# Tools explicitly blocked regardless of tier or permission selection
+# (upstream --disabled-tools / WORKSPACE_MCP_DISABLED_TOOLS)
+_disabled_tools: Set[str] = set()
 
 
 def set_enabled_tools(tool_names: Optional[Set[str]]):
@@ -45,6 +53,37 @@ def set_excluded_tools(tool_names: Optional[Set[str]]):
 def get_excluded_tools() -> Optional[Set[str]]:
     """Get the set of excluded tools, or None if no exclusion is active."""
     return _excluded_tools
+
+
+def set_disabled_tools(tool_names: Set[str]):
+    """Set the globally blocked tools."""
+    global _disabled_tools
+    _disabled_tools = tool_names
+
+
+def get_disabled_tools() -> Set[str]:
+    """Get the set of explicitly blocked tools."""
+    return _disabled_tools
+
+
+def resolve_disabled_tools(cli_names: Optional[list[str]] = None) -> Set[str]:
+    """Resolve the per-tool block list from CLI names, falling back to the env var.
+
+    Names are normalized to lowercase because tool names are lowercase snake_case.
+
+    Args:
+        cli_names: Tool names from --disabled-tools, or None to read the
+            WORKSPACE_MCP_DISABLED_TOOLS env var instead.
+
+    Returns:
+        The set of tool names to block, empty when nothing is configured.
+    """
+    raw = (
+        cli_names
+        if cli_names
+        else os.getenv("WORKSPACE_MCP_DISABLED_TOOLS", "").split(",")
+    )
+    return {name.strip().lower() for name in raw if name.strip()}
 
 
 def is_tool_enabled(tool_name: str) -> bool:
@@ -128,12 +167,14 @@ def filter_server_tools(server) -> int:
     excluded_tools = get_excluded_tools()
     oauth21_enabled = is_oauth21_enabled()
     permissions_mode = is_permissions_mode()
+    disabled_tools = get_disabled_tools()
     if (
         enabled_tools is None
         and excluded_tools is None
         and not oauth21_enabled
         and not is_read_only_mode()
         and not permissions_mode
+        and not disabled_tools
     ):
         return 0
 
@@ -219,6 +260,21 @@ def filter_server_tools(server) -> int:
                 "Exclude-tools: removing %d tools (%s)",
                 excluded_count,
                 ", ".join(sorted(excluded_tools & set(tool_components))),
+            )
+
+    # 6. Explicit per-tool block list (upstream --disabled-tools /
+    # WORKSPACE_MCP_DISABLED_TOOLS; subtractive, so it wins over tier and
+    # permission selection). Unmatched entries only warn: a name is legitimately
+    # absent when its service was not loaded by --tools or --tool-tier.
+    for tool_name in sorted(disabled_tools):
+        if tool_name in tool_components:
+            logger.info("Block list: disabling tool '%s'", tool_name)
+            tools_to_remove.add(tool_name)
+        else:
+            logger.warning(
+                "Block list entry '%s' matches no registered tool - check spelling, "
+                "or its service may not be loaded by the current tool selection",
+                tool_name,
             )
 
     for tool_name in tools_to_remove:

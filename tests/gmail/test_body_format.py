@@ -8,6 +8,7 @@ import pytest
 
 import gmail.gmail_tools as gmail_tools
 from core.utils import UserInputError
+from gmail.gmail_helpers import _signature_html_to_text
 from gmail.gmail_tools import (
     _extract_message_bodies,
     _format_body_content,
@@ -162,6 +163,25 @@ class TestFormatBodyContentTextMode:
 
     def test_html_to_text_ignores_br_inside_skipped_tags(self):
         assert _html_to_text("<script>x<br>y</script><p>Visible</p>") == "Visible"
+
+
+class TestSignatureHtmlToText:
+    def test_preserves_explicit_signature_line_breaks(self):
+        signature = "<p>Best,</p><p><br></p><p>Alice</p>"
+
+        assert _signature_html_to_text(signature) == "Best,\n\nAlice"
+
+    def test_separates_nested_block_content(self):
+        signature = "<div>Name<div>Title</div><div>Phone</div></div>"
+
+        assert _signature_html_to_text(signature) == "Name\nTitle\nPhone"
+
+    def test_collapses_source_formatting_whitespace(self):
+        signature = """<div>Acme
+            Corporation</div>
+        <div>Engineering</div>"""
+
+        assert _signature_html_to_text(signature) == "Acme Corporation\nEngineering"
 
 
 class TestFormatBodyContentHtmlMode:
