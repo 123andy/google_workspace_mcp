@@ -287,7 +287,14 @@ Validations:
 
 ## Fork additions (scientist-hq)
 
-This is the **scientist-hq fork** (branch `integration2` = upstream `main` + the fork feature set).
+This is the **scientist-hq fork**. Branch **`sci-prod`** is the deploy line: upstream `main` + the
+fork feature set, and the branch production image pins are cut from (deploys reference a pinned
+commit SHA — in the mcp-gateway Dockerfile/compose and the k3-applications Helm tag — so `sci-prod`
+is the pointer to *which line* those SHAs come from, not a statement of what is deployed right now).
+It moves only when a new composition is blessed, and is **reset, not fast-forwarded**, when the
+line is rebuilt on a new upstream base (predecessor lines `integration` / `integration2` did this
+by renaming; `sci-prod` keeps one stable name instead). Frozen predecessor: `integration`.
+Fork `main` stays a clean mirror of upstream so feature branches cut from it carry nothing extra.
 Everything below is fork-only until upstreamed; each feature is off by default and a no-op unless
 its flag/env is set. Upstream PRs in flight: [#887](https://github.com/taylorwilsdon/google_workspace_mcp/pull/887)
 (tool flags), [#888](https://github.com/taylorwilsdon/google_workspace_mcp/pull/888) (signed URLs),
