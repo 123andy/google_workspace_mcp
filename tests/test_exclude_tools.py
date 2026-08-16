@@ -216,6 +216,46 @@ class TestUnknownToolValidation:
         assert "unknown tool name" in capsys.readouterr().err.lower()
 
 
+class TestExclusionAppliedBeforeFiltering:
+    """main() wiring: the excluded set must be populated BEFORE filter_server_tools.
+
+    filter_server_tools() is the ONLY consumer of the excluded set; calling
+    set_excluded_tools() after it is a silent no-op that ships every excluded
+    tool. That exact inversion happened once: an upstream startup refactor moved
+    the filter call earlier and a merge left the --exclude-tools block behind it,
+    so base exposed send_gmail_draft/set_drive_file_permissions while every
+    registry unit test still passed. This test pins the main()-level ordering.
+    """
+
+    def test_excluded_set_populated_when_filter_runs(self, monkeypatch):
+        """At the moment filter_server_tools is invoked, the CLI exclusions are set."""
+        monkeypatch.setattr(main, "configure_safe_logging", lambda: None)
+        monkeypatch.setattr(main, "resolve_callback_port_for_transport", lambda t: None)
+        monkeypatch.setattr(main, "validate_streamable_http_auth", lambda t: None)
+
+        class _FilterReached(Exception):
+            pass
+
+        seen = {}
+
+        def _spy(server):
+            """Capture the excluded set as filter_server_tools sees it, then stop main."""
+            seen["excluded_at_filter_time"] = tool_registry.get_excluded_tools()
+            raise _FilterReached()
+
+        monkeypatch.setattr(main, "filter_server_tools", _spy)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["main.py", "--tools", "gmail", "--exclude-tools", "manage_drive_access"],
+        )
+
+        with pytest.raises(_FilterReached):
+            main.main()
+
+        assert seen["excluded_at_filter_time"] == {"manage_drive_access"}
+
+
 class TestExclusionDoesNotAlterScopes:
     """The whole point: dropping a tool must NOT drop any OAuth scope."""
 

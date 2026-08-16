@@ -777,6 +777,29 @@ def main():
             logger.error("Failed to import tool '%s': %s", tool, exc, exc_info=True)
             failed.append((tool, exc))
 
+    # Per-tool-name blocklist (--exclude-tools). Runs for every selection mode:
+    # it composes with whatever was selected above by trimming tools at the tool
+    # layer WITHOUT touching the requested OAuth scopes.
+    # ORDER MATTERS: this must run BEFORE filter_server_tools(), which is the
+    # only consumer of the excluded set — setting it later is a silent no-op
+    # (that exact inversion shipped once via an upstream-merge reorder).
+    if args.exclude_tools is not None:
+        from core.tool_tier_loader import ToolTierLoader
+        from core.tool_registry import set_excluded_tools
+
+        excluded = list(dict.fromkeys(args.exclude_tools))  # de-dup, keep order
+        known_tools = ToolTierLoader().get_all_tool_names()
+        unknown = [t for t in excluded if t not in known_tools]
+        if unknown:
+            print(
+                f"Error: unknown tool name(s) for --exclude-tools: {', '.join(unknown)}. "
+                f"Each must be a registered tool name (see core/tool_tiers.yaml).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        set_excluded_tools(set(excluded))
+        safe_print(f"🚫 exclude-tools: {len(excluded)} tools removed")
+
     # Filter tools based on tier configuration (if tier-based loading is enabled)
     tools_removed = filter_server_tools(server)
 
@@ -819,26 +842,6 @@ def main():
             f"🎯 only-tools: {len(args.only_tools)} tools, "
             f"{len(minimal_scopes)} minimal scopes"
         )
-
-    # Per-tool-name blocklist (--exclude-tools). Runs for every selection mode:
-    # it composes with whatever was selected above by trimming tools at the tool
-    # layer WITHOUT touching the requested OAuth scopes.
-    if args.exclude_tools is not None:
-        from core.tool_tier_loader import ToolTierLoader
-        from core.tool_registry import set_excluded_tools
-
-        excluded = list(dict.fromkeys(args.exclude_tools))  # de-dup, keep order
-        known_tools = ToolTierLoader().get_all_tool_names()
-        unknown = [t for t in excluded if t not in known_tools]
-        if unknown:
-            print(
-                f"Error: unknown tool name(s) for --exclude-tools: {', '.join(unknown)}. "
-                f"Each must be a registered tool name (see core/tool_tiers.yaml).",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        set_excluded_tools(set(excluded))
-        safe_print(f"🚫 exclude-tools: {len(excluded)} tools removed")
 
     if perms:
         ui.blank()
