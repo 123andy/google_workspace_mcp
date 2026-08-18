@@ -13,7 +13,7 @@ import binascii
 
 from typing import Optional, List, Dict, Any
 from tempfile import NamedTemporaryFile, SpooledTemporaryFile
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 from urllib.request import url2pathname
 from pathlib import Path
 from weakref import WeakValueDictionary
@@ -1248,10 +1248,9 @@ async def create_drive_file(
         )
     # Prefer fileUrl if both legacy sources are provided.
     elif fileUrl:
-        # Query strings can carry signed-URL secrets — log the URL without one.
-        logger.info(
-            f"[create_drive_file] Fetching file from URL: {fileUrl.split('?', 1)[0]}"
-        )
+        # Query strings and fragments can carry signed-URL secrets — log neither.
+        display_url = urlsplit(fileUrl)._replace(query="", fragment="").geturl()
+        logger.info(f"[create_drive_file] Fetching file from URL: {display_url}")
 
         # Check if this is a file:// URL
         parsed_url = urlparse(fileUrl)

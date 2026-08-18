@@ -1338,7 +1338,7 @@ async def create_sheet(
         return text_output
 
     logger.info(
-        f"[create_sheet] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, sheet_name_len={len(sheet_name)}"
+        f"[create_sheet] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, sheet_name_len={len(sheet_name) if sheet_name else 0}"
     )
 
     add_request: dict = {"properties": {}}

@@ -103,11 +103,15 @@ reload_oauth_config()
 
 # WORKSPACE_MCP_LOG_LEVEL=DEBUG surfaces the debug-level companion lines that
 # carry user text (search queries, find/replace strings) which INFO deliberately
-# omits — see tests/test_log_hygiene.py. Default stays INFO.
+# omits — see tests/test_log_hygiene.py. Default stays INFO. Allowlisted, not
+# getattr'd: getattr(logging, <arbitrary env value>) can resolve to a non-level
+# attribute (e.g. BASIC_FORMAT) and crash basicConfig at startup.
+_LOG_LEVEL_NAMES = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}
+_log_level_name = os.environ.get("WORKSPACE_MCP_LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=getattr(
-        logging, os.environ.get("WORKSPACE_MCP_LOG_LEVEL", "INFO").upper(), logging.INFO
-    ),
+    level=getattr(logging, _log_level_name)
+    if _log_level_name in _LOG_LEVEL_NAMES
+    else logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
