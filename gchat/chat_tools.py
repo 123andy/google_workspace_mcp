@@ -415,9 +415,10 @@ async def search_messages(
         str: A formatted list of messages matching the search criteria.
     """
     logger.info(
-        f"[search_messages] Email={user_google_email}, query_len={len(query)}, TimeFilter='{time_filter}'"
+        f"[search_messages] Email={user_google_email}, query_len={len(query) if query else 0}, TimeFilter='{time_filter}'"
     )
-    logger.debug(f"[search_messages] Query='{query}'")
+    if query:
+        logger.debug(f"[search_messages] Query='{query}'")
 
     # Google Chat messages.list supports time/thread filters, but not full-text
     # search. Apply only supported API filters, then filter message text below.

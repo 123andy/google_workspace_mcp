@@ -75,4 +75,8 @@ async def test_search_docs_logs_query_length_not_query(caplog):
             query=SECRET,
         )
 
-    assert SECRET not in _info_text(caplog)
+    info_text = _info_text(caplog)
+    # Positive anchor first: prove capture is working at all, so the
+    # exclusion below cannot pass vacuously against an empty log.
+    assert "query_len=" in info_text
+    assert SECRET not in info_text
