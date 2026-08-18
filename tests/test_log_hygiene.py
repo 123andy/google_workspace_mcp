@@ -34,9 +34,7 @@ SECRET = "acquisition of ExampleCorp"
 
 
 def _info_text(caplog) -> str:
-    return " ".join(
-        r.getMessage() for r in caplog.records if r.levelno >= logging.INFO
-    )
+    return " ".join(r.getMessage() for r in caplog.records if r.levelno >= logging.INFO)
 
 
 @pytest.mark.asyncio
@@ -80,3 +78,24 @@ async def test_search_docs_logs_query_length_not_query(caplog):
     # exclusion below cannot pass vacuously against an empty log.
     assert "query_len=" in info_text
     assert SECRET not in info_text
+    debug_text = " ".join(
+        r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG
+    )
+    assert SECRET in debug_text
+
+
+def test_scrub_url_queries_strips_embedded_request_uris():
+    """HttpError messages embed the request URI; its query string carries the
+    user's search terms, so the ERROR-level log must shed it while keeping
+    the endpoint path that identifies what failed."""
+    from core.utils import _scrub_url_queries
+
+    msg = (
+        "<HttpError 400 when requesting "
+        f"https://gmail.googleapis.com/gmail/v1/users/me/messages?q={SECRET}"
+        "&maxResults=25 returned bad request>"
+    )
+    scrubbed = _scrub_url_queries(msg)
+    assert SECRET not in scrubbed
+    assert "gmail/v1/users/me/messages" in scrubbed
+    assert "<query-redacted>" in scrubbed

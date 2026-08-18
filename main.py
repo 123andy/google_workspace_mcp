@@ -101,8 +101,14 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 reload_oauth_config()
 
+# WORKSPACE_MCP_LOG_LEVEL=DEBUG surfaces the debug-level companion lines that
+# carry user text (search queries, find/replace strings) which INFO deliberately
+# omits — see tests/test_log_hygiene.py. Default stays INFO.
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=getattr(
+        logging, os.environ.get("WORKSPACE_MCP_LOG_LEVEL", "INFO").upper(), logging.INFO
+    ),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
