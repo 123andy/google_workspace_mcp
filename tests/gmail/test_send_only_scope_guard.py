@@ -24,7 +24,7 @@ from auth.scopes import (  # noqa: E402
     GMAIL_SEND_SCOPE,
 )
 from core.utils import UserInputError  # noqa: E402
-from gmail.gmail_tools import send_gmail_draft, send_gmail_message  # noqa: E402
+from gmail.gmail_tools import send_gmail_message  # noqa: E402
 
 
 def _unwrap(tool):
@@ -54,10 +54,14 @@ def _http_error(status: int) -> HttpError:
 
 
 class TestScopeDeclarations:
-    def test_send_gmail_message_declares_send_only(self):
+    def test_send_gmail_message_declares_send_class_only(self):
         """The send tool must not declare any read scope — the decorator list is
-        both the consent driver (--only-tools) and a hard runtime requirement."""
-        assert _required_scopes(send_gmail_message) == {GMAIL_SEND_SCOPE}
+        both the consent driver (--only-tools) and a hard runtime requirement.
+        gmail.compose joined for the draft_id path (drafts.send); still no reads."""
+        assert _required_scopes(send_gmail_message) == {
+            GMAIL_SEND_SCOPE,
+            GMAIL_COMPOSE_SCOPE,
+        }
 
     def test_commit_toolset_scope_union_is_exactly_four(self):
         """A commit-only tool selection (send mail / send draft / post chat /
@@ -73,7 +77,6 @@ class TestScopeDeclarations:
         union = set()
         for tool in (
             send_gmail_message,
-            send_gmail_draft,
             send_message,
             manage_drive_access,
             set_drive_file_permissions,
