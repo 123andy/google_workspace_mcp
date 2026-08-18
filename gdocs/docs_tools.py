@@ -98,7 +98,8 @@ async def search_docs(
     Returns:
         str: A formatted list of Google Docs matching the search query.
     """
-    logger.info(f"[search_docs] Email={user_google_email}, Query='{query}'")
+    logger.info(f"[search_docs] Email={user_google_email}, query_len={len(query)}")
+    logger.debug(f"[search_docs] Query='{query}'")
 
     escaped_query = query.replace("'", "\\'")
 
@@ -411,7 +412,7 @@ async def create_doc(
     Returns:
         str: Confirmation message with document ID, link, and initial document state.
     """
-    logger.info(f"[create_doc] Invoked. Email: '{user_google_email}', Title='{title}'")
+    logger.info(f"[create_doc] Invoked. Email: '{user_google_email}', title_len={len(title)}")
 
     doc = await asyncio.to_thread(
         service.documents().create(body={"title": title}).execute
@@ -436,7 +437,7 @@ async def create_doc(
         f"Link: {link}"
     )
     logger.info(
-        f"Successfully created Google Doc '{title}' (ID: {doc_id}) for {user_google_email}. Link: {link}"
+        f"Successfully created Google Doc (ID: {doc_id}) for {user_google_email}. Link: {link}"
     )
     return msg
 
@@ -768,7 +769,10 @@ async def find_and_replace_doc(
         str: Confirmation message with replacement count
     """
     logger.info(
-        f"[find_and_replace_doc] Doc={document_id}, find='{find_text}', replace='{replace_text}', tab='{tab_id}'"
+        f"[find_and_replace_doc] Doc={document_id}, find_len={len(find_text)}, replace_len={len(replace_text)}, tab='{tab_id}'"
+    )
+    logger.debug(
+        f"[find_and_replace_doc] find='{find_text}', replace='{replace_text}'"
     )
 
     requests = [

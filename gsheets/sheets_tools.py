@@ -1226,7 +1226,7 @@ async def create_spreadsheet(
         str: Information about the newly created spreadsheet including ID, URL, and locale.
     """
     logger.info(
-        f"[create_spreadsheet] Invoked. Email: '{user_google_email}', Title: {title}"
+        f"[create_spreadsheet] Invoked. Email: '{user_google_email}', title_len={len(title)}"
     )
 
     spreadsheet_body = {"properties": {"title": title}}

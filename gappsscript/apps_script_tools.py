@@ -337,7 +337,7 @@ async def _create_script_project_impl(
     parent_id: Optional[str] = None,
 ) -> str:
     """Internal implementation for create_script_project."""
-    logger.info(f"[create_script_project] Email: {user_google_email}, Title: {title}")
+    logger.info(f"[create_script_project] Email: {user_google_email}, title_len={len(title)}")
 
     request_body = {"title": title}
 
@@ -582,7 +582,7 @@ async def _create_deployment_impl(
     Creates a new version first, then creates a deployment using that version.
     """
     logger.info(
-        f"[create_deployment] Email: {user_google_email}, ID: {script_id}, Desc: {description}"
+        f"[create_deployment] Email: {user_google_email}, ID: {script_id}, desc_len={len(description) if description else 0}"
     )
 
     # First, create a new version

@@ -2990,7 +2990,7 @@ async def send_gmail_message(
         )
 
     logger.info(
-        f"[send_gmail_message] Invoked. Email: '{user_google_email}', Subject: '{subject}', Attachments: {len(attachments) if attachments else 0}"
+        f"[send_gmail_message] Invoked. Email: '{user_google_email}', subject_len={len(subject) if subject else 0}, Attachments: {len(attachments) if attachments else 0}"
     )
 
     # Prepare the email message
@@ -3622,7 +3622,7 @@ async def draft_gmail_message(
     """
     logger.info(
         f"[draft_gmail_message] Invoked. Action: '{action}', Email: '{user_google_email}', "
-        f"Subject: '{subject}'"
+        f"subject_len={len(subject) if subject else 0}"
     )
 
     if action == "create":
