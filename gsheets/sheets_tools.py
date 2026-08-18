@@ -1333,12 +1333,12 @@ async def create_sheet(
 
         logger.info(
             f"Successfully duplicated sheet for {user_google_email}. "
-            f"New sheet: '{new_title}' (ID: {new_id})"
+            f"New sheet ID: {new_id}"
         )
         return text_output
 
     logger.info(
-        f"[create_sheet] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, Sheet: {sheet_name}"
+        f"[create_sheet] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, sheet_name_len={len(sheet_name)}"
     )
 
     add_request: dict = {"properties": {}}

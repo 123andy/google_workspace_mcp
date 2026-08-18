@@ -205,7 +205,7 @@ async def search_drive_files(
              Includes a nextPageToken line when more results are available.
     """
     logger.info(
-        f"[search_drive_files] Invoked. Email: '{user_google_email}', Query: '{query}', "
+        f"[search_drive_files] Invoked. Email: '{user_google_email}', query_len={len(query)}, "
         f"file_type: '{file_type}', include_trashed: {include_trashed}"
     )
 
@@ -215,14 +215,14 @@ async def search_drive_files(
 
     if is_structured_query:
         final_query = query
-        logger.info(
+        logger.debug(
             f"[search_drive_files] Using structured query as-is: '{final_query}'"
         )
     else:
         # For free text queries, wrap in fullText contains
         escaped_query = query.replace("'", "\\'")
         final_query = f"fullText contains '{escaped_query}'"
-        logger.info(
+        logger.debug(
             f"[search_drive_files] Reformatting free text query '{query}' to '{final_query}'"
         )
 
@@ -1248,7 +1248,10 @@ async def create_drive_file(
         )
     # Prefer fileUrl if both legacy sources are provided.
     elif fileUrl:
-        logger.info(f"[create_drive_file] Fetching file from URL: {fileUrl}")
+        # Query strings can carry signed-URL secrets — log the URL without one.
+        logger.info(
+            f"[create_drive_file] Fetching file from URL: {fileUrl.split('?', 1)[0]}"
+        )
 
         # Check if this is a file:// URL
         parsed_url = urlparse(fileUrl)

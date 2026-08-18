@@ -88,7 +88,7 @@ async def search_custom(
     if sites:
         site_query = " OR ".join([f"site:{site}" for site in sites])
         q = f"{q} ({site_query})"
-        logger.info(f"[search_custom] Applied site restriction: {sites}")
+        logger.debug(f"[search_custom] Applied site restriction: {sites}")
 
     # Build the request parameters
     params = {

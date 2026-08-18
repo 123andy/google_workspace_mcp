@@ -337,7 +337,9 @@ async def _create_script_project_impl(
     parent_id: Optional[str] = None,
 ) -> str:
     """Internal implementation for create_script_project."""
-    logger.info(f"[create_script_project] Email: {user_google_email}, title_len={len(title)}")
+    logger.info(
+        f"[create_script_project] Email: {user_google_email}, title_len={len(title)}"
+    )
 
     request_body = {"title": title}
 

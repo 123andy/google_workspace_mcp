@@ -1846,8 +1846,9 @@ async def search_gmail_messages(
         Includes pagination token if more results are available.
     """
     logger.info(
-        f"[search_gmail_messages] Email: '{user_google_email}', Query: '{query}', Page size: {page_size}"
+        f"[search_gmail_messages] Email: '{user_google_email}', query_len={len(query)}, Page size: {page_size}"
     )
+    logger.debug(f"[search_gmail_messages] Query: '{query}'")
 
     # Build the API request parameters
     request_params = {"userId": "me", "q": query, "maxResults": page_size}
@@ -2948,7 +2949,7 @@ async def send_gmail_message(
                 "'to' is required when forwarding via 'forward_message_id'."
             )
         logger.info(
-            f"[send_gmail_message] Forwarding message '{forward_message_id}' to '{to}' for '{user_google_email}'"
+            f"[send_gmail_message] Forwarding message '{forward_message_id}' for '{user_google_email}'"
         )
         try:
             return await _forward_gmail_message_impl(

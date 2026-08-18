@@ -218,9 +218,7 @@ async def get_task_list(
 - Updated: {task_list.get("updated", "N/A")}
 - Self Link: {task_list.get("selfLink", "N/A")}"""
 
-        logger.info(
-            f"Retrieved task list '{task_list['title']}' for {user_google_email}"
-        )
+        logger.info(f"Retrieved task list {task_list_id} for {user_google_email}")
         return response
 
     except HttpError as error:
@@ -254,9 +252,7 @@ async def _create_task_list_impl(
 - Created: {result.get("updated", "N/A")}
 - Self Link: {result.get("selfLink", "N/A")}"""
 
-    logger.info(
-        f"Created task list with ID {result['id']} for {user_google_email}"
-    )
+    logger.info(f"Created task list with ID {result['id']} for {user_google_email}")
     return response
 
 
@@ -279,9 +275,7 @@ async def _update_task_list_impl(
 - ID: {result["id"]}
 - Updated: {result.get("updated", "N/A")}"""
 
-    logger.info(
-        f"Updated task list {task_list_id} for {user_google_email}"
-    )
+    logger.info(f"Updated task list {task_list_id} for {user_google_email}")
     return response
 
 
@@ -704,9 +698,7 @@ async def get_task(
         if task.get("webViewLink"):
             response += f"\n- Web View Link: {task['webViewLink']}"
 
-        logger.info(
-            f"Retrieved task '{task.get('title', 'Untitled')}' for {user_google_email}"
-        )
+        logger.info(f"Retrieved task {task_id} for {user_google_email}")
         return response
 
     except HttpError as error:
@@ -764,9 +756,7 @@ async def _create_task_impl(
     if result.get("webViewLink"):
         response += f"\n- Web View Link: {result['webViewLink']}"
 
-    logger.info(
-        f"Created task with ID {result['id']} for {user_google_email}"
-    )
+    logger.info(f"Created task with ID {result['id']} for {user_google_email}")
     return response
 
 
