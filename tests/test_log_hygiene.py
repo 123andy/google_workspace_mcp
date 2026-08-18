@@ -99,3 +99,101 @@ def test_scrub_url_queries_strips_embedded_request_uris():
     assert SECRET not in scrubbed
     assert "gmail/v1/users/me/messages" in scrubbed
     assert "<query-redacted>" in scrubbed
+
+
+@pytest.mark.asyncio
+async def test_search_gmail_messages_hides_query_from_info(caplog):
+    """The flagship search tool: Gmail queries carry names and sensitive
+    terms, so the value lives at DEBUG and INFO carries only its length."""
+    from gmail.gmail_tools import search_gmail_messages
+
+    service = Mock()
+    service.users().messages().list().execute.return_value = {"messages": []}
+
+    with caplog.at_level(logging.DEBUG):
+        await _unwrap(search_gmail_messages)(
+            service=service,
+            user_google_email="user@example.com",
+            query=SECRET,
+        )
+
+    info_text = _info_text(caplog)
+    assert "query_len=" in info_text
+    assert SECRET not in info_text
+    assert SECRET in " ".join(
+        r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_drive_files_hides_query_from_info(caplog):
+    """Drive logged the query in up to three lines (invoked + the two
+    reformat branches); all value-bearing lines are DEBUG now."""
+    from gdrive.drive_tools import search_drive_files
+
+    service = Mock()
+    service.files().list().execute.return_value = {"files": []}
+
+    with caplog.at_level(logging.DEBUG):
+        await _unwrap(search_drive_files)(
+            service=service,
+            user_google_email="user@example.com",
+            query=SECRET,
+        )
+
+    info_text = _info_text(caplog)
+    assert "query_len=" in info_text
+    assert SECRET not in info_text
+
+
+@pytest.mark.asyncio
+async def test_chat_search_accepts_none_query():
+    """Regression: search_messages allows query=None (time-filter-only), and
+    the first draft of the hygiene sweep crashed on len(None) at the log
+    line — before this call could do any work at all."""
+    from gchat.chat_tools import search_messages
+
+    chat_service = Mock()
+    chat_service.spaces().list().execute.return_value = {"spaces": []}
+
+    result = await _unwrap(search_messages)(
+        chat_service=chat_service,
+        people_service=Mock(),
+        user_google_email="user@example.com",
+        query=None,
+        time_filter='createTime > "2026-01-01T00:00:00Z"',
+    )
+    assert isinstance(result, str)
+
+
+@pytest.mark.asyncio
+async def test_handle_http_errors_scrubs_request_uri_at_error(caplog):
+    """Integration for the ERROR-path re-leak: HttpError embeds the request
+    URI, so the decorator must log a scrubbed message at ERROR (no traceback,
+    since the traceback's exception repr re-embeds the URI) and keep the full
+    exc_info at DEBUG."""
+    from googleapiclient.errors import HttpError
+
+    from core.utils import handle_http_errors
+
+    class _Resp:
+        status = 400
+        reason = "Bad Request"
+
+    uri = f"https://gmail.googleapis.com/gmail/v1/users/me/messages?q={SECRET}"
+
+    @handle_http_errors("dummy_tool")
+    async def dummy():
+        raise HttpError(_Resp(), b"{}", uri=uri)
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(Exception):
+            await dummy()
+
+    error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert error_records, "the decorator must still log the failure at ERROR"
+    error_text = " ".join(r.getMessage() for r in error_records)
+    assert SECRET not in error_text
+    assert "<query-redacted>" in error_text
+    assert all(not r.exc_info for r in error_records)
+    assert any(r.exc_info for r in caplog.records if r.levelno == logging.DEBUG)
