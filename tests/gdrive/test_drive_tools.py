@@ -2540,12 +2540,18 @@ async def test_update_drive_file_returns_resumable_patch_url(mock_resolve_item):
         user_google_email="user@example.com",
         file_id="file123",
         name="Renamed",  # forces a metadata update call
+        mime_type="text/markdown",  # the UPLOAD bytes; required for native docs
         return_upload_url=True,
     )
 
-    # metadata-only update was applied (no media_body)
+    # metadata-only update was applied (no media_body), and mime_type stayed
+    # OUT of the metadata body — here it describes the uploaded bytes, and a
+    # metadata mimeType flip on a native Doc would be rejected by Drive.
     update_kwargs = mock_service.files.return_value.update.call_args.kwargs
     assert "media_body" not in update_kwargs
+    assert update_kwargs["body"] == {"name": "Renamed"}
+    _, session_kwargs = mock_service._http.request.call_args
+    assert session_kwargs["headers"]["X-Upload-Content-Type"] == "text/markdown"
     # resumable session is a PATCH against the file id
     args, kwargs = mock_service._http.request.call_args
     assert args[0].startswith(
@@ -2780,3 +2786,70 @@ async def test_import_to_google_sheets_rejects_file_path_in_remote_mode(mock_mod
             file_name="Budget.xlsx",
             file_path="/tmp/budget.xlsx",
         )
+
+
+# ---------------------------------------------------------------------------
+# _initiate_resumable_upload_session — error paths (CodeRabbit follow-ups on
+# upstream #871: non-2xx initiation, missing Location, content_length omission)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resumable_session_non_2xx_raises():
+    from gdrive.drive_tools import _initiate_resumable_upload_session
+
+    mock_service = Mock()
+    mock_service._http.request.return_value = _resumable_response(403)
+    with pytest.raises(Exception, match="HTTP 403"):
+        await _initiate_resumable_upload_session(
+            mock_service, mime_type="text/markdown", file_metadata={"name": "x"}
+        )
+
+
+@pytest.mark.asyncio
+async def test_resumable_session_missing_location_raises():
+    from gdrive.drive_tools import _initiate_resumable_upload_session
+
+    mock_service = Mock()
+    mock_service._http.request.return_value = _resumable_response(200, location=None)
+    with pytest.raises(Exception, match="no session URL"):
+        await _initiate_resumable_upload_session(
+            mock_service, mime_type="text/markdown", file_metadata={"name": "x"}
+        )
+
+
+@pytest.mark.asyncio
+async def test_resumable_session_omits_length_header_when_unknown():
+    from gdrive.drive_tools import _initiate_resumable_upload_session
+
+    mock_service = Mock()
+    mock_service._http.request.return_value = _resumable_response(
+        200, "https://upload.example/session"
+    )
+    await _initiate_resumable_upload_session(
+        mock_service, mime_type="text/markdown", file_metadata={"name": "x"}
+    )
+    headers = mock_service._http.request.call_args.kwargs["headers"]
+    assert "X-Upload-Content-Length" not in headers
+    assert headers["X-Upload-Content-Type"] == "text/markdown"
+
+
+@pytest.mark.asyncio
+@patch("gdrive.drive_tools.resolve_drive_item", new_callable=AsyncMock)
+async def test_update_upload_url_native_doc_requires_explicit_mime(mock_resolve):
+    """A native Google Doc's own mimeType is the conversion TARGET, not a valid
+    upload content type — omitting mime_type must be an actionable error, not a
+    session that fails at Google's end."""
+    mock_resolve.return_value = (
+        "doc1",
+        {"mimeType": "application/vnd.google-apps.document"},
+    )
+    mock_service = Mock()
+    with pytest.raises(ValueError, match="native Google type"):
+        await _unwrap(update_drive_file)(
+            service=mock_service,
+            user_google_email="user@example.com",
+            file_id="doc1",
+            return_upload_url=True,
+        )
+    mock_service._http.request.assert_not_called()

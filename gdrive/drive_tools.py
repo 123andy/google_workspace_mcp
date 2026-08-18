@@ -2145,7 +2145,7 @@ async def update_drive_file(
         file_id (str): The ID of the file to update. Required.
         name (Optional[str]): New name for the file.
         description (Optional[str]): New description for the file.
-        mime_type (Optional[str]): New MIME type (note: changing type may require content upload).
+        mime_type (Optional[str]): New MIME type (note: changing type may require content upload). With ``return_upload_url=True`` it instead names the MIME of the bytes you will upload (the conversion source) and leaves file metadata untouched — required there when the file is a native Google type.
         add_parents (Optional[str]): Comma-separated folder IDs to add as parents.
         remove_parents (Optional[str]): Comma-separated folder IDs to remove from parents.
         starred (Optional[bool]): Whether to star/unstar the file.
@@ -2262,6 +2262,13 @@ async def update_drive_file(
                 "return_upload_url replaces content via a resumable PUT; do not also "
                 "pass 'content', 'file_path', or 'file_url'."
             )
+        # In this branch mime_type describes the UPLOADED bytes (the conversion
+        # source), never a metadata change: Drive rejects metadata mimeType
+        # flips on native files, and the resumable session itself carries the
+        # content type. Keep it out of the metadata update.
+        update_body.pop("mimeType", None)
+        if not update_body:
+            query_params.pop("body", None)
         # Apply any metadata-only changes first, then return the upload URL.
         if (
             "body" in query_params
@@ -2274,6 +2281,17 @@ async def update_drive_file(
         upload_mime = (
             mime_type or current_file.get("mimeType") or "application/octet-stream"
         )
+        # A native Google type can never describe the UPLOADED bytes — it is the
+        # conversion TARGET. Without an explicit mime_type the session would be
+        # initiated with e.g. application/vnd.google-apps.document as the upload
+        # content type and the PUT would fail (or mis-convert) at Google's end.
+        if upload_mime.startswith("application/vnd.google-apps."):
+            raise ValueError(
+                f"This file is a native Google type ({upload_mime}); pass mime_type "
+                "with the MIME of the bytes you will upload (e.g. 'text/markdown', "
+                "'application/vnd.openxmlformats-officedocument.wordprocessingml"
+                ".document') so Drive knows what it is converting from."
+            )
         upload_url = await _initiate_resumable_upload_session(
             service,
             mime_type=upload_mime,
