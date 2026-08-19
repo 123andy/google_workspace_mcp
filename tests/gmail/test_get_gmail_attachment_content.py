@@ -288,3 +288,32 @@ async def test_resolves_correct_filename_for_nested_smime_attachment(
     assert len(saved_files) == 1
     assert saved_files[0].suffix == ".pdf"
     assert saved_files[0].read_bytes() == payload
+
+
+@pytest.mark.asyncio
+async def test_stateless_no_url_fallback_names_cause_and_remedy(monkeypatch):
+    """When no download URL can be issued (stateless + signed URL unavailable),
+    the response must say so and route the caller — not claim success and hand
+    back a silently truncated preview (audit finding F6)."""
+    import auth.oauth_config as oauth_config_module
+    import core.attachment_signing as signing_module
+
+    monkeypatch.setattr(oauth_config_module, "is_stateless_mode", lambda: True)
+    monkeypatch.setattr(
+        signing_module, "signed_attachment_urls_enabled", lambda: False
+    )
+    payload = b"attachment bytes " + bytes(range(200))
+    mock_service = _build_mock_service(payload, filename="report.pdf")
+
+    result = await _unwrap(get_gmail_attachment_content)(
+        service=mock_service,
+        message_id="msg-1",
+        attachment_id="att-123",
+        user_google_email="user@example.com",
+    )
+
+    assert "downloaded successfully" not in result
+    assert "NO download URL" in result
+    assert "signed URL" in result and "stateless" in result
+    assert "return_base64=True" in result
+    assert "PREVIEW ONLY" in result

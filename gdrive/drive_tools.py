@@ -439,7 +439,13 @@ async def get_drive_file_download_url(
     Downloads a Google Drive file and saves it to local disk.
 
     In stdio mode, returns the local file path for direct access.
-    In HTTP mode, returns a temporary download URL (valid for 1 hour).
+    On a remote (HTTP) server with signed URLs (the default), returns a signed
+    download URL that expires in ~15 minutes (clamped to the OAuth token's
+    remaining life) — fetch it promptly; do not queue it for later. A legacy
+    stateful HTTP server without signed URLs returns a server-local URL valid
+    for 1 hour. If no URL can be issued (stateless mode and the signed URL
+    could not be minted), the response says so explicitly and shows only a
+    short preview.
 
     For Google native files (Docs, Sheets, Slides), exports to a useful format:
     - Google Docs -> PDF (default) or DOCX if export_format='docx'
@@ -609,13 +615,19 @@ async def get_drive_file_download_url(
     # Check if we're in stateless mode (can't save files)
     if is_stateless_mode():
         result_lines = [
-            "File downloaded successfully!",
+            "File fetched, but NO download URL could be issued.",
             f"File: {file_name}",
             f"File ID: {file_id}",
             f"Size: {size_kb:.1f} KB ({size_bytes} bytes)",
             f"MIME Type: {output_mime_type}",
-            "\n⚠️ Stateless mode: File storage disabled.",
-            "\nBase64-encoded content (first 100 characters shown):",
+            "\n⚠️ No download URL could be issued: this server is stateless "
+            "(no file storage) and a signed URL could not be minted — the "
+            "stored credentials were not recoverable or the OAuth token is "
+            "too near expiry.",
+            "\nRemedy: re-authenticate this account to restore signed download "
+            "URLs. For text files, get_drive_file_content returns the content "
+            "directly.",
+            "\nBase64-encoded PREVIEW ONLY (first 100 bytes):",
             f"{base64.b64encode(file_content_bytes[:100]).decode('utf-8')}...",
         ]
         logger.info(

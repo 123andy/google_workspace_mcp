@@ -2300,7 +2300,12 @@ async def get_gmail_attachment_content(
     Downloads an email attachment and saves it to local disk.
 
     In stdio mode, returns the local file path for direct access.
-    In HTTP mode, returns a temporary download URL (valid for 1 hour).
+    On a remote (HTTP) server with signed URLs (the default), returns a signed
+    download URL that expires in ~15 minutes (clamped to the OAuth token's
+    remaining life) — fetch it promptly; do not queue it for later. A legacy
+    stateful HTTP server without signed URLs returns a server-local URL valid
+    for 1 hour. If no URL can be issued, the response says so explicitly;
+    pass return_base64=True to get the full bytes inline instead.
     May re-fetch message metadata to resolve filename and MIME type.
 
     Args:
@@ -2433,11 +2438,16 @@ async def get_gmail_attachment_content(
 
     if is_stateless_mode():
         result_lines = [
-            "Attachment downloaded successfully!",
+            "Attachment fetched, but NO download URL could be issued.",
             f"Message ID: {message_id}",
             f"Size: {size_kb:.1f} KB ({size_bytes} bytes)",
-            "\n⚠️ Stateless mode: File storage disabled.",
-            "\nBase64-encoded content (first 100 characters shown):",
+            "\n⚠️ This server is stateless (no file storage) and a signed URL "
+            "could not be minted — the stored credentials were not recoverable "
+            "or the OAuth token is too near expiry.",
+            "\nRemedy: call again with return_base64=True for the full bytes "
+            "inline, or re-authenticate this account to restore signed "
+            "download URLs.",
+            "\nBase64-encoded PREVIEW ONLY (first 100 characters):",
             f"{base64_data[:100]}...",
             "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch.",
         ]
