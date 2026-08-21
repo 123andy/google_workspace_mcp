@@ -65,6 +65,7 @@ from gmail.gmail_helpers import (
     _derive_reply_all_recipients,
     _derive_reply_headers,
     _fetch_with_retry,
+    _http_error_status,
     _is_benign_signature_http_error,
     _retryable_result_ids,
     _signature_fetch_tool_error,
@@ -4648,6 +4649,93 @@ async def modify_gmail_message_labels(
     return result
 
 
+def _format_id_list(ids: List[str], limit: int = 10) -> str:
+    """Join IDs for a result message, truncating very long lists."""
+    shown = ", ".join(ids[:limit])
+    if len(ids) > limit:
+        shown += f", … (+{len(ids) - limit} more)"
+    return shown
+
+
+async def _verify_batch_label_changes(
+    service,
+    message_ids: List[str],
+    add_label_ids: Optional[List[str]],
+    remove_label_ids: Optional[List[str]],
+) -> Dict[str, str]:
+    """Read the messages back to see which requested label changes actually landed.
+
+    ``users.messages.batchModify`` answers ``204 No Content`` and silently
+    ignores IDs it does not recognise, so its own response cannot distinguish a
+    sweep that changed everything from one that changed nothing. This re-reads
+    each message with ``format="minimal"`` (``labelIds`` only) and classifies it.
+
+    Returns a per-ID status: ``applied`` (end state matches the request),
+    ``not_applied`` (message exists, labels do not match), ``unresolved``
+    (no such message — the ID was silently ignored), or ``unverified``
+    (the read-back itself failed, so nothing can be claimed either way).
+    """
+    wanted = set(add_label_ids or ())
+    unwanted = set(remove_label_ids or ())
+    statuses: Dict[str, str] = {}
+
+    for chunk_start in range(0, len(message_ids), GMAIL_BATCH_SIZE):
+        chunk_ids = message_ids[chunk_start : chunk_start + GMAIL_BATCH_SIZE]
+        results: Dict[str, Dict] = {}
+
+        def _batch_callback(request_id, response, exception):
+            results[request_id] = {"data": response, "error": exception}
+
+        try:
+            batch = service.new_batch_http_request(callback=_batch_callback)
+            for mid in chunk_ids:
+                batch.add(
+                    service.users()
+                    .messages()
+                    .get(userId="me", id=mid, format="minimal"),
+                    request_id=mid,
+                )
+            await asyncio.to_thread(batch.execute)
+        except Exception as batch_error:
+            # Same fallback the read tools use: sequential reads with a small
+            # delay, to avoid exhausting connections when the batch endpoint is
+            # unavailable.
+            logger.warning(
+                f"[batch_modify_gmail_message_labels] Verification batch failed, "
+                f"falling back to sequential reads: {batch_error}"
+            )
+            for mid in chunk_ids:
+                mid_result, data, error = await _fetch_with_retry(
+                    build_request=lambda mid=mid: (
+                        service.users()
+                        .messages()
+                        .get(userId="me", id=mid, format="minimal")
+                    ),
+                    item_id=mid,
+                    item_label="message",
+                    log_prefix="batch_modify_gmail_message_labels",
+                )
+                results[mid_result] = {"data": data, "error": error}
+                await asyncio.sleep(GMAIL_REQUEST_DELAY)
+
+        for mid in chunk_ids:
+            entry = results.get(mid) or {}
+            error = entry.get("error")
+            if error is not None:
+                statuses[mid] = (
+                    "unresolved" if _http_error_status(error) == 404 else "unverified"
+                )
+                continue
+            labels = set((entry.get("data") or {}).get("labelIds") or ())
+            statuses[mid] = (
+                "applied"
+                if wanted <= labels and not (unwanted & labels)
+                else "not_applied"
+            )
+
+    return statuses
+
+
 @server.tool(
     title="Batch Modify Gmail Message Labels",
     annotations=ToolAnnotations(
@@ -4671,6 +4759,7 @@ async def batch_modify_gmail_message_labels(
         Optional[StringList],
         Field(json_schema_extra={"type": "array", "items": {"type": "string"}}),
     ] = None,
+    verify: bool = True,
 ) -> str:
     """
     Adds or removes labels from multiple Gmail messages in a single batch request.
@@ -4679,14 +4768,22 @@ async def batch_modify_gmail_message_labels(
     does not remove the draft from the Drafts list. Delete drafts with
     draft_gmail_message(action='delete', draft_id=...) instead.
 
+    Takes MESSAGE ids, not thread ids. Gmail's batch endpoint returns no
+    per-message result and silently ignores ids it does not recognise, so by
+    default this reads the messages back afterwards and reports which ids
+    actually changed.
+
     Args:
         user_google_email (str): The user's Google email address. Required.
         message_ids (List[str]): A list of message IDs to modify.
         add_label_ids (Optional[List[str]]): List of label IDs to add to the messages.
         remove_label_ids (Optional[List[str]]): List of label IDs to remove from the messages.
+        verify (bool): Read the messages back and report per-id outcomes. Costs
+            one extra (batched) read per id. Set False for very large sweeps
+            where that cost matters and an unverified result is acceptable.
 
     Returns:
-        str: Confirmation message of the label changes applied to the messages.
+        str: Which label changes were applied, and which ids did not resolve.
     """
     logger.info(
         f"[batch_modify_gmail_message_labels] Invoked. Email: '{user_google_email}', Message IDs: '{message_ids}'"
@@ -4712,5 +4809,46 @@ async def batch_modify_gmail_message_labels(
         actions.append(f"Added labels: {', '.join(add_label_ids)}")
     if remove_label_ids:
         actions.append(f"Removed labels: {', '.join(remove_label_ids)}")
+    action_summary = "; ".join(actions)
 
-    return f"Labels updated for {len(message_ids)} messages: {'; '.join(actions)}"
+    total = len(message_ids)
+
+    if not verify:
+        return (
+            f"Requested label changes for {total} message ID(s): {action_summary}\n"
+            "NOT VERIFIED: Gmail's batchModify returns no per-message result and "
+            "silently ignores IDs it does not recognise, so this records what was "
+            "asked for, not what changed. Re-run with verify=True to confirm."
+        )
+
+    statuses = await _verify_batch_label_changes(
+        service, message_ids, add_label_ids, remove_label_ids
+    )
+    applied = [mid for mid in message_ids if statuses.get(mid) == "applied"]
+    not_applied = [mid for mid in message_ids if statuses.get(mid) == "not_applied"]
+    unresolved = [mid for mid in message_ids if statuses.get(mid) == "unresolved"]
+    unverified = [mid for mid in message_ids if statuses.get(mid) == "unverified"]
+
+    lines = [
+        f"Label changes for {total} message ID(s): {action_summary}",
+        f"Applied: {len(applied)}/{total}",
+    ]
+    if unresolved:
+        lines.append(
+            f"No such message ({len(unresolved)}): {_format_id_list(unresolved)}\n"
+            "  These IDs do not resolve to a message in this mailbox, so Gmail "
+            "ignored them. A common cause is passing a THREAD id where a MESSAGE "
+            "id is required."
+        )
+    if not_applied:
+        lines.append(
+            f"Unchanged ({len(not_applied)}): {_format_id_list(not_applied)}\n"
+            "  These messages exist but their labels do not match the request."
+        )
+    if unverified:
+        lines.append(
+            f"Could not verify ({len(unverified)}): {_format_id_list(unverified)}\n"
+            "  The read-back failed; the change may or may not have been applied."
+        )
+
+    return "\n".join(lines)
