@@ -297,9 +297,12 @@ by renaming; `sci-prod` keeps one stable name instead). Frozen predecessor: `int
 Fork `main` stays a clean mirror of upstream so feature branches cut from it carry nothing extra.
 Everything below is fork-only until upstreamed; each feature is off by default and a no-op unless
 its flag/env is set. Upstream PRs in flight: [#887](https://github.com/taylorwilsdon/google_workspace_mcp/pull/887)
-(tool flags), [#888](https://github.com/taylorwilsdon/google_workspace_mcp/pull/888) (signed URLs),
-[#891](https://github.com/taylorwilsdon/google_workspace_mcp/pull/891) (gateway identity),
-[#943](https://github.com/taylorwilsdon/google_workspace_mcp/pull/943) (compose-then-send drafts).
+(tool flags), [#888](https://github.com/taylorwilsdon/google_workspace_mcp/pull/888) (signed URLs,
+including the short `/dl/` form), [#1035](https://github.com/taylorwilsdon/google_workspace_mcp/pull/1035)
+(draft lifecycle), [#1036](https://github.com/taylorwilsdon/google_workspace_mcp/pull/1036)
+(remote-transport `file_path` boundary), [#1037](https://github.com/taylorwilsdon/google_workspace_mcp/pull/1037)
+(log hygiene). Landed upstream: [#891](https://github.com/taylorwilsdon/google_workspace_mcp/pull/891)
+(gateway identity, merged). Closed in favour of #1035: [#943](https://github.com/taylorwilsdon/google_workspace_mcp/pull/943).
 
 | Feature | Switch | Docs |
 |---|---|---|
@@ -312,3 +315,20 @@ its flag/env is set. Upstream PRs in flight: [#887](https://github.com/taylorwil
 | Short `/auth/{handle}` sign-in links (markdown-rendered auth URLs) | on with signed URLs | `core/auth_handles.py` |
 | Remote-safe Drive uploads (`return_upload_url`) + Gmail Drive attachments (ports of upstream [#871](https://github.com/taylorwilsdon/google_workspace_mcp/pull/871)/[#873](https://github.com/taylorwilsdon/google_workspace_mcp/pull/873)) | tool params | those PRs |
 | Untruncated message export delivered as a signed URL — grafted onto upstream's `get_gmail_message_content(full=True)` | on with signed URLs | fork docs |
+
+### Gotchas that look like bugs
+
+**Gmail's draft list shows no paperclip for drafts created through the API**, even when the
+attachment is really there. Verified server-side on a draft created with `draft_gmail_message`:
+a genuine `application/pdf` MIME part, byte size matching the Drive original exactly, and
+`in:drafts has:attachment` matching it. Opening the draft shows the attachment normally — only
+the *list* view omits the icon. It reads as data loss and has prompted more than one "the
+attachment is missing" report.
+
+**Do not attach this server's own download URLs.** `get_drive_file_download_url` and
+`get_gmail_attachment_content` mint `/dl/{handle}` or `/attachments/signed/{token}` links for a
+*client* to fetch. Passing one back as an `attachments` entry asks the server to fetch itself over
+HTTP, which the SSRF guard blocks on any deploy whose external base URI is localhost or a private
+address — i.e. every containerised one. Use `drive_file_id` for a Drive file, or
+`get_gmail_attachment_content(return_base64=True)` plus `content` for a Gmail attachment. (The
+error message says this too, so a wrong pick self-corrects.)

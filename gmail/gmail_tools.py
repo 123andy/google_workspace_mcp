@@ -1134,6 +1134,24 @@ def _format_resolved_attachment_error(attachment: Dict[str, Any]) -> str:
     return f"{label}: {detail}"
 
 
+def _is_own_download_route(url: str) -> bool:
+    """True if ``url`` is one of this server's own signed download links.
+
+    ``get_drive_file_download_url`` and ``get_gmail_attachment_content`` mint
+    ``/dl/{handle}`` (the default while ``WORKSPACE_MCP_SHORT_SIGNED_URLS`` is
+    on) or ``/attachments/signed/{token}``. Neither is usable as an attachment
+    *source*: :func:`_try_read_local_attachment` only short-circuits the bare
+    two-segment ``/attachments/{id}`` plane, so these fall through to an HTTP
+    fetch of the server by itself — which the SSRF guard blocks whenever the
+    external base URI is a localhost or private address, i.e. every
+    containerised deploy.
+    """
+    parts = urlparse(url).path.strip("/").split("/")
+    return (len(parts) == 2 and parts[0] == "dl") or (
+        len(parts) == 3 and parts[:2] == ["attachments", "signed"]
+    )
+
+
 def _try_read_local_attachment(url: str) -> Optional[tuple[bytes, str, Optional[str]]]:
     """Try to resolve a URL as an MCP attachment stored on local disk.
 
@@ -1228,7 +1246,19 @@ async def _resolve_url_attachments(
             data, resp = await _download_attachment_bytes(url)
         except Exception as exc:
             logger.exception("Failed to fetch attachment URL %s", _redact_url(url))
-            resolved.append(_build_attachment_error_entry(att, exc))
+            attach_error: Exception = exc
+            if _is_own_download_route(url):
+                # Route the agent to something that works instead of leaving it
+                # to retry the same URL with a different hostname.
+                attach_error = ValueError(
+                    "That URL is this server's own download link, so attaching it "
+                    "would mean the server fetching itself over HTTP — which is "
+                    "not reachable in this deployment. Attach a Drive file with "
+                    "'drive_file_id' instead, or fetch a Gmail attachment with "
+                    "get_gmail_attachment_content(return_base64=True) and pass the "
+                    "result as 'content'."
+                )
+            resolved.append(_build_attachment_error_entry(att, attach_error))
             continue
 
         # Infer filename from URL path if not provided.
@@ -2687,7 +2717,7 @@ async def send_gmail_message(
     attachments: Annotated[
         Optional[DictList],
         Field(
-            description='Optional list of attachments. Each can have: "url" (fetch from URL — works with MCP attachment URLs from get_drive_file_download_url / get_gmail_attachment_content), OR "path" (file path, auto-encodes), OR "content" (standard base64, not urlsafe) + "filename". Optional "mime_type". Optional "content_id" (string) makes the attachment inline-rendered: it lands in a multipart/related part with `Content-ID: <content_id>` and `Content-Disposition: inline`, and the HTML body can reference it via `<img src="cid:<content_id>">` (RFC 2392). Without `content_id` the attachment is a regular multipart/mixed attachment. Example: [{"url": "https://host/attachments/abc-123", "filename": "report.pdf"}]',
+            description='Optional list of attachments. Each can have: "drive_file_id" (attach a Drive file by ID — the option to use for anything already in Drive, and the only one that works in remote/streamable-http mode), OR "content" (standard base64, not urlsafe) + "filename", OR "url" (fetch from a PUBLIC URL — do NOT pass a link minted by get_drive_file_download_url or get_gmail_attachment_content; those point back at this server and are rejected), OR "path" (local file path, auto-encodes; stdio transport only — unavailable in remote mode). Optional "mime_type". Optional "content_id" (string) makes the attachment inline-rendered: it lands in a multipart/related part with `Content-ID: <content_id>` and `Content-Disposition: inline`, and the HTML body can reference it via `<img src="cid:<content_id>">` (RFC 2392). Without `content_id` the attachment is a regular multipart/mixed attachment. Example: [{"drive_file_id": "1AbC...", "filename": "report.pdf"}]',
         ),
     ] = None,
     include_signature: Annotated[
@@ -3438,7 +3468,7 @@ async def draft_gmail_message(
     attachments: Annotated[
         Optional[DictList],
         Field(
-            description="Optional list of attachments. Each can have: 'url' (fetch from URL — works with MCP attachment URLs from get_drive_file_download_url / get_gmail_attachment_content), OR 'path' (file path, auto-encodes), OR 'content' (standard base64, not urlsafe) + 'filename'. Optional 'mime_type'. Optional 'content_id' (string) makes the attachment inline-rendered: it lands in a multipart/related part with `Content-ID: <content_id>` and `Content-Disposition: inline`, and the HTML body can reference it via `<img src=\"cid:<content_id>\">` (RFC 2392). Without `content_id` the attachment is a regular multipart/mixed attachment.",
+            description="Optional list of attachments. Each can have: 'drive_file_id' (attach a Drive file by ID — the option to use for anything already in Drive, and the only one that works in remote/streamable-http mode), OR 'content' (standard base64, not urlsafe) + 'filename', OR 'url' (fetch from a PUBLIC URL — do NOT pass a link minted by get_drive_file_download_url or get_gmail_attachment_content; those point back at this server and are rejected), OR 'path' (local file path, auto-encodes; stdio transport only — unavailable in remote mode). Optional 'mime_type'. Optional 'content_id' (string) makes the attachment inline-rendered: it lands in a multipart/related part with `Content-ID: <content_id>` and `Content-Disposition: inline`, and the HTML body can reference it via `<img src=\"cid:<content_id>\">` (RFC 2392). Without `content_id` the attachment is a regular multipart/mixed attachment.",
         ),
     ] = None,
     include_signature: Annotated[
