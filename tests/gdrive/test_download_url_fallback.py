@@ -33,9 +33,7 @@ async def test_stateless_no_url_fallback_names_cause_and_remedy(
 
     # drive_tools binds is_stateless_mode at import time — patch ITS binding.
     monkeypatch.setattr(drive_tools_module, "is_stateless_mode", lambda: True)
-    monkeypatch.setattr(
-        signing_module, "signed_attachment_urls_enabled", lambda: False
-    )
+    monkeypatch.setattr(signing_module, "signed_attachment_urls_enabled", lambda: False)
     mock_download.return_value = b"pdf bytes " + bytes(range(200))
     service = Mock()
     service.files().get().execute.return_value = {

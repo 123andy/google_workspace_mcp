@@ -299,9 +299,7 @@ async def test_stateless_no_url_fallback_names_cause_and_remedy(monkeypatch):
     import core.attachment_signing as signing_module
 
     monkeypatch.setattr(oauth_config_module, "is_stateless_mode", lambda: True)
-    monkeypatch.setattr(
-        signing_module, "signed_attachment_urls_enabled", lambda: False
-    )
+    monkeypatch.setattr(signing_module, "signed_attachment_urls_enabled", lambda: False)
     payload = b"attachment bytes " + bytes(range(200))
     mock_service = _build_mock_service(payload, filename="report.pdf")
 

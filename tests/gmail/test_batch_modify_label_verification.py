@@ -131,9 +131,7 @@ async def test_removal_that_did_not_take_is_reported_unchanged():
     """The message exists, but the label we asked to remove is still on it."""
     service = _service({"msg-1": ["INBOX", "UNREAD"]})
 
-    result = await _run(
-        service, message_ids=["msg-1"], remove_label_ids=["UNREAD"]
-    )
+    result = await _run(service, message_ids=["msg-1"], remove_label_ids=["UNREAD"])
 
     assert "Applied: 0/1" in result
     assert "Unchanged (1): msg-1" in result
