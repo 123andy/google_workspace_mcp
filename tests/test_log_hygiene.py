@@ -197,3 +197,59 @@ async def test_handle_http_errors_scrubs_request_uri_at_error(caplog):
     assert "<query-redacted>" in error_text
     assert all(not r.exc_info for r in error_records)
     assert any(r.exc_info for r in caplog.records if r.levelno == logging.DEBUG)
+
+
+@pytest.mark.asyncio
+async def test_import_to_google_doc_hides_file_name_from_info(caplog):
+    """File names are user content too ("Termination letter — <name>.docx").
+    Found live 2026-08-21: the import tools logged File Name: '<name>' at INFO.
+    INFO carries file_name_len; the name itself is DEBUG."""
+    from gdrive.drive_tools import import_to_google_doc
+
+    secret_name = f"{SECRET}.md"
+    service = Mock()
+    # Folder resolution shortcut-checks the target; answer as a real folder.
+    service.files().get().execute.return_value = {
+        "id": "root",
+        "mimeType": "application/vnd.google-apps.folder",
+    }
+    service.files().create().execute.return_value = {
+        "id": "F1",
+        "name": SECRET,
+        "webViewLink": "https://docs.google.com/x",
+        "mimeType": "application/vnd.google-apps.document",
+    }
+
+    with caplog.at_level(logging.DEBUG):
+        await _unwrap(import_to_google_doc)(
+            service=service,
+            user_google_email="user@example.com",
+            file_name=secret_name,
+            content="# hi",
+        )
+
+    info_text = _info_text(caplog)
+    assert "file_name_len=" in info_text
+    assert secret_name not in info_text
+
+
+def test_gmail_attach_logs_length_not_filename(caplog):
+    """The attach path logged 'Attached file: <name> (N bytes)' at INFO."""
+    import base64
+
+    from gmail.gmail_tools import _prepare_gmail_message
+
+    secret_name = f"{SECRET}.pdf"
+    payload = base64.b64encode(b"%PDF-fake").decode()
+
+    with caplog.at_level(logging.DEBUG):
+        _prepare_gmail_message(
+            to="user@example.com",
+            subject="s",
+            body="b",
+            attachments=[{"content": payload, "filename": secret_name}],
+        )
+
+    info_text = _info_text(caplog)
+    assert "filename_len=" in info_text
+    assert secret_name not in info_text

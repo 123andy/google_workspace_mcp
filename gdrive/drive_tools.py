@@ -1149,8 +1149,11 @@ async def create_drive_file(
         str: Confirmation of the created file, or the resumable upload URL.
     """
     logger.info(
-        f"[create_drive_file] Invoked. Email: '{user_google_email}', File Name: {file_name}, Folder ID: {folder_id}, fileUrl: {fileUrl}, return_upload_url: {return_upload_url}"
+        f"[create_drive_file] Invoked. Email: '{user_google_email}', "
+        f"file_name_len={len(file_name) if file_name else 0}, Folder ID: {folder_id}, "
+        f"has_fileUrl={bool(fileUrl)}, return_upload_url={return_upload_url}"
     )
+    logger.debug(f"[create_drive_file] File Name: {file_name}, fileUrl: {fileUrl}")
 
     # Resumable upload URL path: hand back a pre-authorized session URL and stop.
     if return_upload_url:
@@ -1172,9 +1175,8 @@ async def create_drive_file(
             },
             content_length=content_length,
         )
-        logger.info(
-            f"[create_drive_file] Returned resumable upload URL for '{file_name}'."
-        )
+        logger.info("[create_drive_file] Returned resumable upload URL.")
+        logger.debug(f"[create_drive_file] Resumable upload URL was for '{file_name}'.")
         return (
             f"Resumable upload session created for new file '{file_name}' "
             f"(folder '{folder_id}', for {user_google_email}).\n\n"
@@ -1468,8 +1470,10 @@ async def _import_with_conversion(
     """
     logger.info(
         f"[{tool_name}] Invoked. Email: '{user_google_email}', "
-        f"File Name: '{file_name}', Source Format: '{source_format}', Folder ID: '{folder_id}'"
+        f"file_name_len={len(file_name) if file_name else 0}, "
+        f"Source Format: '{source_format}', Folder ID: '{folder_id}'"
     )
+    logger.debug(f"[{tool_name}] File Name: '{file_name}'")
 
     # Remote-safe path: in streamable-http mode, server-side file ingestion
     # (file_path/file_url) is misleading. Instead, return a resumable upload URL the
@@ -2005,9 +2009,11 @@ async def check_drive_file_public_access(
         str: Information about the file's sharing status and whether it can be used in Google Docs.
     """
     logger.info(
-        f"[check_drive_file_public_access] Searching for {file_name}"
+        f"[check_drive_file_public_access] Invoked. "
+        f"file_name_len={len(file_name) if file_name else 0}"
         + (f" within drive_id={drive_id}" if drive_id else "")
     )
+    logger.debug(f"[check_drive_file_public_access] Searching for {file_name}")
 
     # Search for the file
     escaped_name = file_name.replace("'", "\\'")

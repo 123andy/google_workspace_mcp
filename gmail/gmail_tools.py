@@ -1612,7 +1612,11 @@ def _prepare_gmail_message(
                     subtype=sub_type,
                     filename=safe_filename,
                 )
-                logger.info(f"Attached file: {safe_filename} ({len(file_data)} bytes)")
+                logger.info(
+                    f"Attached file: filename_len={len(safe_filename)} "
+                    f"({len(file_data)} bytes)"
+                )
+                logger.debug(f"Attached file name: {safe_filename}")
             attached_count += 1
         except (binascii.Error, ValueError) as e:
             logger.error(f"Failed to decode attachment {filename or file_path}: {e}")
