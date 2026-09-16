@@ -76,8 +76,10 @@ from gmail.gmail_helpers import (
     _http_error_status,
     _retryable_result_ids,
     _signature_html_to_text,
+    _wrap_signature_html,
     build_label_color,
     build_label_visibility,
+    html_newlines_to_br,
     html_to_text_preserving_breaks,
 )
 
@@ -636,7 +638,7 @@ def _append_signature_to_body(
 
     if body_format == "html":
         separator = "<br><br>" if body.strip() else ""
-        return f"{body}{separator}{signature_html}"
+        return f"{body}{separator}{_wrap_signature_html(signature_html)}"
 
     signature_text = _signature_html_to_text(signature_html).strip()
     if not signature_text:
@@ -695,7 +697,7 @@ def _build_quoted_reply_body(
         # Signature
         sig_block = ""
         if signature_html and signature_html.strip():
-            sig_block = f"<br><br>{signature_html}"
+            sig_block = f"<br><br>{_wrap_signature_html(signature_html)}"
 
         # Quoted original
         orig_html = original.get("html_body") or ""
@@ -2534,6 +2536,15 @@ async def send_gmail_message(
     In forward mode, body (if any) is prepended as a note and subject is optional.
     Threading, reply, and signature options do not apply when forwarding.
 
+    THIS TOOL SENDS IMMEDIATELY AND CANNOT SCHEDULE. Gmail's REST API exposes no
+    send-time parameter; Schedule send is a web-UI feature with no API equivalent,
+    so no argument to this tool can defer delivery. Never tell a user a message
+    was scheduled. For "prepare now, deliver later", create a draft with
+    draft_gmail_message. An external scheduler must retain the message data to
+    create and send a new message via send_gmail_message at the chosen time, or
+    call users.drafts.send with the draft ID returned by draft_gmail_message.
+    Alternatively, let the user schedule that draft in the Gmail UI.
+
     Args:
         to (str): Recipient email address.
         subject (str): Email subject. Required unless forwarding (then defaults to 'Fwd: <original subject>').
@@ -2757,6 +2768,12 @@ async def send_gmail_message(
         signature_html = await _get_send_as_signature_html_for_tool(
             service, from_email=sender_email
         )
+
+    if body_format == "html":
+        # Bare newlines between text are invisible to HTML renderers; callers
+        # (LLMs especially) pass them expecting line breaks. Convert only the
+        # caller's body, before any signature or quoted original is attached.
+        body = html_newlines_to_br(body)
 
     if quote_original and target_reply:
         send_body_content = _build_quoted_reply_body(
@@ -3056,6 +3073,15 @@ async def draft_gmail_message(
     Creates a draft email in the user's Gmail account. Supports both new drafts and reply drafts with optional attachments.
     Supports Gmail's "Send As" feature to draft from configured alias addresses.
 
+    SCHEDULED SEND IS NOT AVAILABLE. Gmail's REST API exposes no send-time
+    parameter; the Schedule send feature is web-UI only, and a message cannot be
+    placed in the Scheduled folder through the API. Do not claim a message was
+    scheduled. To deliver at a chosen time, create a draft with
+    draft_gmail_message. An external scheduler must retain the message data to
+    create and send a new message via send_gmail_message then, or call
+    users.drafts.send with the draft ID returned by draft_gmail_message.
+    Alternatively, let the user schedule the draft in the Gmail UI.
+
     Args:
         user_google_email (str): The user's Google email address. Required for authentication.
         subject (str): Email subject.
@@ -3165,7 +3191,9 @@ async def draft_gmail_message(
             from_email=from_email,
             fallback_email=user_google_email,
         )
-    draft_body = body
+    # Convert only the caller's body, before any signature or quoted original
+    # is attached; see send_gmail_message.
+    draft_body = html_newlines_to_br(body) if body_format == "html" else body
     signature_html = resolved_signature_html if include_signature else ""
 
     reply_context = None
