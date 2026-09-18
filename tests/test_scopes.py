@@ -15,6 +15,7 @@ from auth.scopes import (
     BASE_SCOPES,
     CALENDAR_READONLY_SCOPE,
     CALENDAR_SCOPE,
+    CHAT_MEMBERSHIPS_READONLY_SCOPE,
     CONTACTS_READONLY_SCOPE,
     CONTACTS_SCOPE,
     DRIVE_FILE_SCOPE,
@@ -109,6 +110,27 @@ class TestReadOnlyScopes:
         set_read_only(True)
         scopes = get_scopes_for_tools(["sheets"])
         assert DRIVE_READONLY_SCOPE in scopes
+
+
+class TestChatScopes:
+    """Chat names DMs after their members, which needs these scopes."""
+
+    CHAT_NAMING_SCOPES = {CHAT_MEMBERSHIPS_READONLY_SCOPE, CONTACTS_READONLY_SCOPE}
+
+    def teardown_method(self):
+        set_read_only(False)
+        permissions_module._PERMISSIONS = None
+
+    def test_chat_requests_naming_scopes(self):
+        assert self.CHAT_NAMING_SCOPES <= set(get_scopes_for_tools(["chat"]))
+
+    def test_chat_read_only_mode_requests_naming_scopes(self):
+        set_read_only(True)
+        assert self.CHAT_NAMING_SCOPES <= set(get_scopes_for_tools(["chat"]))
+
+    def test_chat_readonly_permission_requests_naming_scopes(self):
+        set_permissions({"chat": "readonly"})
+        assert self.CHAT_NAMING_SCOPES <= set(get_scopes_for_tools(["chat"]))
 
 
 class TestHasRequiredScopes:
