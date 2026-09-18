@@ -236,7 +236,6 @@ async def test_search_messages_shows_attachment_indicator(mock_resolve):
 
     att = _make_attachment(content_name="report.pdf", content_type="application/pdf")
     msg = _make_message(text="Here is the report", attachments=[att])
-    msg["_space_name"] = "General"
 
     chat_service = Mock()
     chat_service.spaces().list().execute.return_value = {
@@ -265,7 +264,6 @@ async def test_search_messages_combines_filters_and_uses_page_size(mock_resolve)
     mock_resolve.return_value = "Test User"
 
     msg = _make_message(text="Deploy finished")
-    msg["_space_name"] = "General"
 
     chat_service = Mock()
     chat_service.spaces().list().execute.return_value = {
@@ -300,9 +298,7 @@ async def test_search_messages_query_only_filters_client_side_without_api_filter
     mock_resolve.return_value = "Test User"
 
     matching = _make_message(text="Deploy finished")
-    matching["_space_name"] = "General"
     non_matching = _make_message(text="Lunch plans")
-    non_matching["_space_name"] = "General"
 
     chat_service = Mock()
     chat_service.spaces().list().execute.return_value = {

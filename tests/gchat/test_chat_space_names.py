@@ -407,8 +407,9 @@ async def test_list_spaces_keeps_listing_members_between_isolated_network_errors
 
 
 @pytest.mark.parametrize("tool", [list_spaces, get_messages, search_messages])
-def test_space_naming_tools_require_memberships_scope(tool):
-    assert CHAT_MEMBERSHIPS_READONLY_SCOPE in tool._required_google_scopes
+def test_space_naming_tools_do_not_require_memberships_scope(tool):
+    # Tokens granted before the scope was added must keep working.
+    assert CHAT_MEMBERSHIPS_READONLY_SCOPE not in tool._required_google_scopes
 
 
 @pytest.mark.asyncio
@@ -487,3 +488,20 @@ async def test_resolve_sender_falls_back_to_email_when_person_has_no_name():
     name = await chat_helpers._resolve_sender(people_service, {"name": "users/200"})
 
     assert name == "alice@example.com"
+
+
+@pytest.mark.asyncio
+async def test_search_messages_names_explicit_direct_message_space():
+    chat_service = _chat_service(
+        [DM_SPACE], messages={"spaces/DM1": [_message("spaces/DM1", "deploy?")]}
+    )
+
+    result = await _unwrap(search_messages)(
+        chat_service=chat_service,
+        people_service=_people_service(),
+        user_google_email=SELF_EMAIL,
+        query="deploy",
+        space_id="spaces/DM1",
+    )
+
+    assert "Alice Smith in 'Alice Smith': deploy?" in result
