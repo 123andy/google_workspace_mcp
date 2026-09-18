@@ -20,6 +20,7 @@ _UNNAMED_SPACE_FALLBACKS = {
 }
 _SPACE_NAME_MAX_MEMBERS = 3
 _PEOPLE_BATCH_SIZE = 200  # people.getBatchGet limit
+_MAX_CONSECUTIVE_MEMBER_LOOKUP_FAILURES = 2
 
 
 def _cache_sender(user_id: str, name: str) -> None:
@@ -111,6 +112,20 @@ async def _lookup_people_names(people_service, user_ids: List[str]) -> Dict[str,
     return names
 
 
+async def _list_memberships(chat_service, space_name: str) -> List[dict]:
+    """Return every membership of a space, following nextPageToken."""
+    memberships = []
+    params = {"parent": space_name, "pageSize": 100}
+    while True:
+        response = await asyncio.to_thread(
+            chat_service.spaces().members().list(**params).execute
+        )
+        memberships.extend(response.get("memberships", []))
+        if not response.get("nextPageToken"):
+            return memberships
+        params["pageToken"] = response["nextPageToken"]
+
+
 async def _name_spaces(
     chat_service, people_service, spaces: List[dict]
 ) -> Dict[str, str]:
@@ -146,14 +161,10 @@ async def _name_spaces(
     me_id = me["resourceName"].replace("people/", "users/", 1)
 
     others_by_space = {}
+    consecutive_failures = 0
     for space_name in unnamed:
         try:
-            response = await asyncio.to_thread(
-                chat_service.spaces()
-                .members()
-                .list(parent=space_name, pageSize=100)
-                .execute
-            )
+            memberships = await _list_memberships(chat_service, space_name)
         except HttpError as e:
             logger.debug(f"Could not list members of {space_name}: {e}")
             # Missing scope or throttling would fail every remaining space too.
@@ -162,9 +173,14 @@ async def _name_spaces(
             continue
         except Exception as e:
             logger.debug(f"Could not list members of {space_name}: {e}")
+            # Repeated network failures would make every remaining space wait too.
+            consecutive_failures += 1
+            if consecutive_failures >= _MAX_CONSECUTIVE_MEMBER_LOOKUP_FAILURES:
+                break
             continue
+        consecutive_failures = 0
         others = []
-        for membership in response.get("memberships", []):
+        for membership in memberships:
             member = membership.get("member", {})
             if member.get("type") == "HUMAN" and member.get("name") != me_id:
                 others.append(member.get("name"))

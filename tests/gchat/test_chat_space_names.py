@@ -7,8 +7,14 @@ import httplib2
 import pytest
 from googleapiclient.errors import HttpError
 
+from auth.scopes import CHAT_MEMBERSHIPS_READONLY_SCOPE
 from gchat import chat_helpers
-from gchat.chat_tools import get_messages, list_spaces, search_messages
+from gchat.chat_tools import (
+    download_chat_attachment,
+    get_messages,
+    list_spaces,
+    search_messages,
+)
 
 SELF_EMAIL = "me@example.com"
 NAMES = {
@@ -100,18 +106,26 @@ def _batch_lookups(people_service):
     ]
 
 
-def _chat_service(spaces, members=None, members_error=None, messages=None):
-    # members_error is either one error for every space or a dict per space.
+def _chat_service(
+    spaces, members=None, members_error=None, messages=None, member_pages=None
+):
+    # members_error is either one error for every space or a dict per space;
+    # member_pages maps a space to its memberships split into pages.
     chat_service = Mock()
     all_members = {**MEMBERS, **(members or {})}
 
-    def list_members(parent, **kw):
+    def list_members(parent, pageToken=None, **kw):
         error = members_error
         if isinstance(members_error, dict):
             error = members_error.get(parent)
         if error is not None:
             return _request(error=error)
-        return _request({"memberships": all_members.get(parent, [])})
+        pages = (member_pages or {}).get(parent) or [all_members.get(parent, [])]
+        page = int(pageToken or 0)
+        response = {"memberships": pages[page]}
+        if page + 1 < len(pages):
+            response["nextPageToken"] = str(page + 1)
+        return _request(response)
 
     chat_service.spaces().list.side_effect = lambda **kw: _request({"spaces": spaces})
     chat_service.spaces().get.side_effect = lambda name: _request(
@@ -349,6 +363,64 @@ async def test_list_spaces_keeps_listing_members_after_space_specific_error(erro
 
     assert "- Direct message (ID: spaces/DM1, Type: DIRECT_MESSAGE)" in result
     assert "- Alice Smith (ID: spaces/DM2, Type: DIRECT_MESSAGE)" in result
+
+
+@pytest.mark.asyncio
+async def test_list_spaces_counts_members_across_all_pages():
+    member_pages = {
+        "spaces/GC1": [
+            _memberships("spaces/GC1", "100", "200", "300"),
+            _memberships("spaces/GC1", "400", "500"),
+        ]
+    }
+    chat_service = _chat_service([GROUP_SPACE], member_pages=member_pages)
+
+    result = await _list_spaces(chat_service)
+
+    assert "- Alice Smith, Bob Jones, Carol White and 1 other (ID: spaces/GC1" in result
+    page_tokens = [
+        c.kwargs.get("pageToken")
+        for c in chat_service.spaces().members().list.call_args_list
+    ]
+    assert page_tokens == [None, "1"]
+
+
+@pytest.mark.asyncio
+async def test_list_spaces_stops_listing_members_after_consecutive_network_errors():
+    dms = [{**DM_SPACE, "name": f"spaces/DM{i}"} for i in range(1, 6)]
+    chat_service = _chat_service(dms, members_error=TimeoutError("timed out"))
+
+    result = await _list_spaces(chat_service)
+
+    assert "- Direct message (ID: spaces/DM5, Type: DIRECT_MESSAGE)" in result
+    assert chat_service.spaces().members().list.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_list_spaces_keeps_listing_members_between_isolated_network_errors():
+    dms = [{**DM_SPACE, "name": f"spaces/DM{i}"} for i in range(1, 6)]
+    members = {
+        f"spaces/DM{i}": _memberships(f"spaces/DM{i}", "100", "200") for i in (2, 4)
+    }
+    errors = {f"spaces/DM{i}": TimeoutError("timed out") for i in (1, 3, 5)}
+    chat_service = _chat_service(dms, members=members, members_error=errors)
+
+    result = await _list_spaces(chat_service)
+
+    assert "- Alice Smith (ID: spaces/DM4, Type: DIRECT_MESSAGE)" in result
+    assert chat_service.spaces().members().list.call_count == 5
+
+
+@pytest.mark.parametrize("tool", [list_spaces, get_messages, search_messages])
+def test_space_naming_tools_require_memberships_scope(tool):
+    assert CHAT_MEMBERSHIPS_READONLY_SCOPE in tool._required_google_scopes
+
+
+def test_download_chat_attachment_does_not_require_memberships_scope():
+    assert (
+        CHAT_MEMBERSHIPS_READONLY_SCOPE
+        not in download_chat_attachment._required_google_scopes
+    )
 
 
 @pytest.mark.asyncio
