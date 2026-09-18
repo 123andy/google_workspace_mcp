@@ -79,7 +79,7 @@ Downloads an attachment from a Chat message. Returns a local file path (stdio mo
 
 **Space IDs**: Call `list_spaces` first to discover available spaces and their IDs. You need the space ID for all message operations.
 
-**Unnamed spaces**: Direct messages and group chats have no name of their own, so `list_spaces`, `get_messages` and cross-space `search_messages` label them after up to three other members (e.g. `Alice Smith, Bob Jones and 2 others`). This needs the `chat.memberships.readonly` and `contacts.readonly` scopes and the People API enabled in the Google Cloud project; without them the label falls back to `Direct message` or `Group chat`.
+**Unnamed spaces**: Direct messages and group chats have no name of their own, so `list_spaces`, `get_messages` and cross-space `search_messages` label them after up to three other members (e.g. `Alice Smith, Bob Jones and 2 others`). These tools require the `chat.memberships.readonly` and `contacts.readonly` scopes (requested with the Chat scopes), and the People API must be enabled in the Google Cloud project. If a member or name lookup fails, the label falls back to `Direct message` or `Group chat`.
 
 **Message resource names**: Messages are identified by their full resource name in the format `spaces/SPACE_ID/messages/MESSAGE_ID`. This is the value expected by `create_reaction` and `download_chat_attachment`.
 

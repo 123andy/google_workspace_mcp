@@ -9,13 +9,14 @@ export_doc_to_pdf, and list_spreadsheets — without requiring --tools drive.
 import sys
 import os
 
+import pytest
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from auth.scopes import (
     BASE_SCOPES,
     CALENDAR_READONLY_SCOPE,
     CALENDAR_SCOPE,
-    CHAT_MEMBERSHIPS_READONLY_SCOPE,
     CONTACTS_READONLY_SCOPE,
     CONTACTS_SCOPE,
     DRIVE_FILE_SCOPE,
@@ -34,6 +35,12 @@ from auth.scopes import (
     set_read_only,
 )
 from auth.permissions import get_scopes_for_permission, set_permissions
+from gchat.chat_tools import (
+    download_chat_attachment,
+    get_messages,
+    list_spaces,
+    search_messages,
+)
 import auth.permissions as permissions_module
 
 
@@ -112,25 +119,32 @@ class TestReadOnlyScopes:
         assert DRIVE_READONLY_SCOPE in scopes
 
 
-class TestChatScopes:
-    """Chat names DMs after their members, which needs these scopes."""
+def _chat_readonly_permission():
+    set_permissions({"chat": "readonly"})
 
-    CHAT_NAMING_SCOPES = {CHAT_MEMBERSHIPS_READONLY_SCOPE, CONTACTS_READONLY_SCOPE}
+
+class TestChatScopes:
+    """Every Chat read tool can authenticate with the scopes chat requests."""
 
     def teardown_method(self):
         set_read_only(False)
         permissions_module._PERMISSIONS = None
 
-    def test_chat_requests_naming_scopes(self):
-        assert self.CHAT_NAMING_SCOPES <= set(get_scopes_for_tools(["chat"]))
-
-    def test_chat_read_only_mode_requests_naming_scopes(self):
-        set_read_only(True)
-        assert self.CHAT_NAMING_SCOPES <= set(get_scopes_for_tools(["chat"]))
-
-    def test_chat_readonly_permission_requests_naming_scopes(self):
-        set_permissions({"chat": "readonly"})
-        assert self.CHAT_NAMING_SCOPES <= set(get_scopes_for_tools(["chat"]))
+    @pytest.mark.parametrize(
+        "configure",
+        [lambda: None, lambda: set_read_only(True), _chat_readonly_permission],
+        ids=["default", "read_only", "chat_readonly_permission"],
+    )
+    @pytest.mark.parametrize(
+        "tool",
+        [list_spaces, get_messages, search_messages, download_chat_attachment],
+        ids=lambda tool: tool.__name__,
+    )
+    def test_requested_scopes_cover_chat_read_tools(self, configure, tool):
+        configure()
+        assert has_required_scopes(
+            get_scopes_for_tools(["chat"]), tool._required_google_scopes
+        )
 
 
 class TestHasRequiredScopes:

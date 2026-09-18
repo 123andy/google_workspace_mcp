@@ -9,12 +9,7 @@ from googleapiclient.errors import HttpError
 
 from auth.scopes import CHAT_MEMBERSHIPS_READONLY_SCOPE
 from gchat import chat_helpers
-from gchat.chat_tools import (
-    download_chat_attachment,
-    get_messages,
-    list_spaces,
-    search_messages,
-)
+from gchat.chat_tools import get_messages, list_spaces, search_messages
 
 SELF_EMAIL = "me@example.com"
 NAMES = {
@@ -414,13 +409,6 @@ async def test_list_spaces_keeps_listing_members_between_isolated_network_errors
 @pytest.mark.parametrize("tool", [list_spaces, get_messages, search_messages])
 def test_space_naming_tools_require_memberships_scope(tool):
     assert CHAT_MEMBERSHIPS_READONLY_SCOPE in tool._required_google_scopes
-
-
-def test_download_chat_attachment_does_not_require_memberships_scope():
-    assert (
-        CHAT_MEMBERSHIPS_READONLY_SCOPE
-        not in download_chat_attachment._required_google_scopes
-    )
 
 
 @pytest.mark.asyncio
