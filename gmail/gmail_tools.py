@@ -3028,7 +3028,7 @@ async def _build_forward_message(
         # Fail loudly rather than silently building an incomplete forward when the
         # caller asked for the original attachments to be preserved.
         if failed_attachments:
-            raise Exception(
+            raise UserInputError(
                 "Failed to include requested attachment(s): "
                 + ", ".join(failed_attachments)
             )
@@ -3585,9 +3585,9 @@ async def draft_gmail_message(
     # In-Reply-To/References headers to add a draft to a thread. If we could not
     # derive the headers, fall back to an unthreaded draft instead of sending an
     # invalid thread request.
-    draft_body = {"message": {"raw": raw_message}}
+    draft_request_body = {"message": {"raw": raw_message}}
     if thread_id and in_reply_to and references:
-        draft_body["message"]["threadId"] = thread_id
+        draft_request_body["message"]["threadId"] = thread_id
 
     if action == "update":
         # drafts.update replaces the draft's message wholesale, keeping the draft
@@ -3596,7 +3596,7 @@ async def draft_gmail_message(
             saved_draft = await asyncio.to_thread(
                 service.users()
                 .drafts()
-                .update(userId="me", id=draft_id, body=draft_body)
+                .update(userId="me", id=draft_id, body=draft_request_body)
                 .execute,
                 num_retries=GOOGLE_API_WRITE_RETRIES,
             )
@@ -3614,7 +3614,10 @@ async def draft_gmail_message(
         verb = "updated"
     else:
         saved_draft = await asyncio.to_thread(
-            service.users().drafts().create(userId="me", body=draft_body).execute,
+            service.users()
+            .drafts()
+            .create(userId="me", body=draft_request_body)
+            .execute,
             num_retries=GOOGLE_API_WRITE_RETRIES,
         )
         verb = "created"
