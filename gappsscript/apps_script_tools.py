@@ -337,7 +337,9 @@ async def _create_script_project_impl(
     parent_id: Optional[str] = None,
 ) -> str:
     """Internal implementation for create_script_project."""
-    logger.info(f"[create_script_project] Email: {user_google_email}, Title: {title}")
+    logger.info(
+        f"[create_script_project] Email: {user_google_email}, title_len={len(title)}"
+    )
 
     request_body = {"title": title}
 
@@ -494,6 +496,7 @@ async def _run_script_function_impl(
     function_name: str,
     parameters: Optional[list[object]] = None,
     dev_mode: bool = False,
+    deployment_id: Optional[str] = None,
 ) -> str:
     """Internal implementation for run_script_function."""
     logger.info(
@@ -506,8 +509,53 @@ async def _run_script_function_impl(
         request_body["parameters"] = parameters
 
     try:
+        if not deployment_id:
+            all_deployments = []
+            page_token = None
+            while True:
+                list_params = {"scriptId": script_id}
+                if page_token:
+                    list_params["pageToken"] = page_token
+
+                deployments_response = await asyncio.to_thread(
+                    service.projects().deployments().list(**list_params).execute
+                )
+                all_deployments.extend(deployments_response.get("deployments", []))
+                page_token = deployments_response.get("nextPageToken")
+                if not page_token:
+                    break
+
+            deployments = [
+                deployment
+                for deployment in all_deployments
+                if deployment.get("deploymentId")
+                and deployment.get("deploymentConfig", {}).get("versionNumber")
+                is not None
+                and any(
+                    entry_point.get("entryPointType") == "EXECUTION_API"
+                    for entry_point in deployment.get("entryPoints", [])
+                )
+            ]
+
+            if not deployments:
+                return (
+                    "Execution failed\n"
+                    f"Function: {function_name}\n"
+                    "Error: No versioned API Executable deployment was found. In the "
+                    "Apps Script editor, use Deploy > New deployment > API Executable. "
+                    "The script and caller must share a standard Google Cloud project. "
+                    "manage_deployment(action='create') is sufficient only when the "
+                    "script manifest already defines executionApi."
+                )
+
+            latest = max(
+                deployments,
+                key=lambda deployment: deployment["deploymentConfig"]["versionNumber"],
+            )
+            deployment_id = latest["deploymentId"]
+
         response = await asyncio.to_thread(
-            service.scripts().run(scriptId=script_id, body=request_body).execute
+            service.scripts().run(scriptId=deployment_id, body=request_body).execute
         )
 
         if "error" in response:
@@ -542,7 +590,7 @@ async def _run_script_function_impl(
     ),
 )
 @handle_http_errors("run_script_function", service_type="script")
-@require_google_service("script", "script_run")
+@require_google_service("script", ["script_run", "script_deployments_readonly"])
 async def run_script_function(
     service: Any,
     user_google_email: str,
@@ -550,6 +598,7 @@ async def run_script_function(
     function_name: str,
     parameters: Optional[ObjectList] = None,
     dev_mode: bool = False,
+    deployment_id: Optional[str] = None,
 ) -> str:
     """
     Executes a function in a deployed script.
@@ -561,12 +610,21 @@ async def run_script_function(
         function_name: Name of function to execute
         parameters: Optional list of parameters to pass
         dev_mode: Whether to run latest code vs deployed version
+        deployment_id: Optional API Executable deployment ID. When supplied,
+            skips the automatic deployment lookup. When omitted, the versioned
+            API Executable deployment with the highest version number is used.
 
     Returns:
         str: Formatted string with execution result or error
     """
     return await _run_script_function_impl(
-        service, user_google_email, script_id, function_name, parameters, dev_mode
+        service,
+        user_google_email,
+        script_id,
+        function_name,
+        parameters,
+        dev_mode,
+        deployment_id,
     )
 
 
@@ -582,7 +640,7 @@ async def _create_deployment_impl(
     Creates a new version first, then creates a deployment using that version.
     """
     logger.info(
-        f"[create_deployment] Email: {user_google_email}, ID: {script_id}, Desc: {description}"
+        f"[create_deployment] Email: {user_google_email}, ID: {script_id}, desc_len={len(description) if description else 0}"
     )
 
     # First, create a new version
@@ -717,10 +775,24 @@ async def _list_deployments_impl(
 
     for i, deployment in enumerate(deployments, 1):
         deployment_id = deployment.get("deploymentId", "Unknown")
-        description = deployment.get("description", "No description")
+        # description and versionNumber live under deploymentConfig; fall back to
+        # any top-level description for forward/backward compatibility.
+        config = deployment.get("deploymentConfig", {})
+        description = (
+            config.get("description")
+            or deployment.get("description")
+            or "No description"
+        )
         update_time = deployment.get("updateTime", "Unknown")
+        # A HEAD deployment has no versionNumber — it always serves the latest
+        # saved content rather than a pinned version.
+        version_number = config.get("versionNumber")
+        version_label = (
+            str(version_number) if version_number is not None else "HEAD (latest)"
+        )
 
         output.append(f"{i}. {description} ({deployment_id})")
+        output.append(f"   Version: {version_label}")
         output.append(f"   Updated: {update_time}")
         output.append("")
 
@@ -745,7 +817,8 @@ async def list_deployments(
     script_id: str,
 ) -> str:
     """
-    Lists all deployments for a script project.
+    Lists all deployments for a script project, including the bound version
+    number of each deployment so callers can verify which version is served.
 
     Args:
         service: Injected Google API service client
@@ -753,7 +826,7 @@ async def list_deployments(
         script_id: The script project ID
 
     Returns:
-        str: Formatted string with deployment list
+        str: Formatted string with deployment list (id, description, version, updated time)
     """
     return await _list_deployments_impl(service, user_google_email, script_id)
 
@@ -845,13 +918,18 @@ async def _list_script_processes_impl(
         f"[list_script_processes] Email: {user_google_email}, PageSize: {page_size}"
     )
 
-    request_params = {"pageSize": page_size}
     if script_id:
-        request_params["scriptId"] = script_id
-
-    response = await asyncio.to_thread(
-        service.processes().list(**request_params).execute
-    )
+        # processes.list() has no top-level scriptId parameter; the
+        # script-scoped endpoint takes it directly.
+        response = await asyncio.to_thread(
+            service.processes()
+            .listScriptProcesses(scriptId=script_id, pageSize=page_size)
+            .execute
+        )
+    else:
+        response = await asyncio.to_thread(
+            service.processes().list(pageSize=page_size).execute
+        )
 
     processes = response.get("processes", [])
 
@@ -900,7 +978,8 @@ async def list_script_processes(
         service: Injected Google API service client
         user_google_email: User's email address
         page_size: Number of results (default: 50)
-        script_id: Optional filter by script ID
+        script_id: Optional script ID. When set, lists all processes for that
+            script visible to the user, including runs by other users.
 
     Returns:
         str: Formatted string with process list

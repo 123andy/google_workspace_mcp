@@ -50,6 +50,23 @@ def _decoded_raw(body: dict) -> str:
     )
 
 
+def _mock_service() -> Mock:
+    """A Gmail service mock with the Send-As settings lookup stubbed.
+
+    draft_gmail_message resolves the account's default Send-As identity even when
+    include_signature is False, so any test that gets as far as composing a
+    message needs settings().sendAs().list() to return real data rather than a
+    bare Mock (which is not iterable).
+    """
+    service = Mock()
+    service.users().settings().sendAs().list().execute.return_value = {
+        "sendAs": [
+            {"sendAsEmail": "user@example.com", "isDefault": True, "signature": ""}
+        ]
+    }
+    return service
+
+
 async def _call(service, **kwargs):
     kwargs.setdefault("user_google_email", "user@example.com")
     kwargs.setdefault("include_signature", False)
@@ -138,7 +155,7 @@ class TestUpdate:
     async def test_update_calls_drafts_update_with_full_message(self):
         """update goes to drafts.update (NOT create), keeps the caller's draft
         ID, and carries the rebuilt raw message."""
-        service = Mock()
+        service = _mock_service()
         service.users().drafts().update().execute.return_value = {
             "id": "r-1",
             "message": {"id": "m-2", "threadId": "t-3"},
@@ -166,7 +183,7 @@ class TestUpdate:
     @pytest.mark.asyncio
     async def test_update_threads_like_create(self):
         """A reply update with explicit headers carries threadId, same as create."""
-        service = Mock()
+        service = _mock_service()
         service.users().drafts().update().execute.return_value = {
             "id": "r-1",
             "message": {"id": "m-2", "threadId": "t-3"},
@@ -190,7 +207,7 @@ class TestUpdate:
 
     @pytest.mark.asyncio
     async def test_update_404_becomes_actionable_error(self):
-        service = Mock()
+        service = _mock_service()
         service.users().drafts().update().execute.side_effect = _http_error(404)
 
         with pytest.raises(UserInputError, match="not found"):
@@ -208,7 +225,7 @@ class TestCreateUnchanged:
     @pytest.mark.asyncio
     async def test_default_action_still_creates(self):
         """No action arg → identical behavior to before: drafts.create, 'created'."""
-        service = Mock()
+        service = _mock_service()
         service.users().drafts().create().execute.return_value = {
             "id": "r-new",
             "message": {"id": "m-1", "threadId": "t-1"},
