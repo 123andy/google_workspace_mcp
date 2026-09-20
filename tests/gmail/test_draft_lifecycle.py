@@ -14,7 +14,7 @@ import base64
 import os
 import sys
 from typing import Dict, List, Optional
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 from googleapiclient.errors import HttpError
@@ -260,6 +260,17 @@ class TestUpdate:
         assert "In-Reply-To: <parent@mail.example.com>" in raw
         assert "References: <root@mail.example.com> <parent@mail.example.com>" in raw
 
+        # Pin the READ request too, not just the write. drafts.get accepts only
+        # (userId, id, format) — it does NOT take metadataHeaders, unlike
+        # messages.get/threads.get — and googleapiclient rejects unknown kwargs
+        # at request-build time, before any network call. A bare Mock() swallows
+        # them, so without this assertion an invalid kwarg passes CI and fails
+        # for every real caller.
+        # (the fixture itself calls .get() bare to install a return value, so
+        # filter to the real, argument-bearing invocation)
+        real_gets = [c for c in service.users().drafts().get.call_args_list if c.kwargs]
+        assert real_gets == [call(userId="me", id="r-1", format="metadata")]
+
     @pytest.mark.asyncio
     async def test_update_of_unthreaded_draft_stays_unthreaded(self):
         """Gmail gives every message a threadId, including a standalone draft.
@@ -315,11 +326,15 @@ class TestUpdate:
     @pytest.mark.asyncio
     async def test_unreadable_draft_fails_loudly_rather_than_detaching(self):
         """If the existing threading cannot be read, refuse — proceeding would
-        rebuild the message unthreaded with no signal to the caller."""
+        rebuild the message unthreaded with no signal to the caller.
+
+        A 5xx is re-raised rather than retyped as a UserInputError: it is not
+        the caller's input that is wrong, and handle_http_errors gives better
+        advice for it (a 401/403 here means re-auth, not "pass thread_id")."""
         service = _mock_service()
         service.users().drafts().get().execute.side_effect = _http_error(500)
 
-        with pytest.raises(UserInputError, match="threading"):
+        with pytest.raises(HttpError):
             await _call(
                 service,
                 action="update",

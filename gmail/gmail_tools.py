@@ -912,30 +912,31 @@ async def _fetch_draft_threading(
     """
     header_names = ["In-Reply-To", "References"]
     try:
+        # NOTE: drafts.get takes only (userId, id, format) — unlike messages.get
+        # and threads.get it does NOT accept metadataHeaders. googleapiclient
+        # validates kwargs when it BUILDS the request, so passing it raises
+        # TypeError before any network call. format="metadata" returns the full
+        # header set anyway and _extract_headers filters to the two we want.
         request = (
-            service.users()
-            .drafts()
-            .get(
-                userId="me",
-                id=draft_id,
-                format="metadata",
-                metadataHeaders=header_names,
-            )
+            service.users().drafts().get(userId="me", id=draft_id, format="metadata")
         )
-        draft = await asyncio.to_thread(request.execute)
+        draft = await asyncio.to_thread(
+            request.execute, num_retries=GOOGLE_API_WRITE_RETRIES
+        )
     except HttpError as exc:
         if _http_error_status(exc) == 404:
             raise UserInputError(
                 f"Draft '{draft_id}' was not found — it may have already been "
                 "sent or deleted, or its ID rotated after an edit in the Gmail "
-                "UI. Use list_drafts to find the live draft."
+                "UI. Use search_gmail_messages(query='in:drafts') to find the "
+                "live draft."
             ) from exc
-        raise UserInputError(
-            f"Could not read draft '{draft_id}' to preserve its threading "
-            f"({exc}). Updating now would rebuild the message without reply "
-            "headers and drop a threaded draft out of its conversation. Retry, "
-            "or pass thread_id, in_reply_to and references explicitly."
-        ) from exc
+        # Anything else (401/403/5xx) is re-raised so handle_http_errors can
+        # classify it. Typing a revoked token as a UserInputError would hand the
+        # caller "pass thread_id explicitly" when the real answer is re-auth —
+        # the same misdirection the sibling commit fixes for drafts.send. The
+        # update never runs, so the draft cannot be detached either way.
+        raise
 
     message = draft.get("message", {}) or {}
     headers = _extract_headers(message.get("payload", {}) or {}, header_names)
@@ -2594,7 +2595,7 @@ async def send_gmail_message(
     draft_id: Annotated[
         Optional[str],
         Field(
-            description="Send an EXISTING draft (as returned by draft_gmail_message) instead of composing. The draft already contains its recipients, subject, body and attachments, so pass ONLY draft_id — combining it with content/addressing arguments is rejected. Note a draft's ID can rotate if the draft is edited in the Gmail UI; on a not-found error, use list_drafts to find the live ID.",
+            description="Send an EXISTING draft (as returned by draft_gmail_message) instead of composing. The draft already contains its recipients, subject, body and attachments, so pass ONLY draft_id — combining it with content/addressing arguments is rejected. Note a draft's ID can rotate if the draft is edited in the Gmail UI; on a not-found error, use search_gmail_messages(query='in:drafts') to find the live ID.",
         ),
     ] = None,
 ) -> str:
@@ -2621,7 +2622,8 @@ async def send_gmail_message(
     split), pass ONLY draft_id: the draft is sent exactly as it stands via Gmail's
     drafts.send. Edit safety (measured): a draft's message_id rotates on every edit —
     never cache it; draft_id survives web/mobile body, subject, and attachment edits,
-    and only a discard-recreate rotates it. If it no longer resolves, list_drafts
+    and only a discard-recreate rotates it. If it no longer resolves,
+    search_gmail_messages(query='in:drafts')
     re-finds the live draft.
 
     Args:
@@ -2808,7 +2810,7 @@ async def send_gmail_message(
                 raise UserInputError(
                     f"Draft '{draft_id}' was not found — it may have already been "
                     "sent or deleted, or its ID rotated after an edit in the Gmail "
-                    "UI. Use list_drafts to find the live draft."
+                    "UI. Use search_gmail_messages(query='in:drafts') to find the live draft."
                 ) from exc
             if status == 403:
                 # Gmail overloads 403: authorization, quota, rate limit and
@@ -3397,7 +3399,8 @@ async def draft_gmail_message(
         str: Confirmation with the created/updated draft's ID, message ID, and thread ID.
             To send the draft later, pass the draft ID to
             send_gmail_message(draft_id=...); if the draft is edited in the Gmail UI its
-            ID can rotate — list_drafts re-finds the live one. For deletions, a
+            ID can rotate — search_gmail_messages(query='in:drafts') re-finds the live
+            one. For deletions, a
             confirmation of the permanent delete.
 
     Examples:
@@ -3731,7 +3734,7 @@ async def draft_gmail_message(
     result += (
         f". To send later: send_gmail_message(draft_id='{draft_id}'). "
         f"Note the draft ID can rotate if the draft is edited in the Gmail UI — "
-        f"list_drafts re-finds the live one."
+        f"search_gmail_messages(query='in:drafts') re-finds the live one."
     )
     return result
 

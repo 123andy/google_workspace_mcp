@@ -73,7 +73,7 @@ class TestSendDraft:
         service = Mock()
         service.users().drafts().send().execute.side_effect = _http_error(404)
 
-        with pytest.raises(UserInputError, match="list_drafts"):
+        with pytest.raises(UserInputError, match="in:drafts"):
             await _send(service, draft_id="r-gone")
 
     async def test_invalid_id_also_actionable(self):
