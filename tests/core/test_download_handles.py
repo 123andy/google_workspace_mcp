@@ -14,7 +14,7 @@ from core import download_handles as dh
 
 _CLAIMS = {
     "src": "gmail",
-    "sub": "andy@scientist.com",
+    "sub": "user@example.com",
     "iat": 1000,
     "exp": int(time.time()) + 900,
     "mid": "18c2f4a9b3d7e510",
@@ -107,7 +107,7 @@ class TestBuildDownloadUrl:
 
         url = await build_download_url(
             source="gmail",
-            user_email="andy@scientist.com",
+            user_email="user@example.com",
             ref={"mid": "18c2f4a9b3d7e510", "aid": "ANGjdJ8" + "x" * 300},
             ttl_seconds=900,
         )
@@ -118,7 +118,7 @@ class TestBuildDownloadUrl:
         handle = url.rsplit("/", 1)[1]
         claims = await dh.load_download_ref(handle)
         assert claims["src"] == "gmail"
-        assert claims["sub"] == "andy@scientist.com"
+        assert claims["sub"] == "user@example.com"
         assert claims["aid"].startswith("ANGjdJ8")
 
     @pytest.mark.asyncio
@@ -131,7 +131,7 @@ class TestBuildDownloadUrl:
 
         url = await build_download_url(
             source="drive",
-            user_email="andy@scientist.com",
+            user_email="user@example.com",
             ref={"fid": "1A2b3C"},
             ttl_seconds=900,
         )
@@ -150,7 +150,7 @@ class TestBuildDownloadUrl:
 
         url = await build_download_url(
             source="drive",
-            user_email="andy@scientist.com",
+            user_email="user@example.com",
             ref={"fid": "1A2b3C"},
             ttl_seconds=900,
         )
@@ -224,6 +224,6 @@ class TestShortDownloadRoute:
         response = await serve_short_download(self._request(handle))
 
         assert response.status_code == 200
-        assert captured["email"] == "andy@scientist.com"
+        assert captured["email"] == "user@example.com"
         assert captured["claims"]["mid"] == "18c2f4a9b3d7e510"
         assert "report.pdf" in response.headers["content-disposition"]

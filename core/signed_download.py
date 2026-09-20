@@ -174,10 +174,12 @@ async def _fetch_drive(claims: dict, credentials: Credentials) -> DownloadResult
     export_mime = claims.get("emt")  # set only for native Google file exports
 
     drive = build("drive", "v3", credentials=credentials)
+    # supportsAllDrives is required for shared-drive files (the API 404s without
+    # it); export_media doesn't take it, matching the tool-side download path.
     request_obj = (
         drive.files().export_media(fileId=file_id, mimeType=export_mime)
         if export_mime
-        else drive.files().get_media(fileId=file_id)
+        else drive.files().get_media(fileId=file_id, supportsAllDrives=True)
     )
 
     fh = io.BytesIO()
@@ -217,7 +219,9 @@ async def _fetch_drive(claims: dict, credentials: Credentials) -> DownloadResult
     return DownloadResult(filename=filename, media_type=media_type, stream=body())
 
 
-async def _fetch_gmail_message(claims: dict, credentials: Credentials) -> DownloadResult:
+async def _fetch_gmail_message(
+    claims: dict, credentials: Credentials
+) -> DownloadResult:
     """Fetch a COMPLETE Gmail message (not an attachment) by message id.
 
     ``fmt`` selects the representation: ``eml`` = the raw RFC 5322 message (byte-exact,
