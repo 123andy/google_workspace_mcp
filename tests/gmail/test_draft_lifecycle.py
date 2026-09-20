@@ -13,6 +13,7 @@ is precisely the class of bug an unconstrained mock hides.
 import base64
 import os
 import sys
+from typing import Dict, List, Optional
 from unittest.mock import Mock
 
 import pytest
@@ -50,13 +51,18 @@ def _decoded_raw(body: dict) -> str:
     )
 
 
-def _mock_service() -> Mock:
+def _mock_service(draft_headers: Optional[List[Dict[str, str]]] = None) -> Mock:
     """A Gmail service mock with the Send-As settings lookup stubbed.
 
     draft_gmail_message resolves the account's default Send-As identity even when
     include_signature is False, so any test that gets as far as composing a
     message needs settings().sendAs().list() to return real data rather than a
     bare Mock (which is not iterable).
+
+    action='update' also reads the existing draft to preserve its threading, so
+    drafts().get() is stubbed too. ``draft_headers`` supplies the stored draft's
+    headers: leave it None for an unthreaded draft, or pass In-Reply-To /
+    References to model a reply draft.
     """
     service = Mock()
     service.users().settings().sendAs().list().execute.return_value = {
@@ -64,7 +70,26 @@ def _mock_service() -> Mock:
             {"sendAsEmail": "user@example.com", "isDefault": True, "signature": ""}
         ]
     }
+    service.users().drafts().get().execute.return_value = {
+        "id": "r-1",
+        "message": {
+            "id": "m-1",
+            "threadId": "t-1",
+            "payload": {"headers": list(draft_headers or [])},
+        },
+    }
     return service
+
+
+# A stored reply draft: threadId alone is not enough for Gmail to keep a
+# message in its conversation, the RFC 2822 headers have to travel with it.
+_THREADED_DRAFT_HEADERS = [
+    {"name": "In-Reply-To", "value": "<parent@mail.example.com>"},
+    {
+        "name": "References",
+        "value": "<root@mail.example.com> <parent@mail.example.com>",
+    },
+]
 
 
 async def _call(service, **kwargs):
@@ -204,6 +229,107 @@ class TestUpdate:
 
         body = service.users().drafts().update.call_args.kwargs["body"]
         assert body["message"]["threadId"] == "t-3"
+
+    @pytest.mark.asyncio
+    async def test_update_preserves_threading_when_caller_omits_it(self):
+        """THE regression this guards: drafts.update destroys and replaces the
+        underlying message, so a reply draft updated with only new body text
+        would silently leave its conversation. The existing threading must be
+        read back and re-supplied — asserted on the REQUEST, not the fixture,
+        because a fixture that merely returns a threadId proves nothing about
+        what we sent."""
+        service = _mock_service(draft_headers=_THREADED_DRAFT_HEADERS)
+        service.users().drafts().update().execute.return_value = {
+            "id": "r-1",
+            "message": {"id": "m-2", "threadId": "t-1"},
+        }
+        service.users().drafts().update.reset_mock()
+
+        await _call(
+            service,
+            action="update",
+            draft_id="r-1",
+            subject="Re: Hi",
+            body="Just the new wording.",
+            to="rcpt@example.com",
+        )
+
+        body = service.users().drafts().update.call_args.kwargs["body"]
+        assert body["message"]["threadId"] == "t-1"
+        raw = _decoded_raw(body)
+        assert "In-Reply-To: <parent@mail.example.com>" in raw
+        assert "References: <root@mail.example.com> <parent@mail.example.com>" in raw
+
+    @pytest.mark.asyncio
+    async def test_update_of_unthreaded_draft_stays_unthreaded(self):
+        """Gmail gives every message a threadId, including a standalone draft.
+        Re-supplying that bare threadId without reply headers does not meet
+        Gmail's criteria for thread membership, so it must NOT be sent."""
+        service = _mock_service()  # no In-Reply-To / References
+        service.users().drafts().update().execute.return_value = {
+            "id": "r-1",
+            "message": {"id": "m-2"},
+        }
+        service.users().drafts().update.reset_mock()
+
+        await _call(
+            service,
+            action="update",
+            draft_id="r-1",
+            subject="Standalone",
+            body="Body",
+            to="rcpt@example.com",
+        )
+
+        body = service.users().drafts().update.call_args.kwargs["body"]
+        assert "threadId" not in body["message"]
+
+    @pytest.mark.asyncio
+    async def test_explicit_thread_id_wins_over_the_stored_one(self):
+        """Inheriting must not block a deliberate re-thread."""
+        service = _mock_service(draft_headers=_THREADED_DRAFT_HEADERS)
+        service.users().drafts().update().execute.return_value = {
+            "id": "r-1",
+            "message": {"id": "m-2", "threadId": "t-9"},
+        }
+        service.users().drafts().update.reset_mock()
+        service.users().drafts().get.reset_mock()
+
+        await _call(
+            service,
+            action="update",
+            draft_id="r-1",
+            subject="Re: Elsewhere",
+            body="B",
+            to="rcpt@example.com",
+            thread_id="t-9",
+            in_reply_to="<other@example.com>",
+            references="<other@example.com>",
+        )
+
+        body = service.users().drafts().update.call_args.kwargs["body"]
+        assert body["message"]["threadId"] == "t-9"
+        # The caller supplied everything, so no read-back was needed.
+        service.users().drafts().get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unreadable_draft_fails_loudly_rather_than_detaching(self):
+        """If the existing threading cannot be read, refuse — proceeding would
+        rebuild the message unthreaded with no signal to the caller."""
+        service = _mock_service()
+        service.users().drafts().get().execute.side_effect = _http_error(500)
+
+        with pytest.raises(UserInputError, match="threading"):
+            await _call(
+                service,
+                action="update",
+                draft_id="r-1",
+                subject="S",
+                body="B",
+                to="rcpt@example.com",
+            )
+
+        service.users().drafts().update.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_update_404_becomes_actionable_error(self):

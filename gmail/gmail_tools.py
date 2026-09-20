@@ -887,6 +887,65 @@ def _extract_headers(payload: dict, header_names: List[str]) -> Dict[str, str]:
     return headers
 
 
+async def _fetch_draft_threading(
+    service, draft_id: str
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Read an existing draft's thread association.
+
+    drafts.update REPLACES the draft's underlying message, so any threading
+    the caller does not re-supply is destroyed. Gmail's rule for belonging to
+    a thread is all-or-nothing: message.threadId must be set AND In-Reply-To /
+    References must be RFC 2822 compliant AND the Subject must match. Carrying
+    the existing values forward is what keeps an updated reply draft in its
+    conversation.
+
+    Returns (thread_id, in_reply_to, references), each None when the draft is
+    not threaded. The reply headers gate the result deliberately: Gmail gives
+    every message a threadId, including a standalone draft, and re-supplying
+    that bare threadId without reply headers does not satisfy the criteria
+    above. Returning it would risk a 400 on an otherwise valid update, so an
+    unthreaded draft is reported as unthreaded.
+
+    Raises UserInputError if the draft cannot be read, rather than silently
+    proceeding: continuing would rebuild the message with no threading and
+    detach the draft from its conversation with no way for the caller to tell.
+    """
+    header_names = ["In-Reply-To", "References"]
+    try:
+        request = (
+            service.users()
+            .drafts()
+            .get(
+                userId="me",
+                id=draft_id,
+                format="metadata",
+                metadataHeaders=header_names,
+            )
+        )
+        draft = await asyncio.to_thread(request.execute)
+    except HttpError as exc:
+        if _http_error_status(exc) == 404:
+            raise UserInputError(
+                f"Draft '{draft_id}' was not found — it may have already been "
+                "sent or deleted, or its ID rotated after an edit in the Gmail "
+                "UI. Use list_drafts to find the live draft."
+            ) from exc
+        raise UserInputError(
+            f"Could not read draft '{draft_id}' to preserve its threading "
+            f"({exc}). Updating now would rebuild the message without reply "
+            "headers and drop a threaded draft out of its conversation. Retry, "
+            "or pass thread_id, in_reply_to and references explicitly."
+        ) from exc
+
+    message = draft.get("message", {}) or {}
+    headers = _extract_headers(message.get("payload", {}) or {}, header_names)
+    in_reply_to = headers.get("In-Reply-To")
+    references = headers.get("References")
+    if not in_reply_to and not references:
+        return None, None, None
+    return message.get("threadId"), in_reply_to, references
+
+
 async def _fetch_thread_reply_context(
     service,
     thread_id: str,
@@ -3467,6 +3526,21 @@ async def draft_gmail_message(
             "fresh draft and delete the old one instead."
         )
 
+    if action == "update" and not thread_id:
+        # drafts.update destroys and replaces the underlying message, so
+        # threading the caller did not re-supply is lost. A model updating a
+        # reply draft will usually pass only the new body, so inherit the
+        # existing association rather than silently detaching the draft.
+        # An explicit thread_id from the caller always wins, which is what
+        # keeps a deliberate re-thread possible.
+        (
+            thread_id,
+            inherited_in_reply_to,
+            inherited_references,
+        ) = await _fetch_draft_threading(service, draft_id)
+        in_reply_to = in_reply_to or inherited_in_reply_to
+        references = references or inherited_references
+
     # Prepare the email message. An explicit alias needs no settings lookup when
     # its signature is disabled. Otherwise resolve the identity and signature
     # together so Gmail's default sender and its signature stay aligned.
@@ -3609,8 +3683,9 @@ async def draft_gmail_message(
         draft_request_body["message"]["threadId"] = thread_id
 
     if action == "update":
-        # drafts.update replaces the draft's message wholesale, keeping the draft
-        # ID and (absent an explicit re-thread) its thread.
+        # drafts.update keeps the draft ID but replaces the underlying message
+        # wholesale — the thread is NOT preserved for free. It survives only
+        # because threadId and the reply headers were re-supplied above.
         try:
             saved_draft = await asyncio.to_thread(
                 service.users()
