@@ -298,6 +298,26 @@ async def test_update_still_applies_visibility_when_asked():
 
 
 @pytest.mark.asyncio
+async def test_update_keeps_a_visibility_the_parameter_cannot_express():
+    """Gmail also stores "labelShowIfUnread", which the tool cannot be asked
+    for. Carrying the stored value over is the only thing that preserves it."""
+    service = _build_mock_service(
+        {
+            "id": "Label_1",
+            "name": "Urgent",
+            "labelListVisibility": "labelShowIfUnread",
+            "messageListVisibility": "hide",
+        }
+    )
+
+    await _update(service, name="Renamed")
+
+    body = _sent_body(service, "update")
+    assert body["labelListVisibility"] == "labelShowIfUnread"
+    assert body["messageListVisibility"] == "hide"
+
+
+@pytest.mark.asyncio
 async def test_update_falls_back_when_gmail_reports_no_visibility():
     """Gmail omits these fields on some labels; the previous behavior applies."""
     service = _build_mock_service({"id": "Label_1", "name": "Urgent"})

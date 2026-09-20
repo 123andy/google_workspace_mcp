@@ -78,7 +78,6 @@ from gmail.gmail_helpers import (
     _signature_html_to_text,
     _wrap_signature_html,
     build_label_color,
-    build_label_visibility,
     html_newlines_to_br,
     html_to_text_preserving_breaks,
 )
@@ -3843,16 +3842,14 @@ async def manage_gmail_label(
         label_object = {
             "id": label_id,
             "name": name if name is not None else current_label["name"],
-            "labelListVisibility": build_label_visibility(
-                label_list_visibility,
-                current_label.get("labelListVisibility"),
-                "labelShow",
-            ),
-            "messageListVisibility": build_label_visibility(
-                message_list_visibility,
-                current_label.get("messageListVisibility"),
-                "show",
-            ),
+            # A PUT replaces the label outright, so every field the caller left
+            # out is carried over from the fetched label rather than defaulted.
+            "labelListVisibility": label_list_visibility
+            or current_label.get("labelListVisibility")
+            or "labelShow",
+            "messageListVisibility": message_list_visibility
+            or current_label.get("messageListVisibility")
+            or "show",
         }
         label_color = None if clear_color else color or current_label.get("color")
         if label_color:
