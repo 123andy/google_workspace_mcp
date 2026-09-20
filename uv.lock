@@ -2451,7 +2451,7 @@ wheels = [
 
 [[package]]
 name = "workspace-mcp"
-version = "1.27.1"
+version = "1.27.0"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
