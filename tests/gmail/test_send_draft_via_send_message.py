@@ -33,8 +33,17 @@ class _FakeResp:
         self.reason = "Not Found" if status == 404 else "Error"
 
 
-def _http_error(status: int) -> HttpError:
-    return HttpError(_FakeResp(status), b"{}")
+def _http_error(status: int, content: bytes = b"{}") -> HttpError:
+    return HttpError(_FakeResp(status), content)
+
+
+# A real Gmail quota refusal. Same 403 status as a missing-scope failure,
+# entirely different remedy — kept in Google's own wire shape so the
+# classifier is exercised against the text Gmail actually sends.
+_QUOTA_403 = (
+    b'{"error": {"code": 403, "message": "User-rate limit exceeded.", '
+    b'"errors": [{"reason": "rateLimitExceeded", "domain": "usageLimits"}]}}'
+)
 
 
 async def _send(service, **kwargs):
@@ -85,6 +94,37 @@ class TestSendDraft:
 
         with pytest.raises(UserInputError, match="gmail.compose"):
             await _send(service, draft_id="r-1")
+
+    async def test_scope_403_preserves_google_detail_and_draft_id(self):
+        """Re-auth guidance is right, but it must not swallow the provider's
+        own words or the draft it applies to."""
+        service = Mock()
+        service.users().drafts().send().execute.side_effect = _http_error(403)
+
+        with pytest.raises(UserInputError) as exc_info:
+            await _send(service, draft_id="r-42")
+
+        message = str(exc_info.value)
+        assert "r-42" in message
+        assert "Google reported:" in message
+
+    async def test_quota_403_is_not_reported_as_a_scope_problem(self):
+        """Gmail overloads 403. A quota or rate-limit refusal must NOT come
+        back as re-auth guidance — re-authenticating cannot fix it, and the
+        advice sends the caller to repair something that is not broken."""
+        service = Mock()
+        service.users().drafts().send().execute.side_effect = _http_error(
+            403, _QUOTA_403
+        )
+
+        with pytest.raises(UserInputError) as exc_info:
+            await _send(service, draft_id="r-7")
+
+        message = str(exc_info.value)
+        assert "gmail.compose" not in message
+        assert "Re-authenticate" not in message
+        assert "quota or rate limit" in message
+        assert "r-7" in message
 
     async def test_server_errors_pass_through(self):
         service = Mock()

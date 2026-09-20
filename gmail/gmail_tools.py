@@ -75,6 +75,7 @@ from gmail.gmail_helpers import (
     _get_send_as_identity_and_signature,
     _get_send_as_signature_html_for_tool,
     _http_error_status,
+    _is_quota_or_rate_limit_error,
     _retryable_result_ids,
     _signature_html_to_text,
     _wrap_signature_html,
@@ -2751,15 +2752,33 @@ async def send_gmail_message(
                     "UI. Use list_drafts to find the live draft."
                 ) from exc
             if status == 403:
+                # Gmail overloads 403: authorization, quota, rate limit and
+                # domain policy all share it. Only the authorization case is
+                # fixed by re-authenticating, so classify before advising —
+                # telling a rate-limited caller to re-auth sends it to fix
+                # something that is not broken. `_is_quota_or_rate_limit_error`
+                # is the same discriminator `_is_benign_signature_http_error`
+                # already uses for this split.
+                if _is_quota_or_rate_limit_error(exc):
+                    # Deliberately UserInputError rather than a bare re-raise:
+                    # handle_http_errors maps every 401/403 to re-authentication
+                    # guidance, which is exactly the advice this branch exists to
+                    # avoid. UserInputError passes through that decorator intact.
+                    raise UserInputError(
+                        f"Gmail refused to send draft '{draft_id}' because of a "
+                        f"quota or rate limit, not a permissions problem — "
+                        f"re-authenticating will not help. Retry after a pause. "
+                        f"Google reported: {exc}"
+                    ) from exc
                 # drafts.send is compose-scope; gmail.send does not cover it. The
                 # scope is deliberately not declared at the tool boundary (see the
                 # decorator note), so a pre-drafts credential can land here.
                 raise UserInputError(
-                    "Sending an existing draft uses drafts.send, which needs the "
+                    f"Sending draft '{draft_id}' uses drafts.send, which needs the "
                     "gmail.compose scope — this account's stored credential does "
                     "not include it (it predates draft support). Re-authenticate "
                     "this account to add it; drafting with draft_gmail_message "
-                    "grants it as part of the same consent."
+                    f"grants it as part of the same consent. Google reported: {exc}"
                 ) from exc
             raise
         message_id = sent.get("id")
