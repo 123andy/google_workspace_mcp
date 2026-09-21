@@ -10,6 +10,12 @@ from tests.helpers import _make_minimal_pdf
 from gdrive.drive_tools import _download_file_bytes, get_drive_file_content
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_office_xml_limit(monkeypatch):
+    """The expansion limit is read from the environment on every extraction."""
+    monkeypatch.delenv("WORKSPACE_MCP_MAX_OFFICE_XML_BYTES", raising=False)
+
+
 def _unwrap(tool):
     fn = tool.fn if hasattr(tool, "fn") else tool
     while hasattr(fn, "__wrapped__"):
@@ -153,6 +159,37 @@ async def test_get_drive_file_content_reports_invalid_docx(mock_resolve):
         )
 
     assert "appears damaged" in result
+    assert "unsupported text encoding" not in result
+
+
+@pytest.mark.asyncio
+async def test_get_drive_file_content_reports_oversized_expansion(
+    mock_resolve, monkeypatch
+):
+    """A file that expands past the limit is reported as that — not as damaged,
+    and not handed on to the raw-bytes fallback."""
+    import zipfile
+
+    mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    mock_resolve.return_value[1]["mimeType"] = mime_type
+    monkeypatch.setenv("WORKSPACE_MCP_MAX_OFFICE_XML_BYTES", "1000")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("xl/workbook.xml", "<workbook>" + " " * 20_000 + "</workbook>")
+    mock_service = Mock()
+    mock_service.files().get_media.return_value = "req"
+
+    with _patch_downloader(buf.getvalue()):
+        result = await _unwrap(get_drive_file_content)(
+            service=mock_service,
+            user_google_email="user@example.com",
+            file_id="file123",
+        )
+
+    assert "expands beyond the extraction limit" in result
+    assert "WORKSPACE_MCP_MAX_OFFICE_XML_BYTES" in result
+    assert "convert it to a native Google file" in result
+    assert "appears damaged" not in result
     assert "unsupported text encoding" not in result
 
 

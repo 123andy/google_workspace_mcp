@@ -5,6 +5,9 @@ process memory (Drive MediaIo downloads, Gmail attachments, etc.).
 
 Default is disabled (``0`` / unset) so existing deployments keep uncapped
 behavior. Set a positive integer (e.g. ``5242880`` for 5 MiB) to enable.
+
+``WORKSPACE_MCP_MAX_OFFICE_XML_BYTES`` caps how far one Office file may expand
+during text extraction. It is on by default; ``0`` disables it.
 """
 
 from __future__ import annotations
@@ -20,6 +23,20 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
 _ENV_NAME = "WORKSPACE_MCP_MAX_FILE_BYTES"
+_OFFICE_XML_ENV_NAME = "WORKSPACE_MCP_MAX_OFFICE_XML_BYTES"
+
+# Office files are ZIP archives, so the download cap above bounds only the
+# COMPRESSED size, and XML compresses by orders of magnitude. Unlike the
+# download cap this one is on by default: the download cap is opt-in to protect
+# deployments that need large downloads, and nothing comparable depends on
+# unbounded expansion.
+#
+# This counts expanded XML bytes, not memory. The parsed tree is much larger:
+# measured with tracemalloc on 1 MiB of XML, peak allocation was about 14x the
+# XML size for paragraphs of short text and about 30x for empty elements. The
+# default therefore allows a worst case in the hundreds of MiB per extraction;
+# small containers should set it lower.
+DEFAULT_MAX_OFFICE_XML_BYTES = 25 * 1024 * 1024  # 25 MiB
 
 # Keep the uncapped path from asking httplib2 to materialize its 100 MiB
 # default response chunk. This does not impose a total-size limit; it only
@@ -47,21 +64,40 @@ def get_max_file_bytes() -> Optional[int]:
     - positive int → that many bytes
     - invalid or negative value → raise ``ValueError``
     """
-    raw = os.getenv(_ENV_NAME)
+    value = _byte_count_from_env(_ENV_NAME)
+    return value or None
+
+
+def get_max_office_xml_bytes() -> Optional[int]:
+    """Return the cap on bytes expanded out of one Office file, or ``None``.
+
+    Parsing rules:
+    - unset or empty → ``DEFAULT_MAX_OFFICE_XML_BYTES``
+    - ``0`` → uncapped (``None``)
+    - positive int → that many bytes
+    - invalid or negative value → raise ``ValueError``
+    """
+    value = _byte_count_from_env(_OFFICE_XML_ENV_NAME)
+    if value is None:
+        return DEFAULT_MAX_OFFICE_XML_BYTES
+    return value or None
+
+
+def _byte_count_from_env(name: str) -> Optional[int]:
+    """Parse a non-negative byte count from ``name``; ``None`` when unset or empty."""
+    raw = os.getenv(name)
     if raw is None or raw.strip() == "":
         return None
     try:
         value = int(raw.strip())
     except ValueError as exc:
         raise ValueError(
-            f"Invalid {_ENV_NAME}={raw!r}; expected a non-negative integer byte count."
+            f"Invalid {name}={raw!r}; expected a non-negative integer byte count."
         ) from exc
     if value < 0:
         raise ValueError(
-            f"Invalid {_ENV_NAME}={raw!r}; expected a non-negative integer byte count."
+            f"Invalid {name}={raw!r}; expected a non-negative integer byte count."
         )
-    if value == 0:
-        return None
     return value
 
 

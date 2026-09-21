@@ -8,11 +8,13 @@ import httpx
 import pytest
 
 from core.file_limits import (
+    DEFAULT_MAX_OFFICE_XML_BYTES,
     FileTooLargeError,
     download_http_url_bytes,
     download_media_bytes,
     ensure_within_file_size_limit,
     get_max_file_bytes,
+    get_max_office_xml_bytes,
 )
 
 
@@ -265,3 +267,28 @@ async def test_encoded_content_length_is_not_compared_to_decoded_limit(monkeypat
         result = await download_media_bytes(request)
 
     assert result == b"ok"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, DEFAULT_MAX_OFFICE_XML_BYTES),
+        ("", DEFAULT_MAX_OFFICE_XML_BYTES),
+        ("0", None),
+        (" 4096 ", 4096),
+    ],
+)
+def test_get_max_office_xml_bytes(monkeypatch, raw, expected):
+    """Unlike the download cap, unset means the default limit, not no limit."""
+    if raw is None:
+        monkeypatch.delenv("WORKSPACE_MCP_MAX_OFFICE_XML_BYTES", raising=False)
+    else:
+        monkeypatch.setenv("WORKSPACE_MCP_MAX_OFFICE_XML_BYTES", raw)
+    assert get_max_office_xml_bytes() == expected
+
+
+@pytest.mark.parametrize("raw", ["-1", "ten", "1.5"])
+def test_get_max_office_xml_bytes_rejects_invalid(monkeypatch, raw):
+    monkeypatch.setenv("WORKSPACE_MCP_MAX_OFFICE_XML_BYTES", raw)
+    with pytest.raises(ValueError, match="WORKSPACE_MCP_MAX_OFFICE_XML_BYTES"):
+        get_max_office_xml_bytes()
