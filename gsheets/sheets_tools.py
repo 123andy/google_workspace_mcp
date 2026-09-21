@@ -2655,7 +2655,7 @@ async def _manage_named_range_impl(
         )
 
         created_nr = (
-            response.get("replies", [{}])[0]
+            (response.get("replies") or [{}])[0]
             .get("addNamedRange", {})
             .get("namedRange", {})
         )

@@ -672,8 +672,14 @@ def _grid_range_to_a1(grid_range: dict, sheet_titles: dict[int, str]) -> str:
     end_label = f"{col_label(end_col - 1 if end_col is not None else None)}{row_label(end_row - 1 if end_row is not None else None)}"
 
     if start_label and end_label:
+        # Collapse to a single label only for a bounded single cell (both a
+        # column and a row). Column-only (e.g. "A") or row-only (e.g. "1")
+        # ranges must keep the "start:end" form to stay valid A1 (A:A, 1:1).
+        is_single_cell = start_col is not None and start_row is not None
         range_ref = (
-            start_label if start_label == end_label else f"{start_label}:{end_label}"
+            start_label
+            if start_label == end_label and is_single_cell
+            else f"{start_label}:{end_label}"
         )
     elif start_label:
         range_ref = start_label

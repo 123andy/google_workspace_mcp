@@ -161,6 +161,36 @@ async def test_list_named_ranges_omitted_sheet_id_defaults_to_zero():
     assert "Sheet1!A1:B5" in result
 
 
+@pytest.mark.asyncio
+async def test_list_named_ranges_whole_column_and_row():
+    """Test that column-only and row-only named ranges render as valid A1."""
+    named_ranges = [
+        {
+            "namedRangeId": "nr_col",
+            "name": "WholeColumn",
+            # Column A only: no row bounds.
+            "range": {"sheetId": 0, "startColumnIndex": 0, "endColumnIndex": 1},
+        },
+        {
+            "namedRangeId": "nr_row",
+            "name": "WholeRow",
+            # Row 1 only: no column bounds.
+            "range": {"sheetId": 0, "startRowIndex": 0, "endRowIndex": 1},
+        },
+    ]
+    service = _create_mock_service(named_ranges=named_ranges)
+
+    result = await _unwrap(sheets_tools.manage_named_range)(
+        service=service,
+        user_google_email="user@example.com",
+        spreadsheet_id="sheet123",
+        action="list",
+    )
+
+    assert "Sheet1!A:A" in result
+    assert "Sheet1!1:1" in result
+
+
 # ===========================================================================
 # Action: Create
 # ===========================================================================
