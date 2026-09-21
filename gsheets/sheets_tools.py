@@ -28,7 +28,9 @@ from gsheets.sheets_helpers import (
     _fetch_detailed_sheet_errors,
     _fetch_grid_metadata,
     _fetch_sheets_with_rules,
+    _find_named_range,
     _format_conditional_rules_section,
+    _format_named_ranges_list,
     _format_sheet_error_section,
     _parse_a1_range,
     _parse_condition_values,
@@ -1226,7 +1228,7 @@ async def create_spreadsheet(
         str: Information about the newly created spreadsheet including ID, URL, and locale.
     """
     logger.info(
-        f"[create_spreadsheet] Invoked. Email: '{user_google_email}', Title: {title}"
+        f"[create_spreadsheet] Invoked. Email: '{user_google_email}', title_len={len(title)}"
     )
 
     spreadsheet_body = {"properties": {"title": title}}
@@ -1333,12 +1335,12 @@ async def create_sheet(
 
         logger.info(
             f"Successfully duplicated sheet for {user_google_email}. "
-            f"New sheet: '{new_title}' (ID: {new_id})"
+            f"New sheet ID: {new_id}"
         )
         return text_output
 
     logger.info(
-        f"[create_sheet] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, Sheet: {sheet_name}"
+        f"[create_sheet] Invoked. Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, sheet_name_len={len(sheet_name) if sheet_name else 0}"
     )
 
     add_request: dict = {"properties": {}}
@@ -2167,6 +2169,128 @@ async def _resize_sheet_dimensions_impl(
 
 
 @server.tool(
+    title="Manage Sheet Tab",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("manage_sheet_tab", service_type="sheets")
+@require_google_service("sheets", "sheets_write")
+async def manage_sheet_tab(
+    service,
+    user_google_email: str,
+    spreadsheet_id: str,
+    sheet_name: str,
+    action: str,
+    new_name: Optional[str] = None,
+    new_index: Optional[int] = None,
+) -> str:
+    """
+    Manages the lifecycle of an existing sheet tab: rename, delete, hide, unhide or reorder.
+
+    Use create_sheet to add a tab, and resize_sheet_dimensions for row and column
+    level changes. This tool operates on the tab itself.
+
+    Args:
+        user_google_email: User's Google email address
+        spreadsheet_id: ID of the spreadsheet
+        sheet_name: Title of the existing tab to act on
+        action: One of "rename", "delete", "hide", "unhide", "reorder"
+        new_name: New title, required for action="rename"
+        new_index: New zero-based position, required for action="reorder"
+
+    Returns:
+        str: Confirmation of the change.
+    """
+    valid_actions = ("rename", "delete", "hide", "unhide", "reorder")
+    action_lower = action.strip().lower() if isinstance(action, str) else ""
+    if action_lower not in valid_actions:
+        raise UserInputError(
+            f"Invalid action '{action}'. Must be one of: {', '.join(valid_actions)}."
+        )
+
+    if action_lower == "rename":
+        if not new_name or not new_name.strip():
+            raise UserInputError("new_name is required for action='rename'.")
+        new_name = new_name.strip()
+    if action_lower == "reorder":
+        if (
+            new_index is None
+            or isinstance(new_index, bool)
+            or not isinstance(new_index, int)
+            or new_index < 0
+        ):
+            raise UserInputError(
+                "new_index must be a non-negative integer for action='reorder'."
+            )
+
+    logger.info(
+        f"[manage_sheet_tab] Email: '{user_google_email}', Spreadsheet: {spreadsheet_id}, "
+        f"Sheet: '{sheet_name}', Action: {action_lower}"
+    )
+
+    spreadsheet = await asyncio.to_thread(
+        service.spreadsheets()
+        .get(spreadsheetId=spreadsheet_id, fields="sheets.properties")
+        .execute
+    )
+    sheets = spreadsheet.get("sheets", [])
+    target_sheet = _select_sheet(sheets, sheet_name)
+    sheet_id = target_sheet["properties"]["sheetId"]
+
+    if action_lower == "delete":
+        if len(sheets) == 1:
+            raise UserInputError(
+                f"Cannot delete '{sheet_name}': a spreadsheet must keep at least one sheet."
+            )
+        request = {"deleteSheet": {"sheetId": sheet_id}}
+        summary = f"deleted sheet '{sheet_name}'"
+    else:
+        properties: dict = {"sheetId": sheet_id}
+        if action_lower == "rename":
+            properties["title"] = new_name
+            fields = "title"
+            summary = f"renamed sheet '{sheet_name}' to '{new_name}'"
+        elif action_lower in ("hide", "unhide"):
+            properties["hidden"] = action_lower == "hide"
+            fields = "hidden"
+            summary = f"{action_lower} sheet '{sheet_name}'"
+        else:
+            if new_index >= len(sheets):
+                raise UserInputError(
+                    f"new_index must be less than the number of sheets ({len(sheets)})."
+                )
+            current_index = target_sheet["properties"].get(
+                "index", sheets.index(target_sheet)
+            )
+            # Sheets interprets indices before removing the tab from its old position.
+            properties["index"] = (
+                new_index + 1 if new_index > current_index else new_index
+            )
+            fields = "index"
+            summary = f"moved sheet '{sheet_name}' to index {new_index}"
+        request = {
+            "updateSheetProperties": {"properties": properties, "fields": fields}
+        }
+
+    await asyncio.to_thread(
+        service.spreadsheets()
+        .batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": [request]})
+        .execute
+    )
+
+    text_output = (
+        f"Successfully {summary} (ID: {sheet_id}) in spreadsheet "
+        f"{spreadsheet_id} for {user_google_email}."
+    )
+    logger.info(text_output)
+    return text_output
+
+
+@server.tool(
     title="Resize Sheet Dimensions",
     annotations=ToolAnnotations(
         readOnlyHint=False,
@@ -2447,6 +2571,293 @@ async def move_sheet_rows(
 
     logger.info(f"[move_sheet_rows] Moved {num_rows} rows for {user_google_email}")
     return text_output
+
+
+async def _manage_named_range_impl(
+    service,
+    user_google_email: str,
+    spreadsheet_id: str,
+    action: str,
+    name: Optional[str] = None,
+    range_name: Optional[str] = None,
+    named_range_id: Optional[str] = None,
+    new_name: Optional[str] = None,
+    new_range: Optional[str] = None,
+) -> str:
+    """Internal implementation of manage_named_range."""
+    valid_actions = ("list", "create", "update", "delete")
+    action_lower = action.strip().lower() if isinstance(action, str) else ""
+    if action_lower not in valid_actions:
+        raise UserInputError(
+            f"Invalid action '{action}'. Must be one of: {', '.join(valid_actions)}."
+        )
+
+    if action_lower == "list":
+        spreadsheet = await asyncio.to_thread(
+            service.spreadsheets()
+            .get(
+                spreadsheetId=spreadsheet_id,
+                fields="sheets(properties(sheetId,title)),namedRanges(namedRangeId,name,range)",
+            )
+            .execute
+        )
+        sheet_titles = {
+            sheet["properties"]["sheetId"]: sheet["properties"].get(
+                "title", f"Sheet {sheet['properties']['sheetId']}"
+            )
+            for sheet in spreadsheet.get("sheets", [])
+            if "properties" in sheet and "sheetId" in sheet["properties"]
+        }
+        named_ranges = spreadsheet.get("namedRanges", [])
+        return _format_named_ranges_list(
+            named_ranges=named_ranges,
+            sheet_titles=sheet_titles,
+            spreadsheet_id=spreadsheet_id,
+            user_google_email=user_google_email,
+        )
+
+    if action_lower == "create":
+        if not name or not name.strip():
+            raise UserInputError("name is required for action='create'.")
+        if not range_name or not range_name.strip():
+            raise UserInputError("range_name is required for action='create'.")
+
+        name_clean = name.strip()
+        range_clean = range_name.strip()
+
+        spreadsheet = await asyncio.to_thread(
+            service.spreadsheets()
+            .get(
+                spreadsheetId=spreadsheet_id,
+                fields="sheets(properties(sheetId,title))",
+            )
+            .execute
+        )
+        sheets = spreadsheet.get("sheets", [])
+        grid_range = _parse_a1_range(range_clean, sheets)
+
+        body = {
+            "requests": [
+                {
+                    "addNamedRange": {
+                        "namedRange": {
+                            "name": name_clean,
+                            "range": grid_range,
+                        }
+                    }
+                }
+            ]
+        }
+        response = await asyncio.to_thread(
+            service.spreadsheets()
+            .batchUpdate(spreadsheetId=spreadsheet_id, body=body)
+            .execute
+        )
+
+        created_nr = (
+            (response.get("replies") or [{}])[0]
+            .get("addNamedRange", {})
+            .get("namedRange", {})
+        )
+        created_id = created_nr.get("namedRangeId", "")
+        id_info = f" (ID: {created_id})" if created_id else ""
+
+        return (
+            f"Successfully created named range '{name_clean}'{id_info} covering '{range_clean}' "
+            f"in spreadsheet {spreadsheet_id} for {user_google_email}."
+        )
+
+    if action_lower == "update":
+        if not (new_name and new_name.strip()) and not (
+            new_range and new_range.strip()
+        ):
+            raise UserInputError(
+                "At least one of 'new_name' or 'new_range' must be provided for action='update'."
+            )
+        if not (named_range_id and named_range_id.strip()) and not (
+            name and name.strip()
+        ):
+            raise UserInputError(
+                "Either 'named_range_id' or 'name' is required to identify the named range to update."
+            )
+
+        spreadsheet = await asyncio.to_thread(
+            service.spreadsheets()
+            .get(
+                spreadsheetId=spreadsheet_id,
+                fields="sheets(properties(sheetId,title)),namedRanges(namedRangeId,name,range)",
+            )
+            .execute
+        )
+        sheets = spreadsheet.get("sheets", [])
+        named_ranges = spreadsheet.get("namedRanges", [])
+
+        target_nr = _find_named_range(
+            named_ranges, target_id=named_range_id, target_name=name
+        )
+        if not target_nr:
+            identifier = (
+                f"ID '{named_range_id}'" if named_range_id else f"name '{name}'"
+            )
+            raise UserInputError(
+                f"Named range with {identifier} not found in spreadsheet {spreadsheet_id}."
+            )
+
+        resolved_id = target_nr.get("namedRangeId")
+        existing_name = target_nr.get("name", "")
+
+        update_payload: dict = {"namedRangeId": resolved_id}
+        fields = []
+        applied_desc = []
+
+        if new_name and new_name.strip():
+            new_name_clean = new_name.strip()
+            if new_name_clean != existing_name:
+                update_payload["name"] = new_name_clean
+                fields.append("name")
+                applied_desc.append(
+                    f"renamed from '{existing_name}' to '{new_name_clean}'"
+                )
+
+        if new_range and new_range.strip():
+            new_range_clean = new_range.strip()
+            new_grid_range = _parse_a1_range(new_range_clean, sheets)
+            update_payload["range"] = new_grid_range
+            fields.append("range")
+            applied_desc.append(f"range updated to '{new_range_clean}'")
+
+        if not fields:
+            raise UserInputError("No changes to apply to the named range.")
+
+        body = {
+            "requests": [
+                {
+                    "updateNamedRange": {
+                        "namedRange": update_payload,
+                        "fields": ",".join(fields),
+                    }
+                }
+            ]
+        }
+        await asyncio.to_thread(
+            service.spreadsheets()
+            .batchUpdate(spreadsheetId=spreadsheet_id, body=body)
+            .execute
+        )
+
+        return (
+            f"Successfully updated named range (ID: {resolved_id}) in spreadsheet {spreadsheet_id} "
+            f"for {user_google_email}: {', '.join(applied_desc)}."
+        )
+
+    if action_lower == "delete":
+        if not (named_range_id and named_range_id.strip()) and not (
+            name and name.strip()
+        ):
+            raise UserInputError(
+                "Either 'named_range_id' or 'name' is required to identify the named range to delete."
+            )
+
+        resolved_id = named_range_id.strip() if named_range_id else None
+        deleted_name = name.strip() if name else None
+
+        if not resolved_id:
+            spreadsheet = await asyncio.to_thread(
+                service.spreadsheets()
+                .get(
+                    spreadsheetId=spreadsheet_id,
+                    fields="namedRanges(namedRangeId,name)",
+                )
+                .execute
+            )
+            named_ranges = spreadsheet.get("namedRanges", [])
+            target_nr = _find_named_range(named_ranges, target_name=name)
+            if not target_nr:
+                raise UserInputError(
+                    f"Named range with name '{name}' not found in spreadsheet {spreadsheet_id}."
+                )
+            resolved_id = target_nr.get("namedRangeId")
+            deleted_name = target_nr.get("name", name)
+
+        body = {
+            "requests": [
+                {
+                    "deleteNamedRange": {
+                        "namedRangeId": resolved_id,
+                    }
+                }
+            ]
+        }
+        await asyncio.to_thread(
+            service.spreadsheets()
+            .batchUpdate(spreadsheetId=spreadsheet_id, body=body)
+            .execute
+        )
+
+        name_info = f"'{deleted_name}' " if deleted_name else ""
+        return (
+            f"Successfully deleted named range {name_info}(ID: {resolved_id}) "
+            f"from spreadsheet {spreadsheet_id} for {user_google_email}."
+        )
+
+    raise UserInputError(f"Unhandled action: {action}")
+
+
+@server.tool(
+    title="Manage Named Range",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("manage_named_range", service_type="sheets")
+@require_google_service("sheets", "sheets_write")
+async def manage_named_range(
+    service,
+    user_google_email: str,
+    spreadsheet_id: str,
+    action: str,
+    name: Optional[str] = None,
+    range_name: Optional[str] = None,
+    named_range_id: Optional[str] = None,
+    new_name: Optional[str] = None,
+    new_range: Optional[str] = None,
+) -> str:
+    """
+    Manages the lifecycle of named ranges in a Google Sheet: list, create, update, or delete.
+
+    Args:
+        user_google_email: The user's Google email address. Required.
+        spreadsheet_id: The ID of the spreadsheet. Required.
+        action: The operation to perform: "list", "create", "update", or "delete". Required.
+        name: Name for the named range (required for "create"; optional identifier for "update"/"delete").
+        range_name: Target cell or range in A1 notation (e.g., "Sheet1!A1:D10", "A1:B5") (required for "create").
+        named_range_id: The ID of the named range (optional identifier for "update"/"delete").
+        new_name: New name for the named range (used with action="update").
+        new_range: New A1-style range for the named range (used with action="update").
+
+    Returns:
+        str: Confirmation message or formatted list of named ranges.
+    """
+    logger.info(
+        "[manage_named_range] Invoked. Email: '%s', Spreadsheet: %s, Action: %s",
+        user_google_email,
+        spreadsheet_id,
+        action,
+    )
+    return await _manage_named_range_impl(
+        service=service,
+        user_google_email=user_google_email,
+        spreadsheet_id=spreadsheet_id,
+        action=action,
+        name=name,
+        range_name=range_name,
+        named_range_id=named_range_id,
+        new_name=new_name,
+        new_range=new_range,
+    )
 
 
 # Create comment management tools for sheets

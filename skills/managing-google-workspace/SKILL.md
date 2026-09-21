@@ -123,6 +123,7 @@ For parameters: [references/calendar.md](references/calendar.md)
 |------|------|
 | Read doc as Markdown | `get_doc_as_markdown` |
 | Read doc content (raw) | `get_doc_content` |
+| Read plain text with link/chip targets and document segments | `get_doc_content(preserve_context=True)` |
 | Create new doc | `create_doc` |
 | Modify text / apply styles | `modify_doc_text` |
 | Insert elements (tables, lists, breaks) | `insert_doc_elements` |
@@ -154,6 +155,7 @@ For parameters: [references/docs.md](references/docs.md)
 | Create spreadsheet | `create_spreadsheet` |
 | Create sheet (tab) | `create_sheet` |
 | Move rows between sheets | `move_sheet_rows` |
+| Manage named ranges | `manage_named_range` |
 | List spreadsheets | `list_spreadsheets` |
 | Comments | `manage_spreadsheet_comment` / `list_spreadsheet_comments` |
 
@@ -222,6 +224,7 @@ For parameters: [references/contacts.md](references/contacts.md)
 | Get messages | `get_messages` |
 | Search messages | `search_messages` |
 | Send message | `send_message` |
+| Edit a message already sent | `send_message` with `message_name` |
 | React to message | `create_reaction` |
 | Download attachment | `download_chat_attachment` |
 
@@ -268,7 +271,7 @@ Parameters: `user_google_email` (string, optional), `service_name` (string, requ
 ### Reply to an email
 1. `search_gmail_messages` -- find the email
 2. `get_gmail_message_content` -- read it (get `message_id` and `thread_id`)
-3. `send_gmail_message` -- reply using `in_reply_to` and `thread_id`
+3. `send_gmail_message` -- reply using `thread_id`; omit reply headers to target the latest non-draft, non-trash message with an RFC `Message-ID`
 
 ### Find and share a file
 1. `search_drive_files` -- find the file
