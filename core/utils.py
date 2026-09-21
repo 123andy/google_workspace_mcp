@@ -354,6 +354,19 @@ _ZIP_READ_CHUNK_BYTES = 64 * 1024
 _OFFICE_ZIP_COMPRESSION = (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
 
 
+def _office_extraction_too_large(
+    total_bytes: int, name: str, *, reason: str, activity: str
+) -> OfficeXmlTooLargeError:
+    """Build the common actionable error for either extraction boundary."""
+    return OfficeXmlTooLargeError(
+        f"{reason} the extraction limit of {total_bytes:,} bytes (exceeded while "
+        f"{activity} {name}; set by WORKSPACE_MCP_MAX_OFFICE_XML_BYTES). To read "
+        "it anyway, convert it to a native Google file in Drive (File > Save as "
+        "Google Docs, Sheets or Slides) and read the converted file: Google "
+        "exports native files as text itself, so nothing is expanded here."
+    )
+
+
 class _ExpansionBudget:
     """Bytes one Office file may still expand to, across all of its parts."""
 
@@ -368,14 +381,52 @@ class _ExpansionBudget:
         return self.total_bytes - self.used
 
     def too_large(self, name: str) -> OfficeXmlTooLargeError:
-        return OfficeXmlTooLargeError(
-            f"the file expands beyond the extraction limit of "
-            f"{self.total_bytes:,} bytes (exceeded while reading {name}; set by "
-            "WORKSPACE_MCP_MAX_OFFICE_XML_BYTES). To read it anyway, convert "
-            "it to a native Google file in Drive (File > Save as Google Docs, "
-            "Sheets or Slides) and read the converted file: Google exports "
-            "native files as text itself, so nothing is expanded here."
+        assert self.total_bytes is not None
+        return _office_extraction_too_large(
+            self.total_bytes,
+            name,
+            reason="the file expands beyond",
+            activity="reading",
         )
+
+
+class _ExtractedTextBudget:
+    """UTF-8 bytes of text one Office file may produce.
+
+    This is independent of the XML expansion budget. In particular, XLSX can
+    reference one shared string from many cells, making the extracted text much
+    larger than the XML that describes it.
+    """
+
+    def __init__(self, total_bytes: Optional[int]) -> None:
+        self.total_bytes = total_bytes
+        self.used = 0
+
+    def join(
+        self,
+        parts: list[str],
+        separator: str,
+        member: str,
+        *,
+        prefix: str = "",
+    ) -> str:
+        """Join ``parts`` only after proving the result fits the text budget."""
+        if self.total_bytes is not None:
+            size = self.used + len(prefix.encode("utf-8"))
+            separator_size = len(separator.encode("utf-8"))
+            for index, part in enumerate(parts):
+                if index:
+                    size += separator_size
+                size += len(part.encode("utf-8"))
+                if size > self.total_bytes:
+                    raise _office_extraction_too_large(
+                        self.total_bytes,
+                        member,
+                        reason="the extracted text exceeds",
+                        activity="extracting text from",
+                    )
+            self.used = size
+        return separator.join(parts)
 
 
 def _read_zip_member(zf: zipfile.ZipFile, name: str, budget: _ExpansionBudget) -> bytes:
@@ -770,7 +821,9 @@ def extract_office_xml_text(file_bytes: bytes, mime_type: str) -> Optional[str]:
 
     # Outside the try: an invalid setting is a configuration error, and must not
     # be reported as a damaged file.
-    budget = _ExpansionBudget(get_max_office_xml_bytes())
+    max_bytes = get_max_office_xml_bytes()
+    budget = _ExpansionBudget(max_bytes)
+    text_budget = _ExtractedTextBudget(max_bytes)
 
     try:
         with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
@@ -811,7 +864,14 @@ def extract_office_xml_text(file_bytes: bytes, mime_type: str) -> Optional[str]:
                     # Paragraph boundaries carry meaning; keep them as newlines.
                     sep = "\n"
                 if member_texts:
-                    pieces.append(sep.join(member_texts))
+                    pieces.append(
+                        text_budget.join(
+                            member_texts,
+                            sep,
+                            member,
+                            prefix="\n\n" if pieces else "",
+                        )
+                    )
 
             text = "\n\n".join(pieces).strip(" ")
             return text or None

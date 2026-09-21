@@ -712,6 +712,29 @@ class TestExpansionLimits:
         with pytest.raises(OfficeXmlTooLargeError, match="sheet3.xml"):
             extract_office_xml_text(data, XLSX_MIME)
 
+    def test_repeated_shared_strings_cannot_amplify_the_extracted_text(
+        self, monkeypatch
+    ):
+        """A shared string is stored once but may be referenced by many cells."""
+        monkeypatch.setenv(ENV, "20000")
+        cells = "".join(f'<c r="A{row}" t="s"><v>0</v></c>' for row in range(1, 301))
+        members = {
+            "xl/workbook.xml": "<workbook/>",
+            "xl/sharedStrings.xml": (
+                f"<sst {SHEET_NS}><si><t>{'A' * 5_000}</t></si></sst>"
+            ),
+            "xl/worksheets/sheet1.xml": (
+                f"<worksheet {SHEET_NS}><sheetData><row>{cells}</row></sheetData>"
+                "</worksheet>"
+            ),
+        }
+        assert sum(len(xml.encode()) for xml in members.values()) < 20_000
+
+        with pytest.raises(OfficeXmlTooLargeError, match="extracted text") as exc:
+            extract_office_xml_text(_deflated(**members), XLSX_MIME)
+
+        assert "extracting text from xl/worksheets/sheet1.xml" in str(exc.value)
+
     @pytest.mark.parametrize(
         ("mime_type", "members", "culprit"),
         [

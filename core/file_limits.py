@@ -6,8 +6,9 @@ process memory (Drive MediaIo downloads, Gmail attachments, etc.).
 Default is disabled (``0`` / unset) so existing deployments keep uncapped
 behavior. Set a positive integer (e.g. ``5242880`` for 5 MiB) to enable.
 
-``WORKSPACE_MCP_MAX_OFFICE_XML_BYTES`` caps how far one Office file may expand
-during text extraction. It is on by default; ``0`` disables it.
+``WORKSPACE_MCP_MAX_OFFICE_XML_BYTES`` independently caps both the XML expanded
+from one Office file and the text extracted from it. It is on by default;
+``0`` disables it.
 """
 
 from __future__ import annotations
@@ -81,6 +82,12 @@ def get_max_office_xml_bytes() -> Optional[int]:
     if value is None:
         return DEFAULT_MAX_OFFICE_XML_BYTES
     return value or None
+
+
+def validate_file_limit_settings() -> None:
+    """Raise ``ValueError`` if any file-limit environment setting is invalid."""
+    get_max_file_bytes()
+    get_max_office_xml_bytes()
 
 
 def _byte_count_from_env(name: str) -> Optional[int]:

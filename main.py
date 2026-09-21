@@ -506,11 +506,10 @@ def main():
     # Validate the memory-safety settings once at startup. Tool helpers parse them
     # defensively as well, but a deployment typo must not silently disable the
     # configured limit.
-    from core.file_limits import get_max_file_bytes, get_max_office_xml_bytes
+    from core.file_limits import validate_file_limit_settings
 
     try:
-        get_max_file_bytes()
-        get_max_office_xml_bytes()
+        validate_file_limit_settings()
     except ValueError as exc:
         parser.error(str(exc))
 

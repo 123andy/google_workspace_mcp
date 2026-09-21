@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -39,6 +40,24 @@ def test_main_rejects_invalid_max_office_xml_bytes_at_startup(monkeypatch, capsy
 
     assert exc.value.code == 2
     assert "WORKSPACE_MCP_MAX_OFFICE_XML_BYTES" in capsys.readouterr().err
+
+
+def test_fastmcp_entrypoint_rejects_invalid_file_limits_at_startup():
+    env = os.environ.copy()
+    env["WORKSPACE_MCP_MAX_FILE_BYTES"] = "0"
+    env["WORKSPACE_MCP_MAX_OFFICE_XML_BYTES"] = "5MB"
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import fastmcp_server"],
+        cwd=os.path.dirname(os.path.dirname(__file__)),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "WORKSPACE_MCP_MAX_OFFICE_XML_BYTES" in result.stderr
 
 
 def test_resolve_permissions_mode_selection_without_tier():
