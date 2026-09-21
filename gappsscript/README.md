@@ -4,7 +4,7 @@ This module provides Model Context Protocol (MCP) tools for interacting with Goo
 
 ## Overview
 
-Google Apps Script allows automation and extension of Google Workspace applications. This MCP integration provides 8 action-based tools across core and extended tiers for complete Apps Script lifecycle management. Most tools take an `action` argument that selects the operation (for example `manage_script_project(action="list")`).
+Google Apps Script allows automation and extension of Google Workspace applications. This MCP integration provides 11 focused tools across core and extended tiers for complete Apps Script lifecycle management. Most management tools take an `action` argument that selects the operation.
 
 ## Why Apps Script?
 
@@ -103,7 +103,7 @@ This ensures safe, auditable automation management.
 ## Limitations & Non-Goals
 
 **Current Limitations**
-- Triggers cannot be created directly via API. Existing triggers can be listed and deleted with `manage_script_trigger`; to create one, generate the setup code with `generate_trigger_code`, add it with `manage_script_content`, and run it with `run_script_function`.
+- Triggers cannot be created directly via API. The current user's existing triggers can be listed and deleted with `manage_script_trigger`; this requires an API Executable deployment, and its default development mode requires the project owner. To create one, generate the setup code with `generate_trigger_code`, add it with `manage_script_content`, and run it with `run_script_function`.
 - Real-time debugging and breakpoints are not available
 - Advanced service enablement must be done manually in the script editor
 
@@ -156,7 +156,7 @@ https://www.googleapis.com/auth/script.processes
 https://www.googleapis.com/auth/script.metrics
 https://www.googleapis.com/auth/script.external_request
 https://www.googleapis.com/auth/script.scriptapp
-https://www.googleapis.com/auth/drive.file
+https://www.googleapis.com/auth/drive
 ```
 
 These are automatically requested when using the appscript tool tier.
@@ -182,18 +182,21 @@ On first use, you will be prompted to authorize the application. Complete the OA
 ### Core Tier
 Essential operations for reading, writing, and executing scripts:
 
-- `manage_script_project`: Project lifecycle - `action` is `list`, `get`, `create`, or `delete`
-- `manage_script_content`: Source files - `action="get"` (whole project, or a single `file_name`) or `action="update"` (merge or replace; `merge=true` by default)
+- `get_script_project`: Read projects - `action="list"`, or `action="get"` with an optional `file_name`
+- `manage_script_project`: Project mutations - `action="create"` or `action="delete"`
+- `manage_script_content`: Update source files - `action="update"` (merge or replace; `merge=true` by default)
 - `run_script_function`: Execute functions
 - `generate_trigger_code`: Generate trigger setup code
 
 ### Extended Tier
 Advanced deployment, versioning, and monitoring:
 
-- `manage_deployment`: Deployments - `action` is `list`, `create`, `update`, or `delete`
-- `manage_script_version`: Immutable versions - `action` is `list`, `get`, or `create`
+- `list_script_deployments`: List deployments and their bound versions
+- `manage_deployment`: Deployment mutations - `action` is `create`, `update`, or `delete`
+- `get_script_version`: Immutable versions - `action="list"` or `action="get"`
+- `manage_script_version`: Create an immutable version - `action="create"`
 - `get_script_activity`: Observability - `action="processes"` (execution history) or `action="metrics"` (execution analytics)
-- `manage_script_trigger`: Installable triggers - `action="list"` or `action="delete"`
+- `manage_script_trigger`: Current user's installable triggers - `action="list"` or `action="delete"`
 
 ## Usage Examples
 
@@ -401,7 +404,7 @@ Google requires scripts to be explicitly deployed as "API Executable" before the
 
 After completing these steps, the `run_script_function` tool will work for that script.
 
-**Note:** All other tools (create, update, list, deploy) work without this manual step. Only function execution via API requires the API Executable deployment.
+**Note:** Project, content, deployment, version, and activity tools work without this manual step. `run_script_function` and `manage_script_trigger` require an API Executable deployment.
 
 ## Error Handling
 

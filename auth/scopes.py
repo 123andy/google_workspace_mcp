@@ -196,7 +196,7 @@ SCRIPT_SCOPES = [
     SCRIPT_METRICS_SCOPE,  # Required for get_script_activity (metrics)
     SCRIPT_EXTERNAL_REQUEST_SCOPE,  # Required for scripts.run (execution API)
     SCRIPT_SCRIPTAPP_SCOPE,  # Required for scripts.run (execution API)
-    DRIVE_FILE_SCOPE,  # Required for manage_script_project list/delete (uses Drive API)
+    DRIVE_SCOPE,  # Required for manage_script_project delete (uses Drive API)
 ]
 
 # Tool-to-scopes mapping

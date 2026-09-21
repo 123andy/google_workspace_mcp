@@ -30,6 +30,7 @@ from gappsscript.apps_script_tools import (
     _update_script_content_impl,
     _merge_script_files,
     _run_script_function_impl,
+    _resolve_execution_deployment_id,
     _create_deployment_impl,
     _list_deployments_impl,
     _update_deployment_impl,
@@ -47,8 +48,11 @@ from gappsscript.apps_script_tools import (
     _TRIGGER_ADMIN_FILE_NAME,
     _TRIGGER_ADMIN_SOURCE,
     manage_deployment,
+    get_script_project,
+    list_script_deployments,
     manage_script_project,
     manage_script_content,
+    get_script_version,
     manage_script_version,
     manage_script_trigger,
     get_script_activity,
@@ -1040,8 +1044,12 @@ def test_generate_trigger_code_invalid():
 async def test_ensure_trigger_admin_file_injects_when_missing():
     """The admin file is appended, existing files are left untouched."""
     mock_service = Mock()
-    existing_files = [{"name": "Code", "type": "SERVER_JS", "source": "function foo(){}"}]
-    mock_service.projects().getContent().execute.return_value = {"files": existing_files}
+    existing_files = [
+        {"name": "Code", "type": "SERVER_JS", "source": "function foo(){}"}
+    ]
+    mock_service.projects().getContent().execute.return_value = {
+        "files": existing_files
+    }
 
     await _ensure_trigger_admin_file(mock_service, "script123")
 
@@ -1076,6 +1084,52 @@ async def test_ensure_trigger_admin_file_noop_when_current():
 
 
 @pytest.mark.asyncio
+async def test_ensure_trigger_admin_file_rejects_user_file_collision():
+    """A user-managed file with the reserved name must never be overwritten."""
+    mock_service = Mock()
+    mock_service.projects().getContent().execute.return_value = {
+        "files": [
+            {
+                "name": _TRIGGER_ADMIN_FILE_NAME,
+                "type": "SERVER_JS",
+                "source": "function userCode() {}",
+            }
+        ]
+    }
+
+    with pytest.raises(UserInputError, match="user-managed"):
+        await _ensure_trigger_admin_file(mock_service, "script123")
+
+    mock_service.projects().updateContent.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_execution_deployment_id_uses_latest_api_executable():
+    mock_service = Mock()
+    mock_service.projects().deployments().list().execute.return_value = {
+        "deployments": [
+            {
+                "deploymentId": "web",
+                "deploymentConfig": {"versionNumber": 9},
+                "entryPoints": [{"entryPointType": "WEB_APP"}],
+            },
+            {
+                "deploymentId": "exec-2",
+                "deploymentConfig": {"versionNumber": 2},
+                "entryPoints": [{"entryPointType": "EXECUTION_API"}],
+            },
+            {
+                "deploymentId": "exec-4",
+                "deploymentConfig": {"versionNumber": 4},
+                "entryPoints": [{"entryPointType": "EXECUTION_API"}],
+            },
+        ]
+    }
+
+    assert await _resolve_execution_deployment_id(mock_service, "script123") == "exec-4"
+
+
+@pytest.mark.asyncio
 async def test_list_script_triggers():
     """Test listing triggers on a script project"""
     mock_service = Mock()
@@ -1096,7 +1150,10 @@ async def test_list_script_triggers():
     }
 
     result = await _list_script_triggers_impl(
-        service=mock_service, user_google_email="test@example.com", script_id="script123"
+        service=mock_service,
+        user_google_email="test@example.com",
+        script_id="script123",
+        deployment_id="deployment123",
     )
 
     assert "sendDailyReport" in result
@@ -1105,6 +1162,7 @@ async def test_list_script_triggers():
     # Must have provisioned the admin file before running it.
     mock_service.projects().updateContent.assert_called_once()
     _, run_kwargs = mock_service.scripts().run.call_args
+    assert run_kwargs["scriptId"] == "deployment123"
     assert run_kwargs["body"]["function"] == "__mcpListTriggers"
 
 
@@ -1116,10 +1174,32 @@ async def test_list_script_triggers_none_found():
     mock_service.scripts().run().execute.return_value = {"response": {"result": "[]"}}
 
     result = await _list_script_triggers_impl(
-        service=mock_service, user_google_email="test@example.com", script_id="script123"
+        service=mock_service,
+        user_google_email="test@example.com",
+        script_id="script123",
+        deployment_id="deployment123",
     )
 
     assert "No triggers found" in result
+
+
+@pytest.mark.asyncio
+async def test_list_script_triggers_requires_deployment_before_writing_helper():
+    """A missing API Executable deployment must not mutate the project."""
+    mock_service = Mock()
+    mock_service.projects().deployments().list().execute.return_value = {
+        "deployments": []
+    }
+
+    with pytest.raises(UserInputError, match="API Executable deployment"):
+        await _list_script_triggers_impl(
+            service=mock_service,
+            user_google_email="test@example.com",
+            script_id="script123",
+        )
+
+    mock_service.projects().getContent.assert_not_called()
+    mock_service.projects().updateContent.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1128,7 +1208,9 @@ async def test_delete_script_trigger_requires_a_selector():
     mock_service = Mock()
     with pytest.raises(UserInputError):
         await _delete_script_trigger_impl(
-            service=mock_service, user_google_email="test@example.com", script_id="script123"
+            service=mock_service,
+            user_google_email="test@example.com",
+            script_id="script123",
         )
 
 
@@ -1150,6 +1232,7 @@ async def test_delete_script_trigger_by_id():
         user_google_email="test@example.com",
         script_id="script123",
         trigger_id="abc123",
+        deployment_id="deployment123",
     )
 
     assert "Deleted 1 trigger" in result
@@ -1170,6 +1253,7 @@ async def test_delete_script_trigger_no_match():
         user_google_email="test@example.com",
         script_id="script123",
         trigger_id="nope",
+        deployment_id="deployment123",
     )
 
     assert "No matching trigger found" in result
@@ -1186,7 +1270,10 @@ async def test_list_script_triggers_execution_error():
 
     with pytest.raises(RuntimeError, match="Script function not found"):
         await _list_script_triggers_impl(
-            service=mock_service, user_google_email="test@example.com", script_id="script123"
+            service=mock_service,
+            user_google_email="test@example.com",
+            script_id="script123",
+            deployment_id="deployment123",
         )
 
 
@@ -1211,6 +1298,7 @@ async def test_delete_script_trigger_by_handler():
         user_google_email="test@example.com",
         script_id="script123",
         handler_function="sendDailyReport",
+        deployment_id="deployment123",
     )
 
     assert "Deleted 2 trigger" in result
@@ -1238,6 +1326,7 @@ async def test_delete_script_trigger_by_id_and_handler():
         script_id="script123",
         trigger_id="abc123",
         handler_function="sendDailyReport",
+        deployment_id="deployment123",
     )
 
     assert "Deleted 1 trigger" in result
@@ -1266,27 +1355,16 @@ async def test_manage_script_project_routes_actions_to_correct_service():
     script_service = Mock()
     fn = _undecorated(manage_script_project)
 
-    with patch(
-        "gappsscript.apps_script_tools._list_script_projects_impl",
-        new=AsyncMock(return_value="listed"),
-    ) as list_impl, patch(
-        "gappsscript.apps_script_tools._get_script_project_impl",
-        new=AsyncMock(return_value="got"),
-    ) as get_impl, patch(
-        "gappsscript.apps_script_tools._create_script_project_impl",
-        new=AsyncMock(return_value="created"),
-    ) as create_impl, patch(
-        "gappsscript.apps_script_tools._delete_script_project_impl",
-        new=AsyncMock(return_value="deleted"),
-    ) as delete_impl:
-        assert (
-            await fn(drive_service, script_service, "u@e.com", "list", page_size=10)
-            == "listed"
-        )
-        assert (
-            await fn(drive_service, script_service, "u@e.com", "get", script_id="s1")
-            == "got"
-        )
+    with (
+        patch(
+            "gappsscript.apps_script_tools._create_script_project_impl",
+            new=AsyncMock(return_value="created"),
+        ) as create_impl,
+        patch(
+            "gappsscript.apps_script_tools._delete_script_project_impl",
+            new=AsyncMock(return_value="deleted"),
+        ) as delete_impl,
+    ):
         assert (
             await fn(drive_service, script_service, "u@e.com", "create", title="T")
             == "created"
@@ -1296,10 +1374,8 @@ async def test_manage_script_project_routes_actions_to_correct_service():
             == "deleted"
         )
 
-    # list/delete use the Drive client; get/create use the Script client.
-    assert list_impl.call_args.args[0] is drive_service
+    # Delete uses the Drive client; create uses the Script client.
     assert delete_impl.call_args.args[0] is drive_service
-    assert get_impl.call_args.args[0] is script_service
     assert create_impl.call_args.args[0] is script_service
 
 
@@ -1307,7 +1383,6 @@ async def test_manage_script_project_routes_actions_to_correct_service():
 @pytest.mark.parametrize(
     "kwargs, message",
     [
-        ({"action": "get"}, "script_id is required"),
         ({"action": "delete"}, "script_id is required"),
         ({"action": "create"}, "title is required"),
         ({"action": "bogus"}, "Invalid action"),
@@ -1320,22 +1395,57 @@ async def test_manage_script_project_validates_arguments(kwargs, message):
 
 
 @pytest.mark.asyncio
-async def test_manage_script_content_get_routes_by_file_name():
-    fn = _undecorated(manage_script_content)
-    with patch(
-        "gappsscript.apps_script_tools._get_script_content_impl",
-        new=AsyncMock(return_value="file"),
-    ) as file_impl, patch(
-        "gappsscript.apps_script_tools._get_script_project_impl",
-        new=AsyncMock(return_value="project"),
-    ) as project_impl:
+async def test_get_script_project_routes_list_project_and_file_reads():
+    drive_service = Mock()
+    script_service = Mock()
+    fn = _undecorated(get_script_project)
+    with (
+        patch(
+            "gappsscript.apps_script_tools._list_script_projects_impl",
+            new=AsyncMock(return_value="listed"),
+        ) as list_impl,
+        patch(
+            "gappsscript.apps_script_tools._get_script_content_impl",
+            new=AsyncMock(return_value="file"),
+        ) as file_impl,
+        patch(
+            "gappsscript.apps_script_tools._get_script_project_impl",
+            new=AsyncMock(return_value="project"),
+        ) as project_impl,
+    ):
+        assert await fn(drive_service, script_service, "u@e.com", "list") == "listed"
         assert (
-            await fn(Mock(), "u@e.com", "get", "s1", file_name="Code") == "file"
+            await fn(
+                drive_service,
+                script_service,
+                "u@e.com",
+                "get",
+                "s1",
+                file_name="Code",
+            )
+            == "file"
         )
-        assert await fn(Mock(), "u@e.com", "get", "s1") == "project"
+        assert (
+            await fn(drive_service, script_service, "u@e.com", "get", "s1") == "project"
+        )
 
+    assert list_impl.call_args.args[0] is drive_service
     assert file_impl.call_count == 1
     assert project_impl.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"action": "get"}, "script_id is required"),
+        ({"action": "bogus"}, "Invalid action"),
+    ],
+)
+async def test_get_script_project_validates_arguments(kwargs, message):
+    fn = _undecorated(get_script_project)
+    with pytest.raises(UserInputError, match=message):
+        await fn(Mock(), Mock(), "u@e.com", **kwargs)
 
 
 @pytest.mark.asyncio
@@ -1353,24 +1463,23 @@ async def test_manage_script_content_rejects_unknown_action():
 
 
 @pytest.mark.asyncio
-async def test_manage_deployment_list_action():
+async def test_list_script_deployments():
     mock_service = Mock()
     mock_service.projects().deployments().list().execute.return_value = {
         "deployments": []
     }
-    fn = manage_deployment.__wrapped__.__wrapped__
+    fn = _undecorated(list_script_deployments)
     result = await fn(
         service=mock_service,
         user_google_email="u@e.com",
-        action="list",
         script_id="s1",
     )
     assert "No deployments found" in result
 
 
 @pytest.mark.asyncio
-async def test_manage_script_version_get_requires_version_number():
-    fn = _undecorated(manage_script_version)
+async def test_get_script_version_get_requires_version_number():
+    fn = _undecorated(get_script_version)
     with pytest.raises(UserInputError, match="version_number is required"):
         await fn(Mock(), "u@e.com", "get", "s1")
 
@@ -1380,6 +1489,13 @@ async def test_manage_script_version_rejects_unknown_action():
     fn = _undecorated(manage_script_version)
     with pytest.raises(UserInputError, match="Invalid action"):
         await fn(Mock(), "u@e.com", "delete", "s1")
+
+
+@pytest.mark.asyncio
+async def test_get_script_version_rejects_unknown_action():
+    fn = _undecorated(get_script_version)
+    with pytest.raises(UserInputError, match="Invalid action"):
+        await fn(Mock(), "u@e.com", "create", "s1")
 
 
 @pytest.mark.asyncio
@@ -1404,17 +1520,18 @@ async def test_get_script_activity_processes_allows_missing_script_id():
 @pytest.mark.asyncio
 async def test_manage_script_trigger_routes_list_and_delete():
     fn = _undecorated(manage_script_trigger)
-    with patch(
-        "gappsscript.apps_script_tools._list_script_triggers_impl",
-        new=AsyncMock(return_value="listed"),
-    ), patch(
-        "gappsscript.apps_script_tools._delete_script_trigger_impl",
-        new=AsyncMock(return_value="deleted"),
+    with (
+        patch(
+            "gappsscript.apps_script_tools._list_script_triggers_impl",
+            new=AsyncMock(return_value="listed"),
+        ),
+        patch(
+            "gappsscript.apps_script_tools._delete_script_trigger_impl",
+            new=AsyncMock(return_value="deleted"),
+        ),
     ):
         assert await fn(Mock(), "u@e.com", "list", "s1") == "listed"
-        assert (
-            await fn(Mock(), "u@e.com", "delete", "s1", trigger_id="t1") == "deleted"
-        )
+        assert await fn(Mock(), "u@e.com", "delete", "s1", trigger_id="t1") == "deleted"
 
 
 @pytest.mark.asyncio

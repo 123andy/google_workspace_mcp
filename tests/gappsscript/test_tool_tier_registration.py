@@ -18,6 +18,8 @@ import yaml
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 import gappsscript.apps_script_tools  # noqa: F401  (registers tools as an import side effect)
+from auth.permissions import get_scopes_for_permission
+from auth.scopes import get_all_read_only_scopes
 from core.server import server
 from core.tool_registry import get_tool_components
 
@@ -52,3 +54,38 @@ def test_every_gappsscript_tool_is_listed_in_tool_tiers_yaml():
         "core/tool_tiers.yaml's appscript section (they will be silently pruned "
         f"at startup under any TOOL_TIER/TOOLS filtering): {sorted(missing)}"
     )
+
+
+def _required_scopes(tool_name):
+    component = get_tool_components(server)[tool_name]
+    func = getattr(component, "fn", component)
+    return set(getattr(func, "_required_google_scopes", []))
+
+
+def test_script_read_tools_survive_read_only_filtering():
+    allowed = set(get_all_read_only_scopes())
+    read_tools = {
+        "get_script_project",
+        "list_script_deployments",
+        "get_script_version",
+        "get_script_activity",
+        "generate_trigger_code",
+    }
+
+    for tool_name in read_tools:
+        assert _required_scopes(tool_name) <= allowed, tool_name
+
+
+def test_script_mutation_tools_survive_full_permission_filtering():
+    allowed = set(get_scopes_for_permission("appscript", "full"))
+    mutation_tools = {
+        "manage_script_project",
+        "manage_script_content",
+        "manage_deployment",
+        "manage_script_version",
+        "manage_script_trigger",
+        "run_script_function",
+    }
+
+    for tool_name in mutation_tools:
+        assert _required_scopes(tool_name) <= allowed, tool_name

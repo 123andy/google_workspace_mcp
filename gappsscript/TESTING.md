@@ -32,11 +32,14 @@ uv run pytest tests/gappsscript/test_apps_script_tools.py --cov=gappsscript
 
 Unit tests cover the `_impl` functions behind each tool plus the action-dispatch
 wrappers:
-- manage_script_project: list (Drive API), get, create, delete
-- manage_script_content: get, update
+- get_script_project: list (Drive API), get project, get file
+- manage_script_project: create, delete
+- manage_script_content: update
 - run_script_function
-- manage_deployment: list, create, update, delete
-- manage_script_version: list, get, create
+- list_script_deployments
+- manage_deployment: create, update, delete
+- get_script_version: list, get
+- manage_script_version: create
 - get_script_activity: processes, metrics
 - manage_script_trigger: list, delete
 
@@ -166,7 +169,7 @@ For E2E testing purposes, it is acceptable for this test to fail. All other test
 
 ### Drive API Requirement
 
-The `manage_script_project` list action uses the Google Drive API (not the Apps Script API) because the Apps Script API does not provide a projects.list endpoint. Ensure the Drive API is enabled in your GCP project.
+The `get_script_project` list action uses the Google Drive API (not the Apps Script API) because the Apps Script API does not provide a projects.list endpoint. Ensure the Drive API is enabled in your GCP project.
 
 ### Scope Requirements
 
