@@ -26,6 +26,7 @@ from auth.oauth_config import (
     get_transport_mode,
     is_external_oauth21_provider,
     is_oauth21_enabled,
+    is_stateless_mode,
 )
 from .file_limits import get_max_office_xml_bytes
 
@@ -74,25 +75,6 @@ _SUPPORTED_TEXT_CHOICE_NAMESPACES = {
     "http://schemas.microsoft.com/office/word/2012/wordml",
     "http://schemas.microsoft.com/office/drawing/2010/main",
 }
-
-
-def stdio_only_args(*names: str) -> list[str] | None:
-    """Tool-registration helper: hide these parameters on remote transports.
-
-    Server-side file paths (``file_path`` and friends) resolve on the machine the
-    SERVER runs on, so on a remote (streamable-http) deployment they can never
-    work for the caller; excluding them via FastMCP's ``exclude_args`` avoids
-    advertising a dead parameter. Same deployment-adaptive-schema idiom as the
-    managed-identity handling of ``user_google_email``. Runtime guards stay in
-    place as defense-in-depth, since a client with a cached schema can still send
-    the argument.
-
-    Returns the names to exclude on remote transports, or ``None`` on stdio
-    (advertise normally). Transport must be set before tool modules import.
-    """
-    if get_transport_mode() == "streamable-http":
-        return list(names)
-    return None
 
 
 class TransientNetworkError(Exception):
@@ -173,6 +155,33 @@ that send ``'{"key":"val"}'`` instead of ``{"key": "val"}``.
 # Override via ALLOWED_FILE_DIRS env var (os.pathsep-separated paths).
 _ALLOWED_FILE_DIRS_ENV = "ALLOWED_FILE_DIRS"
 
+# Operators of hosted deployments, where the server cannot see the caller's
+# disk, set this to stop tools reading server-side paths. Transport alone is not
+# a reliable signal: streamable-http on localhost shares the caller's filesystem.
+_DISABLE_LOCAL_FILES_ENV = "WORKSPACE_MCP_DISABLE_LOCAL_FILES"
+
+
+def local_file_access_enabled() -> bool:
+    """Return whether tools may read files from the server's filesystem.
+
+    Disabled by ``WORKSPACE_MCP_DISABLE_LOCAL_FILES=true``, and implied by
+    stateless mode, which already denotes a diskless hosted deployment.
+    """
+    if is_stateless_mode():
+        return False
+    return os.environ.get(_DISABLE_LOCAL_FILES_ENV, "").lower() != "true"
+
+
+def local_file_args(*names: str) -> list[str] | None:
+    """Tool-registration helper: hide server-side path parameters when disabled.
+
+    Pass the result as FastMCP's ``exclude_args`` so deployments without local
+    file access do not advertise a parameter that cannot work. Returns ``None``
+    (advertise normally) when local file access is enabled. Runtime guards stay
+    in place, since a client with a cached schema can still send the argument.
+    """
+    return None if local_file_access_enabled() else list(names)
+
 
 def _get_allowed_file_dirs() -> list[Path]:
     """Return the list of directories from which local file access is permitted."""
@@ -212,23 +221,31 @@ def validate_file_path(file_path: str) -> Path:
         Path: The resolved, validated Path object.
 
     Raises:
+        UserInputError: If local file access is disabled on this server.
+        FileNotFoundError: If the path does not exist on the server.
         ValueError: If the path is outside allowed directories or targets
                     a sensitive location.
     """
+    if not local_file_access_enabled():
+        raise UserInputError(
+            "Local file access is disabled on this server: file paths resolve "
+            "on the server's filesystem, not the caller's. Provide the file by "
+            "URL or as inline content instead."
+        )
+
     resolved = Path(file_path).resolve()
 
     if not resolved.exists():
-        # Paths resolve on the SERVER: on a remote transport a caller-side path
-        # can never exist here, so name the boundary rather than let a bare "does
-        # not exist" misdirect the caller to check for typos. Guarded call sites
-        # reject remote paths first; this is defense-in-depth for any that don't.
-        if get_transport_mode() == "streamable-http":
-            raise FileNotFoundError(
-                f"Path does not exist on the MCP server: {resolved}. This server "
-                "runs remotely (streamable-http) and cannot see the caller's "
-                "local filesystem, so a client-side path will never resolve here."
-            )
-        raise FileNotFoundError(f"Path does not exist: {resolved}")
+        # Over HTTP the server may be on another machine, where a caller-side
+        # path can never exist, so say so rather than imply a typo.
+        hint = (
+            " Paths resolve on the MCP server's filesystem; if the server runs "
+            "on a different machine than the client, provide the file by URL "
+            "or as inline content instead."
+            if get_transport_mode() == "streamable-http"
+            else ""
+        )
+        raise FileNotFoundError(f"Path does not exist: {resolved}.{hint}")
 
     # Block sensitive file patterns regardless of allowlist
     resolved_str = str(resolved)
@@ -319,9 +336,8 @@ def validate_file_path(file_path: str) -> Path:
 
     raise ValueError(
         f"Access to '{resolved_str}' is not allowed: "
-        f"path is outside the SERVER's permitted directories ({', '.join(str(d) for d in allowed_dirs)}). "
-        "The server operator can broaden this via the ALLOWED_FILE_DIRS environment "
-        "variable; callers of a remote server cannot."
+        f"path is outside permitted directories ({', '.join(str(d) for d in allowed_dirs)}). "
+        "Set ALLOWED_FILE_DIRS to adjust."
     )
 
 
