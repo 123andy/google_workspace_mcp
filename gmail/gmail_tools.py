@@ -818,8 +818,9 @@ def _extract_attachments(payload: dict) -> List[Dict[str, Any]]:
     """
     attachments = []
 
-    def search_parts(part, in_attached_message=False):
-        """Recursively search for attachments in message parts"""
+    pending = [(payload, False)]
+    while pending:
+        part, in_attached_message = pending.pop()
         # Check if this part is an attachment
         if part.get("filename") and part.get("body", {}).get("attachmentId"):
             # Files inside a wrapped message (message/rfc822) are fetched with the
@@ -834,16 +835,13 @@ def _extract_attachments(payload: dict) -> List[Dict[str, Any]]:
                 }
             )
 
-        # Recursively search sub-parts
+        # Reverse the push order to preserve depth-first attachment ordering.
         if "parts" in part:
             nested = in_attached_message or (
                 (part.get("mimeType") or "").lower() == "message/rfc822"
             )
-            for subpart in part["parts"]:
-                search_parts(subpart, nested)
+            pending.extend((subpart, nested) for subpart in reversed(part["parts"]))
 
-    # Start searching from the root payload
-    search_parts(payload)
     return attachments
 
 
@@ -868,45 +866,43 @@ def _render_attached_messages(
     counts = {"shown": 0, "over_limit": 0, "too_deep": 0}
     names = ["From", "To", "Cc", "Subject", "Date"]
 
-    def visit(part: dict, depth: int) -> None:
-        for child in part.get("parts") or []:
-            mime_type = (child.get("mimeType") or "").lower()
-            if mime_type == "message/rfc822" and child.get("parts"):
-                if depth > ATTACHED_MESSAGE_MAX_DEPTH:
-                    counts["too_deep"] += 1
-                    continue
-                if counts["shown"] >= ATTACHED_MESSAGE_MAX_COUNT:
-                    counts["over_limit"] += 1
-                    continue
-                counts["shown"] += 1
-                inner = child["parts"][0]
-                # Fall back to the rfc822 part's headers if the inner root lacks them.
-                headers = _extract_headers(inner, names) or _extract_headers(
-                    child, names
-                )
-                bodies = _extract_message_bodies(inner)
-                body = _format_body_content(
-                    bodies.get("text", ""), bodies.get("html", ""), body_format
-                )
-                lines = [
-                    f"--- ATTACHED MESSAGE {counts['shown']} (headers as claimed "
-                    "by the attachment, unverified) ---"
-                ]
-                for name in names:
-                    if name in headers:
-                        value = headers[name]
-                        if len(value) > ATTACHED_MESSAGE_HEADER_LIMIT:
-                            value = (
-                                value[:ATTACHED_MESSAGE_HEADER_LIMIT] + " [truncated]"
-                            )
-                        lines.append(f"{name}: {value}")
-                lines += ["", _truncate_content(body, HTML_BODY_TRUNCATE_LIMIT)]
-                blocks.append("\n".join(lines))
-                visit(inner, depth + 1)
-            else:
-                visit(child, depth)
+    # Depth counts attached messages only; ordinary MIME nesting uses the stack.
+    pending = [(child, 1) for child in reversed(payload.get("parts") or [])]
+    while pending:
+        child, depth = pending.pop()
+        mime_type = (child.get("mimeType") or "").lower()
+        if mime_type == "message/rfc822" and child.get("parts"):
+            if depth > ATTACHED_MESSAGE_MAX_DEPTH:
+                counts["too_deep"] += 1
+                continue
+            if counts["shown"] >= ATTACHED_MESSAGE_MAX_COUNT:
+                counts["over_limit"] += 1
+                continue
+            counts["shown"] += 1
+            inner = child["parts"][0]
+            # Fall back to the rfc822 part's headers if the inner root lacks them.
+            headers = _extract_headers(inner, names) or _extract_headers(child, names)
+            bodies = _extract_message_bodies(inner)
+            body = _format_body_content(
+                bodies.get("text", ""), bodies.get("html", ""), body_format
+            )
+            lines = [
+                f"--- ATTACHED MESSAGE {counts['shown']} (headers as claimed "
+                "by the attachment, unverified) ---"
+            ]
+            for name in names:
+                if name in headers:
+                    value = headers[name]
+                    if len(value) > ATTACHED_MESSAGE_HEADER_LIMIT:
+                        value = value[:ATTACHED_MESSAGE_HEADER_LIMIT] + " [truncated]"
+                    lines.append(f"{name}: {value}")
+            lines += ["", _truncate_content(body, HTML_BODY_TRUNCATE_LIMIT)]
+            blocks.append("\n".join(lines))
+            child = inner
+            depth += 1
+        # Preserve depth-first rendering and which messages fall within the limit.
+        pending.extend((part, depth) for part in reversed(child.get("parts") or []))
 
-    visit(payload, 1)
     if counts["over_limit"]:
         blocks.append(
             f"--- {counts['over_limit']} more attached message(s) not shown "

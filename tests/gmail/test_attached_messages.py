@@ -96,6 +96,12 @@ def _file(name, attachment_id):
     }
 
 
+def _deep_multipart(part):
+    for _ in range(sys.getrecursionlimit() + 50):
+        part = {"mimeType": "multipart/mixed", "parts": [part]}
+    return part
+
+
 MARKER_1 = (
     "--- ATTACHED MESSAGE 1 (headers as claimed by the attachment, unverified) ---"
 )
@@ -168,12 +174,34 @@ class TestRenderAttachedMessages:
         assert "Subject: The message that bounced" in out
         assert "delivery-status" not in out and "5.1.1" not in out
 
-    def test_nesting_depth_boundary(self):
+    def test_deep_mime_containers_preserve_render_order(self):
+        inner = _wrapped(
+            subject="first",
+            extra_parts=[_deep_multipart(_rfc822(_wrapped(subject="nested")))],
+        )
+        payload = _wrapper(
+            _deep_multipart(_rfc822(inner)), _rfc822(_wrapped(subject="last"))
+        )
+
+        out = _render_attached_messages(payload)
+
+        assert out.count("--- ATTACHED MESSAGE ") == 3
+        assert out.index("Subject: first") < out.index("Subject: nested")
+        assert out.index("Subject: nested") < out.index("Subject: last")
+        assert "Wrapped plain body" in out
+        assert "not shown" not in out
+
+    @pytest.mark.parametrize("deep_mime", [False, True])
+    def test_nesting_depth_boundary(self, deep_mime):
         """Levels 1..MAX are rendered; the next level is announced, not shown."""
         payload = None
         for level in range(ATTACHED_MESSAGE_MAX_DEPTH + 2, 0, -1):
             extra = [_rfc822(payload)] if payload else None
             payload = _wrapped(subject=f"level {level}", extra_parts=extra)
+            if deep_mime:
+                headers = payload["headers"]
+                payload = _deep_multipart(payload)
+                payload["headers"] = headers
         out = _render_attached_messages(_wrapper(_rfc822(payload)))
 
         assert f"Subject: level {ATTACHED_MESSAGE_MAX_DEPTH}" in out
@@ -218,6 +246,43 @@ class TestRenderAttachedMessages:
 
 
 class TestAttachmentAttribution:
+    def test_deep_mime_containers_preserve_metadata_order_and_attribution(self):
+        attached = _rfc822(
+            _deep_multipart(
+                _wrapper(
+                    _file("inner.png", "att-inner"),
+                    _rfc822(_deep_multipart(_file("nested.png", "att-nested"))),
+                )
+            )
+        )
+        attached.update(filename="message.eml", body={"attachmentId": "att-eml"})
+        payload = _deep_multipart(
+            _wrapper(
+                _file("first.png", "att-first"),
+                attached,
+                _file("last.png", "att-last"),
+            )
+        )
+
+        attachments = _extract_attachments(payload)
+
+        assert attachments == [
+            {
+                "filename": filename,
+                "mimeType": mime_type,
+                "size": size,
+                "attachmentId": attachment_id,
+                "inAttachedMessage": nested,
+            }
+            for filename, mime_type, size, attachment_id, nested in [
+                ("first.png", "image/png", 2048, "att-first", False),
+                ("message.eml", "message/rfc822", 0, "att-eml", False),
+                ("inner.png", "image/png", 2048, "att-inner", True),
+                ("nested.png", "image/png", 2048, "att-nested", True),
+                ("last.png", "image/png", 2048, "att-last", False),
+            ]
+        ]
+
     def test_files_inside_a_wrapped_message_are_flagged_not_renamed(self):
         payload = _wrapper(
             _file("wrapper.png", "att-outer"),
