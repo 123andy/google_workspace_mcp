@@ -822,11 +822,8 @@ def _extract_attachments(payload: dict) -> List[Dict[str, Any]]:
         """Recursively search for attachments in message parts"""
         # Check if this part is an attachment
         if part.get("filename") and part.get("body", {}).get("attachmentId"):
-            # A file inside a wrapped email (message/rfc822) is still fetched
-            # with the OUTER message's ID, so it stays listed -- but flagged, so
-            # the read tools can say it is not the wrapper's own attachment.
-            # The filename itself is left exact: forwarding and downloading
-            # both match on it.
+            # Files inside a wrapped message (message/rfc822) are fetched with the
+            # outer message's ID, so keep them listed but flag their origin.
             attachments.append(
                 {
                     "filename": part["filename"],
@@ -860,19 +857,12 @@ def _render_attached_messages(
 ) -> str:
     """Render emails wrapped inside this one (message/rfc822 parts) as text.
 
-    _extract_message_bodies only descends into multipart/* containers, so a
-    wrapped email -- forward-as-attachment, a group moderation notice, the
-    original inside a bounce, each entry of a digest -- was invisible to the
-    read tools, while _extract_attachments DOES descend and listed the wrapped
-    email's files as if they were the wrapper's. The wrapped message's own MIME
-    tree is the child of the message/rfc822 part.
-
-    Returns "" when there is no message/rfc822 part, so other messages render
-    unchanged.
-    Every bound is announced in the output: nesting depth, the number of wrapped
-    messages shown, each body's length and each header line's length. The
-    wrapped headers are printed as the attachment claims them -- unlike the
-    wrapper's, they never passed the receiving server's sender checks.
+    _extract_message_bodies descends only into multipart/* containers, so a
+    wrapped email (forward-as-attachment, moderation notice, bounce, digest) is
+    otherwise invisible to the read tools. The wrapped message's MIME tree is
+    the child of the message/rfc822 part. Returns "" when there is no such part.
+    Wrapped headers are printed as the attachment claims them: unlike the
+    wrapper's, they are unverified.
     """
     blocks: List[str] = []
     counts = {"shown": 0, "over_limit": 0, "too_deep": 0}
@@ -890,8 +880,7 @@ def _render_attached_messages(
                     continue
                 counts["shown"] += 1
                 inner = child["parts"][0]
-                # Fall back to the rfc822 part's own headers if the wrapped
-                # message's are not on its root part.
+                # Fall back to the rfc822 part's headers if the inner root lacks them.
                 headers = _extract_headers(inner, names) or _extract_headers(
                     child, names
                 )

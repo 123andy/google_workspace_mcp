@@ -1,10 +1,7 @@
 """Emails wrapped inside another email (message/rfc822 parts).
 
-The body walker only descended into multipart/* containers, so a wrapped email --
-forward-as-attachment, a group moderation notice, the original inside a bounce --
-read as its wrapper only, while the attachment walker DID descend and listed the
-wrapped email's files as if they were the wrapper's. All fixtures are synthetic
-and use the Gmail API `format=full` payload shape.
+Covers rendering of wrapped messages and attribution of files found inside them.
+All fixtures are synthetic and use the Gmail API `format=full` payload shape.
 """
 
 import base64
