@@ -503,13 +503,14 @@ def main():
     )
     args = parser.parse_args()
 
-    # Validate the memory-safety setting once at startup. Tool helpers parse it
+    # Validate the memory-safety settings once at startup. Tool helpers parse them
     # defensively as well, but a deployment typo must not silently disable the
     # configured limit.
-    from core.file_limits import get_max_file_bytes
+    from core.file_limits import get_max_file_bytes, get_max_office_xml_bytes
 
     try:
         get_max_file_bytes()
+        get_max_office_xml_bytes()
     except ValueError as exc:
         parser.error(str(exc))
 
