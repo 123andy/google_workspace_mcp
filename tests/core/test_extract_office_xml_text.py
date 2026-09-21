@@ -968,3 +968,183 @@ class TestChoiceNamespaceScope:
         assert maps[first] is not maps[second]
         assert maps[fourth] is not maps[third]
         assert maps[first] == maps[fourth]
+
+
+STRICT_SHEET_NS = 'xmlns="http://purl.oclc.org/ooxml/spreadsheetml/main"'
+
+
+def _cells_sheet(cells: str, ns: str = SHEET_NS) -> str:
+    return f"<worksheet {ns}><sheetData><row>{cells}</row></sheetData></worksheet>"
+
+
+def _sst(*entries: str, ns: str = SHEET_NS) -> str:
+    return f"<sst {ns}>" + "".join(f"<si>{e}</si>" for e in entries) + "</sst>"
+
+
+class TestSpreadsheetTextFidelity:
+    """Cell text reaches the output whichever way the workbook stores it.
+
+    A t="inlineStr" cell keeps its text in <is>, not <v>; a Strict Open XML
+    workbook uses the purl.oclc.org namespace. Numbers came through either
+    way, so both gaps lost text silently."""
+
+    def test_inline_string_is_read_in_cell_order(self):
+        data = _xlsx(
+            **{
+                "xl/worksheets/sheet1.xml": _cells_sheet(
+                    '<c r="A1" t="inlineStr"><is><t>Coffee</t></is></c>'
+                    '<c r="B1"><v>42</v></c>'
+                )
+            }
+        )
+        assert extract_office_xml_text(data, XLSX_MIME) == "Coffee 42"
+
+    def test_inline_rich_text_runs_concatenate(self):
+        data = _xlsx(
+            **{
+                "xl/worksheets/sheet1.xml": _cells_sheet(
+                    '<c r="A1" t="inlineStr"><is><r><t>Cof</t></r>'
+                    '<r><rPr><b/></rPr><t xml:space="preserve">fee </t></r></is></c>'
+                    '<c r="B1"><v>42</v></c>'
+                )
+            }
+        )
+        assert extract_office_xml_text(data, XLSX_MIME) == "Coffee  42"
+
+    @pytest.mark.parametrize("kind", ["inline", "shared"])
+    def test_phonetic_guide_is_not_cell_text(self, kind):
+        """<rPh> holds a reading aid (furigana), which is not the cell's text.
+        Inline and shared strings share one reader, so both agree."""
+        rich = '<r><t>東京</t></r><rPh sb="0" eb="2"><t>とうきょう</t></rPh>'
+        if kind == "inline":
+            members = {
+                "xl/worksheets/sheet1.xml": _cells_sheet(
+                    f'<c r="A1" t="inlineStr"><is>{rich}</is></c>'
+                )
+            }
+        else:
+            members = {
+                "xl/worksheets/sheet1.xml": _shared_string_sheet("0"),
+                "xl/sharedStrings.xml": _sst(rich),
+            }
+        assert extract_office_xml_text(_xlsx(**members), XLSX_MIME) == "東京"
+
+    def test_shared_and_inline_strings_keep_document_order(self):
+        data = _xlsx(
+            **{
+                "xl/worksheets/sheet1.xml": _cells_sheet(
+                    '<c r="A1" t="s"><v>0</v></c>'
+                    '<c r="B1" t="inlineStr"><is><t>two</t></is></c>'
+                    '<c r="C1"><v>3</v></c>'
+                    '<c r="D1" t="s"><v>1</v></c>'
+                ),
+                "xl/sharedStrings.xml": _sst("<t>one</t>", "<t>four</t>"),
+            }
+        )
+        assert extract_office_xml_text(data, XLSX_MIME) == "one two 3 four"
+
+    def test_empty_inline_string_is_an_empty_cell(self):
+        data = _xlsx(
+            **{
+                "xl/worksheets/sheet1.xml": _cells_sheet(
+                    '<c r="A1" t="inlineStr"><is/></c>'
+                    '<c r="B1" t="inlineStr"/>'
+                    '<c r="C1"><v>42</v></c>'
+                )
+            }
+        )
+        assert extract_office_xml_text(data, XLSX_MIME) == "42"
+
+    def test_strict_workbook_with_shared_strings(self):
+        data = _zip(
+            **{
+                "xl/workbook.xml": f"<workbook {STRICT_SHEET_NS}/>",
+                "xl/worksheets/sheet1.xml": _cells_sheet(
+                    '<c r="A1" t="s"><v>0</v></c><c r="B1"><v>42</v></c>',
+                    ns=STRICT_SHEET_NS,
+                ),
+                "xl/sharedStrings.xml": _sst("<t>Coffee</t>", ns=STRICT_SHEET_NS),
+            }
+        )
+        assert extract_office_xml_text(data, XLSX_MIME) == "Coffee 42"
+
+    def test_strict_workbook_with_inline_strings(self):
+        data = _zip(
+            **{
+                "xl/workbook.xml": f"<workbook {STRICT_SHEET_NS}/>",
+                "xl/worksheets/sheet1.xml": _cells_sheet(
+                    '<c r="A1" t="inlineStr"><is><t>Coffee</t></is></c>'
+                    '<c r="B1"><v>42</v></c>',
+                    ns=STRICT_SHEET_NS,
+                ),
+            }
+        )
+        assert extract_office_xml_text(data, XLSX_MIME) == "Coffee 42"
+
+    def test_strict_iso_date_cell_passes_through_unconverted(self):
+        data = _zip(
+            **{
+                "xl/workbook.xml": f"<workbook {STRICT_SHEET_NS}/>",
+                "xl/worksheets/sheet1.xml": _cells_sheet(
+                    '<c r="A1" t="d"><v>2024-01-31T00:00:00</v></c>',
+                    ns=STRICT_SHEET_NS,
+                ),
+            }
+        )
+        assert extract_office_xml_text(data, XLSX_MIME) == "2024-01-31T00:00:00"
+
+    def test_inline_string_text_counts_against_the_extracted_text_budget(
+        self, monkeypatch
+    ):
+        """Inline text is charged like any other cell text.
+
+        Inline text sits in the worksheet XML, so it alone can never outgrow the
+        expansion budget first; shared strings bring the text close to the limit
+        and the inline cell must be what crosses it.
+        """
+        monkeypatch.setenv(ENV, "20000")
+        shared = "".join(f'<c r="A{row}" t="s"><v>0</v></c>' for row in range(1, 151))
+        inline = f'<c r="B1" t="inlineStr"><is><t>{"B" * 6_000}</t></is></c>'
+        members = {
+            "xl/workbook.xml": "<workbook/>",
+            "xl/sharedStrings.xml": _sst(f"<t>{'A' * 100}</t>"),
+        }
+        without_inline = _deflated(
+            **members, **{"xl/worksheets/sheet1.xml": _cells_sheet(shared)}
+        )
+        with_inline = {
+            **members,
+            "xl/worksheets/sheet1.xml": _cells_sheet(shared + inline),
+        }
+        # The XML fits the expansion budget, and without the inline cell so
+        # does the text: only the inline text can push it over.
+        assert sum(len(xml.encode()) for xml in with_inline.values()) < 20_000
+        assert extract_office_xml_text(without_inline, XLSX_MIME)
+
+        with pytest.raises(OfficeXmlTooLargeError, match="extracted text") as exc:
+            extract_office_xml_text(_deflated(**with_inline), XLSX_MIME)
+        assert "extracting text from xl/worksheets/sheet1.xml" in str(exc.value)
+
+    def test_strict_workbook_parts_are_charged_to_the_expansion_budget(
+        self, monkeypatch
+    ):
+        """Every Strict part read is counted: text at exactly the total, and a
+        refusal one byte below it."""
+        members = {
+            "xl/workbook.xml": f"<workbook {STRICT_SHEET_NS}/>",
+            "xl/sharedStrings.xml": _sst("<t>Coffee</t>", ns=STRICT_SHEET_NS),
+            "xl/worksheets/sheet1.xml": _cells_sheet(
+                '<c r="A1" t="s"><v>0</v></c>'
+                '<c r="B1" t="inlineStr"><is><t>Tea</t></is></c>',
+                ns=STRICT_SHEET_NS,
+            ),
+        }
+        total = sum(len(xml.encode()) for xml in members.values())
+        data = _deflated(**members)
+
+        monkeypatch.setenv(ENV, str(total))
+        assert extract_office_xml_text(data, XLSX_MIME) == "Coffee Tea"
+
+        monkeypatch.setenv(ENV, str(total - 1))
+        with pytest.raises(OfficeXmlTooLargeError, match="sheet1.xml"):
+            extract_office_xml_text(data, XLSX_MIME)
