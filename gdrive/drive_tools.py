@@ -1321,6 +1321,21 @@ async def create_drive_file(
     return confirmation_message
 
 
+def _remote_file_path_error(inline_params: tuple[str, ...]) -> UserInputError:
+    """Build the error for ``file_path`` sent to a remote (streamable-http) server.
+
+    ``inline_params`` are the inline-source parameters the calling tool really
+    has, so the message only ever names routes that exist on that tool.
+    """
+    inline = " or ".join(f"'{name}'" for name in inline_params)
+    return UserInputError(
+        "'file_path' is unavailable in remote (streamable-http) mode: it "
+        "resolves on the MCP server's filesystem, which is not the caller's. "
+        "Instead, pass 'file_url' if the file is already at a URL the server "
+        f"can reach, or send it inline via {inline}."
+    )
+
+
 async def _import_with_conversion(
     service,
     *,
@@ -1338,7 +1353,7 @@ async def _import_with_conversion(
     folder_id: str,
     base64_content: Optional[str],
     base64_sha256: Optional[str],
-    content_supported: bool = True,
+    inline_params: tuple[str, ...] = ("content", "base64_content"),
 ) -> str:
     """
     Shared implementation for the import_to_google_* tools.
@@ -1353,9 +1368,9 @@ async def _import_with_conversion(
         id_label: Label for the created file's ID in the confirmation message.
         target_mime_type: The ``application/vnd.google-apps.*`` destination type.
         format_map: Extension -> source MIME type allowlist for this destination.
-        content_supported: Whether the calling tool exposes a ``content`` param
-            (Slides takes binary formats only), so the remote-mode error can name
-            the routes that actually exist on that tool.
+        inline_params: The inline-source parameters the calling tool exposes
+            (Slides takes binary formats only, so it has no ``content``), so the
+            remote-mode error names only routes that exist on that tool.
     """
     logger.info(
         f"[{tool_name}] Invoked. Email: '{user_google_email}', "
@@ -1369,16 +1384,7 @@ async def _import_with_conversion(
     # "Path does not exist", which reads as a typo rather than a topology
     # mismatch and sends callers off checking spelling and permissions.
     if file_path is not None and get_transport_mode() == "streamable-http":
-        alternatives = (
-            "pass the text via 'content', or host the file and pass 'file_url'"
-            if content_supported
-            else "host the file somewhere the server can reach and pass 'file_url'"
-        )
-        raise UserInputError(
-            f"'file_path' is unavailable in remote (streamable-http) mode: it "
-            f"resolves on the MCP server's filesystem, which is not the "
-            f"caller's. Instead, {alternatives}."
-        )
+        raise _remote_file_path_error(inline_params)
 
     media, source_mime_type, remote_file_data = await _resolve_import_media(
         tool_name=tool_name,
@@ -1611,7 +1617,7 @@ async def import_to_google_slides(
         folder_id=folder_id,
         base64_content=base64_content,
         base64_sha256=base64_sha256,
-        content_supported=False,
+        inline_params=("base64_content",),
     )
 
 
@@ -2090,11 +2096,8 @@ async def update_drive_file(
     # the remote schema, but a client with a cached schema can still send it —
     # and the path would resolve on the SERVER's filesystem, not the caller's.
     if file_path is not None and get_transport_mode() == "streamable-http":
-        raise UserInputError(
-            "'file_path' is unavailable in remote (streamable-http) mode: it "
-            "reads from the MCP server's filesystem, not yours. Pass the text "
-            "via 'content', or host the file and pass 'file_url'."
-        )
+        # update_drive_file has no base64_content parameter.
+        raise _remote_file_path_error(("content",))
 
     replacing_content = any(x is not None for x in (content, file_path, file_url))
     current_file_fields = (

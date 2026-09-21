@@ -11,7 +11,9 @@ import tools; validate_file_path() additionally names the server boundary
 in its own errors as defense-in-depth for any unguarded path.
 """
 
+import inspect
 import os
+import re
 import subprocess
 import sys
 from unittest.mock import AsyncMock, Mock, patch
@@ -47,7 +49,7 @@ class TestRemoteFilePathRejected:
 
     @pytest.mark.asyncio
     @REMOTE
-    async def test_doc_import_names_content_and_file_url(self, _mode):
+    async def test_doc_import_names_every_route_it_has(self, _mode):
         service = Mock()
         with pytest.raises(UserInputError) as exc:
             await _unwrap(import_to_google_doc)(
@@ -59,12 +61,15 @@ class TestRemoteFilePathRejected:
         msg = str(exc.value)
         assert "streamable-http" in msg and "MCP server" in msg
         assert "'content'" in msg and "'file_url'" in msg
+        assert "'base64_content'" in msg
         service.files.assert_not_called()
 
     @pytest.mark.asyncio
     @REMOTE
-    async def test_slides_import_names_only_file_url(self, _mode):
-        """Slides has no content param — the error must not advertise one."""
+    async def test_slides_import_names_base64_content_but_not_content(self, _mode):
+        """Slides has no content param — the error must not advertise one. It
+        does take base64_content, which is its only inline route: telling a
+        remote caller to go and host the file is wrong when they can send it."""
         service = Mock()
         with pytest.raises(UserInputError) as exc:
             await _unwrap(import_to_google_slides)(
@@ -74,7 +79,7 @@ class TestRemoteFilePathRejected:
                 file_path="/Users/someone/deck.pptx",
             )
         msg = str(exc.value)
-        assert "'file_url'" in msg
+        assert "'file_url'" in msg and "'base64_content'" in msg
         assert "'content'" not in msg
         service.files.assert_not_called()
 
@@ -95,20 +100,57 @@ class TestRemoteFilePathRejected:
             )
         msg = str(exc.value)
         assert "'content'" in msg and "'file_url'" in msg
+        # update_drive_file has no base64_content parameter.
+        assert "'base64_content'" not in msg
         service.files.assert_not_called()
 
     @pytest.mark.asyncio
     @REMOTE
     async def test_sheets_import_rejected_too(self, _mode):
         service = Mock()
-        with pytest.raises(UserInputError):
+        with pytest.raises(UserInputError) as exc:
             await _unwrap(import_to_google_sheets)(
                 service=service,
                 user_google_email="user@example.com",
                 file_name="Budget",
                 file_path="/Users/someone/budget.xlsx",
             )
+        msg = str(exc.value)
+        assert "'content'" in msg and "'base64_content'" in msg
+        assert "'file_url'" in msg
         service.files.assert_not_called()
+
+    @pytest.mark.asyncio
+    @REMOTE
+    @pytest.mark.parametrize(
+        "tool, kwargs",
+        [
+            (import_to_google_doc, {"file_name": "n"}),
+            (import_to_google_slides, {"file_name": "n"}),
+            (import_to_google_sheets, {"file_name": "n"}),
+            (update_drive_file, {"file_id": "abc123"}),
+        ],
+        ids=["doc", "slides", "sheets", "update"],
+    )
+    async def test_error_names_exactly_the_routes_the_tool_has(
+        self, _mode, tool, kwargs
+    ):
+        """The routes are read from each tool's real signature, not restated
+        here, so a parameter added or removed upstream fails this test instead
+        of leaving the guidance quietly wrong."""
+        fn = _unwrap(tool)
+        params = set(inspect.signature(fn).parameters)
+        has = {"content", "base64_content", "file_url"} & params
+
+        with pytest.raises(UserInputError) as exc:
+            await fn(
+                service=Mock(),
+                user_google_email="user@example.com",
+                file_path="/Users/someone/file.bin",
+                **kwargs,
+            )
+        advice = str(exc.value).split("Instead,", 1)[1]
+        assert set(re.findall(r"'(\w+)'", advice)) == has
 
 
 class TestWorkingRoutesUntouched:
@@ -239,6 +281,62 @@ class TestRemoteDecorationBoots:
         assert result.returncode == 0, (
             f"gdrive.drive_tools failed to import on streamable-http:\n{result.stderr}"
         )
+
+
+class TestGuardReachableThroughFastMCP:
+    """exclude_args only removes file_path from the ADVERTISED schema. FastMCP
+    does not enforce that closed schema on incoming calls, so a client holding
+    an older schema can still send file_path and it reaches the function — the
+    guard is what answers, and it is what keeps a hidden parameter from
+    resolving on the server's disk. The other tests call the functions
+    directly and cannot see this, so go through a real client, in a subprocess
+    because the schema is fixed at import time by the transport."""
+
+    def test_stale_client_gets_the_guidance_not_a_generic_error(self):
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+        code = """
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
+from core.server import server, set_transport_mode
+set_transport_mode('streamable-http')
+import auth.service_decorator as sd
+import gdrive.drive_tools
+from fastmcp import Client
+
+async def main():
+    auth = AsyncMock(return_value=(MagicMock(), 'user@example.com'))
+    with patch.object(sd, '_authenticate_service', auth):
+        async with Client(server) as client:
+            tools = {t.name: t for t in await client.list_tools()}
+            schema = tools['import_to_google_slides'].inputSchema
+            assert 'file_path' not in schema['properties'], 'file_path advertised'
+            result = await client.call_tool(
+                'import_to_google_slides',
+                {'file_name': 'Deck', 'file_path': '/Users/someone/deck.pptx',
+                 'user_google_email': 'user@example.com'},
+                raise_on_error=False,
+            )
+            print('RESULT:' + result.content[0].text)
+
+asyncio.run(main())
+"""
+        env = {
+            **os.environ,
+            "GOOGLE_OAUTH_CLIENT_ID": "test-client-id",
+            "GOOGLE_OAUTH_CLIENT_SECRET": "test-client-secret",
+        }
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        assert result.returncode == 0, result.stderr[-2000:]
+        text = result.stdout.split("RESULT:", 1)[1]
+        assert "'file_path' is unavailable in remote" in text
+        assert "'base64_content'" in text
 
 
 class TestStdioOnlyArgsHelper:
