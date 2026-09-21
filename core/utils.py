@@ -57,7 +57,10 @@ _DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.doc
 _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 _PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 _OFFICE_XML_MIME_TYPES = {_DOCX_MIME, _XLSX_MIME, _PPTX_MIME}
-_EXCEL_MAIN_NAMESPACE = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_SPREADSHEETML_NAMESPACES = {
+    "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+    "http://purl.oclc.org/ooxml/spreadsheetml/main",
+}
 _WORD_TEXT_RELATIONSHIP_KINDS = {"header", "footer", "footnotes", "endnotes"}
 _WORD_TEXT_RELATIONSHIP_TYPES = {
     f"{base}/{kind}": kind
@@ -753,6 +756,35 @@ def _read_part(zf: zipfile.ZipFile, name: str, budget: _ExpansionBudget) -> byte
         raise OfficeXmlExtractionError(f"missing required part: {name}") from e
 
 
+def _sheet_children(node: Any, local_name: str) -> List[Any]:
+    """Direct children of ``node`` named ``local_name`` in any SpreadsheetML namespace."""
+    return [
+        child
+        for child in node
+        if _xml_name(child.tag)[0] in _SPREADSHEETML_NAMESPACES
+        and _xml_name(child.tag)[1] == local_name
+    ]
+
+
+def _rich_text(node: Any) -> str:
+    """Text of a rich-text container: a shared-string ``<si>`` or an inline ``<is>``.
+
+    Both hold either a single ``<t>`` or runs ``<r><t>…</t></r>``. Phonetic
+    guides ``<rPh>`` also carry ``<t>``, but are annotations, not the cell's
+    text, so they are skipped. One helper for both kinds so they cannot drift.
+    """
+    parts: List[str] = []
+    for child in node:
+        namespace, local_name = _xml_name(child.tag)
+        if namespace not in _SPREADSHEETML_NAMESPACES:
+            continue
+        if local_name == "t":
+            parts.append(child.text or "")
+        elif local_name == "r":
+            parts.extend(t.text or "" for t in _sheet_children(child, "t"))
+    return "".join(parts)
+
+
 def _read_shared_strings(
     zf: zipfile.ZipFile, budget: _ExpansionBudget
 ) -> Optional[List[str]]:
@@ -762,10 +794,7 @@ def _read_shared_strings(
     except KeyError:
         return None
     root = ET.fromstring(shared_strings_xml)
-    return [
-        "".join(t.text or "" for t in si.findall(f".//{{{_EXCEL_MAIN_NAMESPACE}}}t"))
-        for si in root.findall(f"{{{_EXCEL_MAIN_NAMESPACE}}}si")
-    ]
+    return [_rich_text(si) for si in _sheet_children(root, "si")]
 
 
 def _shared_string(shared_strings: Optional[List[str]], value: str, member: str) -> str:
@@ -792,14 +821,26 @@ def _spreadsheet_texts(
 ) -> List[str]:
     """Return cell values from one worksheet in document order."""
     texts: List[str] = []
-    for cell in xml_root.iter(f"{{{_EXCEL_MAIN_NAMESPACE}}}c"):
-        value = cell.find(f"{{{_EXCEL_MAIN_NAMESPACE}}}v")
-        if value is None or value.text is None:
+    for cell in xml_root.iter():
+        namespace, local_name = _xml_name(cell.tag)
+        if namespace not in _SPREADSHEETML_NAMESPACES or local_name != "c":
             continue
-        if cell.get("t") == "s":
-            texts.append(_shared_string(shared_strings, value.text, member))
+        cell_type = cell.get("t")
+        if cell_type == "inlineStr":
+            # The text lives in <is>, not <v>; an empty or absent <is> is an
+            # empty cell, like a cell with no <v>.
+            for inline in _sheet_children(cell, "is"):
+                if text := _rich_text(inline):
+                    texts.append(text)
+            continue
+        values = _sheet_children(cell, "v")
+        if not values or values[0].text is None:
+            continue
+        value = values[0].text
+        if cell_type == "s":
+            texts.append(_shared_string(shared_strings, value, member))
         else:
-            texts.append(value.text)
+            texts.append(value)
     return texts
 
 
