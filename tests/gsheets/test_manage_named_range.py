@@ -307,6 +307,24 @@ async def test_update_missing_new_values_raises_error():
 
 
 @pytest.mark.asyncio
+async def test_update_whitespace_new_values_raises_error():
+    service = _create_mock_service()
+    with pytest.raises(
+        UserInputError,
+        match="At least one of 'new_name' or 'new_range' must be provided",
+    ):
+        await _unwrap(sheets_tools.manage_named_range)(
+            service=service,
+            user_google_email="user@example.com",
+            spreadsheet_id="sheet123",
+            action="update",
+            named_range_id="nr_1",
+            new_name="   ",
+            new_range="   ",
+        )
+
+
+@pytest.mark.asyncio
 async def test_update_missing_identifier_raises_error():
     service = _create_mock_service()
     with pytest.raises(
@@ -317,6 +335,23 @@ async def test_update_missing_identifier_raises_error():
             user_google_email="user@example.com",
             spreadsheet_id="sheet123",
             action="update",
+            new_name="NewName",
+        )
+
+
+@pytest.mark.asyncio
+async def test_update_whitespace_identifier_raises_error():
+    service = _create_mock_service()
+    with pytest.raises(
+        UserInputError, match="Either 'named_range_id' or 'name' is required"
+    ):
+        await _unwrap(sheets_tools.manage_named_range)(
+            service=service,
+            user_google_email="user@example.com",
+            spreadsheet_id="sheet123",
+            action="update",
+            named_range_id="   ",
+            name="   ",
             new_name="NewName",
         )
 
@@ -396,6 +431,22 @@ async def test_delete_missing_identifier_raises_error():
             user_google_email="user@example.com",
             spreadsheet_id="sheet123",
             action="delete",
+        )
+
+
+@pytest.mark.asyncio
+async def test_delete_whitespace_identifier_raises_error():
+    service = _create_mock_service()
+    with pytest.raises(
+        UserInputError, match="Either 'named_range_id' or 'name' is required"
+    ):
+        await _unwrap(sheets_tools.manage_named_range)(
+            service=service,
+            user_google_email="user@example.com",
+            spreadsheet_id="sheet123",
+            action="delete",
+            named_range_id="   ",
+            name="   ",
         )
 
 

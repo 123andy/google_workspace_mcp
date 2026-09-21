@@ -2668,11 +2668,15 @@ async def _manage_named_range_impl(
         )
 
     if action_lower == "update":
-        if not new_name and not new_range:
+        if not (new_name and new_name.strip()) and not (
+            new_range and new_range.strip()
+        ):
             raise UserInputError(
                 "At least one of 'new_name' or 'new_range' must be provided for action='update'."
             )
-        if not named_range_id and not name:
+        if not (named_range_id and named_range_id.strip()) and not (
+            name and name.strip()
+        ):
             raise UserInputError(
                 "Either 'named_range_id' or 'name' is required to identify the named range to update."
             )
@@ -2741,13 +2745,15 @@ async def _manage_named_range_impl(
         )
 
     if action_lower == "delete":
-        if not named_range_id and not name:
+        if not (named_range_id and named_range_id.strip()) and not (
+            name and name.strip()
+        ):
             raise UserInputError(
                 "Either 'named_range_id' or 'name' is required to identify the named range to delete."
             )
 
-        resolved_id = named_range_id
-        deleted_name = name
+        resolved_id = named_range_id.strip() if named_range_id else None
+        deleted_name = name.strip() if name else None
 
         if not resolved_id:
             spreadsheet = await asyncio.to_thread(
