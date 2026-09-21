@@ -1,11 +1,26 @@
 import importlib
 from types import SimpleNamespace
 
+import pytest
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.responses import Response
 from starlette.routing import Route
 from starlette.testclient import TestClient
+
+from auth.oauth_config import reload_oauth_config
+
+
+@pytest.fixture(autouse=True)
+def _reset_oauth_singleton():
+    """Some tests here set the process-global transport mode to streamable-http;
+    reload the memoised oauth-config singleton on teardown so that mode does not
+    leak into transport-sensitive tests that run afterwards.
+    """
+    try:
+        yield
+    finally:
+        reload_oauth_config()
 
 
 def test_well_known_cache_control_middleware_rewrites_headers():
