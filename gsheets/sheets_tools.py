@@ -2712,9 +2712,10 @@ async def _manage_named_range_impl(
 
         if new_name and new_name.strip():
             new_name_clean = new_name.strip()
-            update_payload["name"] = new_name_clean
-            fields.append("name")
-            applied_desc.append(f"renamed from '{existing_name}' to '{new_name_clean}'")
+            if new_name_clean != existing_name:
+                update_payload["name"] = new_name_clean
+                fields.append("name")
+                applied_desc.append(f"renamed from '{existing_name}' to '{new_name_clean}'")
 
         if new_range and new_range.strip():
             new_range_clean = new_range.strip()
@@ -2722,6 +2723,9 @@ async def _manage_named_range_impl(
             update_payload["range"] = new_grid_range
             fields.append("range")
             applied_desc.append(f"range updated to '{new_range_clean}'")
+
+        if not fields:
+            raise UserInputError("No changes to apply to the named range.")
 
         body = {
             "requests": [
