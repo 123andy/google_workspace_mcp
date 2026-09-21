@@ -4,7 +4,7 @@ This module provides Model Context Protocol (MCP) tools for interacting with Goo
 
 ## Overview
 
-Google Apps Script allows automation and extension of Google Workspace applications. This MCP integration provides 17 tools across core and extended tiers for complete Apps Script lifecycle management.
+Google Apps Script allows automation and extension of Google Workspace applications. This MCP integration provides 8 action-based tools across core and extended tiers for complete Apps Script lifecycle management. Most tools take an `action` argument that selects the operation (for example `manage_script_project(action="list")`).
 
 ## Why Apps Script?
 
@@ -103,7 +103,7 @@ This ensures safe, auditable automation management.
 ## Limitations & Non-Goals
 
 **Current Limitations**
-- Direct trigger management via API is not supported (use `generate_trigger_code` instead)
+- Triggers cannot be created directly via API. Existing triggers can be listed and deleted with `manage_script_trigger`; to create one, generate the setup code with `generate_trigger_code`, add it with `manage_script_content`, and run it with `run_script_function`.
 - Real-time debugging and breakpoints are not available
 - Advanced service enablement must be done manually in the script editor
 
@@ -182,27 +182,18 @@ On first use, you will be prompted to authorize the application. Complete the OA
 ### Core Tier
 Essential operations for reading, writing, and executing scripts:
 
-- `list_script_projects`: List accessible projects
-- `get_script_project`: Get full project with all files
-- `get_script_content`: Get specific file content
-- `create_script_project`: Create new project
-- `update_script_content`: Merge or replace project files (`merge=true` by default)
+- `manage_script_project`: Project lifecycle - `action` is `list`, `get`, `create`, or `delete`
+- `manage_script_content`: Source files - `action="get"` (whole project, or a single `file_name`) or `action="update"` (merge or replace; `merge=true` by default)
 - `run_script_function`: Execute functions
 - `generate_trigger_code`: Generate trigger setup code
 
 ### Extended Tier
 Advanced deployment, versioning, and monitoring:
 
-- `create_deployment`: Create new deployment
-- `list_deployments`: List all deployments
-- `update_deployment`: Update deployment config
-- `delete_deployment`: Remove deployment
-- `delete_script_project`: Delete a project permanently
-- `list_versions`: List all versions
-- `create_version`: Create immutable version snapshot
-- `get_version`: Get version details
-- `list_script_processes`: View execution history
-- `get_script_metrics`: Get execution analytics
+- `manage_deployment`: Deployments - `action` is `list`, `create`, `update`, or `delete`
+- `manage_script_version`: Immutable versions - `action` is `list`, `get`, or `create`
+- `get_script_activity`: Observability - `action="processes"` (execution history) or `action="metrics"` (execution analytics)
+- `manage_script_trigger`: Installable triggers - `action="list"` or `action="delete"`
 
 ## Usage Examples
 
@@ -271,7 +262,7 @@ Files:
 The AI will:
 1. Read current code
 2. Generate improved version
-3. Call `update_script_content` with the changed files (`merge=true` merges by file name)
+3. Call `manage_script_content(action="update")` with the changed files (`merge=true` merges by file name)
 
 To delete files or replace the entire project, pass `merge=false` with the complete desired file set.
 
@@ -386,7 +377,7 @@ See [Apps Script Quotas](https://developers.google.com/apps-script/guides/servic
 ### Cannot Execute Arbitrary Code
 The `run_script_function` tool can only execute functions that are defined in the script. You cannot run arbitrary JavaScript code directly. To run new code:
 
-1. Add function to script via `update_script_content`
+1. Add function to script via `manage_script_content(action="update")`
 2. Execute the function via `run_script_function`
 3. Optionally remove the function after execution
 

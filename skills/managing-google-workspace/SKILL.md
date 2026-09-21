@@ -234,18 +234,14 @@ For parameters: [references/chat.md](references/chat.md)
 
 | Task | Tool |
 |------|------|
-| List projects | `list_script_projects` |
-| Get project | `get_script_project` |
-| Create project | `create_script_project` |
-| Delete project | `delete_script_project` |
-| Get file content | `get_script_content` |
-| Update file content | `update_script_content` |
+| Projects (list/get/create/delete) | `manage_script_project` (`action`) |
+| File content (get/update) | `manage_script_content` (`action`) |
 | Run function | `run_script_function` |
 | Generate trigger code | `generate_trigger_code` |
-| Manage deployments | `manage_deployment` / `list_deployments` |
-| Versions | `create_version` / `get_version` / `list_versions` |
-| Execution metrics | `get_script_metrics` |
-| Process history | `list_script_processes` |
+| Deployments (list/create/update/delete) | `manage_deployment` (`action`) |
+| Versions (list/get/create) | `manage_script_version` (`action`) |
+| Execution metrics / process history | `get_script_activity` (`action="metrics"` / `"processes"`) |
+| Triggers (list/delete) | `manage_script_trigger` (`action`) |
 
 For parameters: [references/apps-script.md](references/apps-script.md)
 

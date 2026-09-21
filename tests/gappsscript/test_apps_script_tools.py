@@ -10,7 +10,7 @@ import os
 import sys
 import threading
 from typing import get_type_hints
-from unittest.mock import Mock, call
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import pytest
 
@@ -47,6 +47,11 @@ from gappsscript.apps_script_tools import (
     _TRIGGER_ADMIN_FILE_NAME,
     _TRIGGER_ADMIN_SOURCE,
     manage_deployment,
+    manage_script_project,
+    manage_script_content,
+    manage_script_version,
+    manage_script_trigger,
+    get_script_activity,
     run_script_function,
 )
 
@@ -1183,3 +1188,237 @@ async def test_list_script_triggers_execution_error():
         await _list_script_triggers_impl(
             service=mock_service, user_google_email="test@example.com", script_id="script123"
         )
+
+
+@pytest.mark.asyncio
+async def test_delete_script_trigger_by_handler():
+    """Deleting by handler_function passes it through and reports every match."""
+    mock_service = Mock()
+    mock_service.projects().getContent().execute.return_value = {"files": []}
+    mock_service.scripts().run().execute.return_value = {
+        "response": {
+            "result": json.dumps(
+                [
+                    {"uniqueId": "abc123", "handlerFunction": "sendDailyReport"},
+                    {"uniqueId": "def456", "handlerFunction": "sendDailyReport"},
+                ]
+            )
+        }
+    }
+
+    result = await _delete_script_trigger_impl(
+        service=mock_service,
+        user_google_email="test@example.com",
+        script_id="script123",
+        handler_function="sendDailyReport",
+    )
+
+    assert "Deleted 2 trigger" in result
+    assert "abc123" in result and "def456" in result
+    _, run_kwargs = mock_service.scripts().run.call_args
+    assert run_kwargs["body"]["parameters"] == [None, "sendDailyReport"]
+
+
+@pytest.mark.asyncio
+async def test_delete_script_trigger_by_id_and_handler():
+    """Both selectors are forwarded so the helper can match on either."""
+    mock_service = Mock()
+    mock_service.projects().getContent().execute.return_value = {"files": []}
+    mock_service.scripts().run().execute.return_value = {
+        "response": {
+            "result": json.dumps(
+                [{"uniqueId": "abc123", "handlerFunction": "sendDailyReport"}]
+            )
+        }
+    }
+
+    result = await _delete_script_trigger_impl(
+        service=mock_service,
+        user_google_email="test@example.com",
+        script_id="script123",
+        trigger_id="abc123",
+        handler_function="sendDailyReport",
+    )
+
+    assert "Deleted 1 trigger" in result
+    _, run_kwargs = mock_service.scripts().run.call_args
+    assert run_kwargs["body"]["parameters"] == ["abc123", "sendDailyReport"]
+
+
+# ============================================================================
+# Consolidated tool dispatch (action routing + argument validation)
+#
+# The public @server.tool wrappers are thin action dispatchers over the _impl
+# functions tested above. These tests unwrap the auth/error decorators and
+# verify that each action routes to the right _impl (with the right service for
+# multi-service tools) and that missing required arguments raise UserInputError.
+# ============================================================================
+
+
+def _undecorated(tool):
+    """Strip the two auth/error decorators to reach the raw dispatcher."""
+    return tool.__wrapped__.__wrapped__
+
+
+@pytest.mark.asyncio
+async def test_manage_script_project_routes_actions_to_correct_service():
+    drive_service = Mock()
+    script_service = Mock()
+    fn = _undecorated(manage_script_project)
+
+    with patch(
+        "gappsscript.apps_script_tools._list_script_projects_impl",
+        new=AsyncMock(return_value="listed"),
+    ) as list_impl, patch(
+        "gappsscript.apps_script_tools._get_script_project_impl",
+        new=AsyncMock(return_value="got"),
+    ) as get_impl, patch(
+        "gappsscript.apps_script_tools._create_script_project_impl",
+        new=AsyncMock(return_value="created"),
+    ) as create_impl, patch(
+        "gappsscript.apps_script_tools._delete_script_project_impl",
+        new=AsyncMock(return_value="deleted"),
+    ) as delete_impl:
+        assert (
+            await fn(drive_service, script_service, "u@e.com", "list", page_size=10)
+            == "listed"
+        )
+        assert (
+            await fn(drive_service, script_service, "u@e.com", "get", script_id="s1")
+            == "got"
+        )
+        assert (
+            await fn(drive_service, script_service, "u@e.com", "create", title="T")
+            == "created"
+        )
+        assert (
+            await fn(drive_service, script_service, "u@e.com", "delete", script_id="s1")
+            == "deleted"
+        )
+
+    # list/delete use the Drive client; get/create use the Script client.
+    assert list_impl.call_args.args[0] is drive_service
+    assert delete_impl.call_args.args[0] is drive_service
+    assert get_impl.call_args.args[0] is script_service
+    assert create_impl.call_args.args[0] is script_service
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"action": "get"}, "script_id is required"),
+        ({"action": "delete"}, "script_id is required"),
+        ({"action": "create"}, "title is required"),
+        ({"action": "bogus"}, "Invalid action"),
+    ],
+)
+async def test_manage_script_project_validates_arguments(kwargs, message):
+    fn = _undecorated(manage_script_project)
+    with pytest.raises(UserInputError, match=message):
+        await fn(Mock(), Mock(), "u@e.com", **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_manage_script_content_get_routes_by_file_name():
+    fn = _undecorated(manage_script_content)
+    with patch(
+        "gappsscript.apps_script_tools._get_script_content_impl",
+        new=AsyncMock(return_value="file"),
+    ) as file_impl, patch(
+        "gappsscript.apps_script_tools._get_script_project_impl",
+        new=AsyncMock(return_value="project"),
+    ) as project_impl:
+        assert (
+            await fn(Mock(), "u@e.com", "get", "s1", file_name="Code") == "file"
+        )
+        assert await fn(Mock(), "u@e.com", "get", "s1") == "project"
+
+    assert file_impl.call_count == 1
+    assert project_impl.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_manage_script_content_update_requires_files():
+    fn = _undecorated(manage_script_content)
+    with pytest.raises(UserInputError, match="files is required"):
+        await fn(Mock(), "u@e.com", "update", "s1")
+
+
+@pytest.mark.asyncio
+async def test_manage_script_content_rejects_unknown_action():
+    fn = _undecorated(manage_script_content)
+    with pytest.raises(UserInputError, match="Invalid action"):
+        await fn(Mock(), "u@e.com", "delete", "s1")
+
+
+@pytest.mark.asyncio
+async def test_manage_deployment_list_action():
+    mock_service = Mock()
+    mock_service.projects().deployments().list().execute.return_value = {
+        "deployments": []
+    }
+    fn = manage_deployment.__wrapped__.__wrapped__
+    result = await fn(
+        service=mock_service,
+        user_google_email="u@e.com",
+        action="list",
+        script_id="s1",
+    )
+    assert "No deployments found" in result
+
+
+@pytest.mark.asyncio
+async def test_manage_script_version_get_requires_version_number():
+    fn = _undecorated(manage_script_version)
+    with pytest.raises(UserInputError, match="version_number is required"):
+        await fn(Mock(), "u@e.com", "get", "s1")
+
+
+@pytest.mark.asyncio
+async def test_manage_script_version_rejects_unknown_action():
+    fn = _undecorated(manage_script_version)
+    with pytest.raises(UserInputError, match="Invalid action"):
+        await fn(Mock(), "u@e.com", "delete", "s1")
+
+
+@pytest.mark.asyncio
+async def test_get_script_activity_metrics_requires_script_id():
+    fn = _undecorated(get_script_activity)
+    with pytest.raises(UserInputError, match="script_id is required"):
+        await fn(Mock(), "u@e.com", "metrics")
+
+
+@pytest.mark.asyncio
+async def test_get_script_activity_processes_allows_missing_script_id():
+    fn = _undecorated(get_script_activity)
+    with patch(
+        "gappsscript.apps_script_tools._list_script_processes_impl",
+        new=AsyncMock(return_value="ok"),
+    ) as processes_impl:
+        assert await fn(Mock(), "u@e.com", "processes") == "ok"
+    # script_id defaults to None and is forwarded to the impl.
+    assert processes_impl.call_args.args[3] is None
+
+
+@pytest.mark.asyncio
+async def test_manage_script_trigger_routes_list_and_delete():
+    fn = _undecorated(manage_script_trigger)
+    with patch(
+        "gappsscript.apps_script_tools._list_script_triggers_impl",
+        new=AsyncMock(return_value="listed"),
+    ), patch(
+        "gappsscript.apps_script_tools._delete_script_trigger_impl",
+        new=AsyncMock(return_value="deleted"),
+    ):
+        assert await fn(Mock(), "u@e.com", "list", "s1") == "listed"
+        assert (
+            await fn(Mock(), "u@e.com", "delete", "s1", trigger_id="t1") == "deleted"
+        )
+
+
+@pytest.mark.asyncio
+async def test_manage_script_trigger_rejects_unknown_action():
+    fn = _undecorated(manage_script_trigger)
+    with pytest.raises(UserInputError, match="Invalid action"):
+        await fn(Mock(), "u@e.com", "create", "s1")

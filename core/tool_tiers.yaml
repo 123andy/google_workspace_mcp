@@ -165,22 +165,13 @@ search:
 
 appscript:
   core:
-    - list_script_projects
-    - get_script_project
-    - get_script_content
-    - create_script_project
-    - update_script_content
+    - manage_script_project
+    - manage_script_content
     - run_script_function
     - generate_trigger_code
   extended:
     - manage_deployment
-    - list_deployments
-    - delete_script_project
-    - list_versions
-    - create_version
-    - get_version
-    - list_script_processes
-    - get_script_metrics
-    - list_script_triggers
-    - delete_script_trigger
+    - manage_script_version
+    - get_script_activity
+    - manage_script_trigger
   complete: []

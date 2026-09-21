@@ -32,7 +32,7 @@ def test_every_gappsscript_tool_is_listed_in_tool_tiers_yaml():
             gappsscript_tool_names.add(name)
 
     assert gappsscript_tool_names, (
-        "No gappsscript tools found registered on the shared server — "
+        "No gappsscript tools found registered on the shared server - "
         "this test's own detection is broken, not a real pass."
     )
 
