@@ -377,6 +377,9 @@ standard library would reach it, at the cost of downloading the whole message, a
 
 ## Related
 
+- **Feature ledger** — every feature carried on top of upstream, its PR, and where it runs — is kept
+  in the private `scientist-hq/mcp-gateway` repo as `docs/google-workspace-fork-ledger.md`, not here:
+  it records company deployment state, and this fork is public.
 - [`granular-tool-selection.md`](granular-tool-selection.md) — `--only-tools` / `--exclude-tools`,
   the subject of PR #887 and the flag whose upstream twin (`--disabled-tools`) makes
   `--exclude-tools` retirable.
