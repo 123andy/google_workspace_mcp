@@ -1268,9 +1268,7 @@ def _format_named_ranges_list(
 ) -> str:
     """Format a list of named ranges into a human-readable markdown table."""
     if not named_ranges:
-        return (
-            f"No named ranges found in spreadsheet '{spreadsheet_id}' for {user_google_email}."
-        )
+        return f"No named ranges found in spreadsheet '{spreadsheet_id}' for {user_google_email}."
 
     header = (
         f"Found {len(named_ranges)} named range(s) in spreadsheet '{spreadsheet_id}' for {user_google_email}:\n\n"

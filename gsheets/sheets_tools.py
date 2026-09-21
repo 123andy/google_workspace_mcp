@@ -32,7 +32,6 @@ from gsheets.sheets_helpers import (
     _format_conditional_rules_section,
     _format_named_ranges_list,
     _format_sheet_error_section,
-    _grid_range_to_a1,
     _parse_a1_range,
     _parse_condition_values,
     _parse_gradient_points,
@@ -2693,7 +2692,9 @@ async def _manage_named_range_impl(
             named_ranges, target_id=named_range_id, target_name=name
         )
         if not target_nr:
-            identifier = f"ID '{named_range_id}'" if named_range_id else f"name '{name}'"
+            identifier = (
+                f"ID '{named_range_id}'" if named_range_id else f"name '{name}'"
+            )
             raise UserInputError(
                 f"Named range with {identifier} not found in spreadsheet {spreadsheet_id}."
             )

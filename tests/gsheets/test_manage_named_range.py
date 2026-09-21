@@ -183,7 +183,9 @@ async def test_create_missing_name_raises_error():
 @pytest.mark.asyncio
 async def test_create_missing_range_name_raises_error():
     service = _create_mock_service()
-    with pytest.raises(UserInputError, match="range_name is required for action='create'"):
+    with pytest.raises(
+        UserInputError, match="range_name is required for action='create'"
+    ):
         await _unwrap(sheets_tools.manage_named_range)(
             service=service,
             user_google_email="user@example.com",
@@ -232,7 +234,11 @@ async def test_update_named_range_by_id_both_fields():
 @pytest.mark.asyncio
 async def test_update_named_range_by_name_resolution():
     existing_ranges = [
-        {"namedRangeId": "nr_auto_resolved", "name": "SalesData", "range": {"sheetId": 0}}
+        {
+            "namedRangeId": "nr_auto_resolved",
+            "name": "SalesData",
+            "range": {"sheetId": 0},
+        }
     ]
     service = _create_mock_service(named_ranges=existing_ranges)
 
@@ -259,7 +265,10 @@ async def test_update_named_range_by_name_resolution():
 @pytest.mark.asyncio
 async def test_update_missing_new_values_raises_error():
     service = _create_mock_service()
-    with pytest.raises(UserInputError, match="At least one of 'new_name' or 'new_range' must be provided"):
+    with pytest.raises(
+        UserInputError,
+        match="At least one of 'new_name' or 'new_range' must be provided",
+    ):
         await _unwrap(sheets_tools.manage_named_range)(
             service=service,
             user_google_email="user@example.com",
@@ -272,7 +281,9 @@ async def test_update_missing_new_values_raises_error():
 @pytest.mark.asyncio
 async def test_update_missing_identifier_raises_error():
     service = _create_mock_service()
-    with pytest.raises(UserInputError, match="Either 'named_range_id' or 'name' is required"):
+    with pytest.raises(
+        UserInputError, match="Either 'named_range_id' or 'name' is required"
+    ):
         await _unwrap(sheets_tools.manage_named_range)(
             service=service,
             user_google_email="user@example.com",
@@ -285,7 +296,9 @@ async def test_update_missing_identifier_raises_error():
 @pytest.mark.asyncio
 async def test_update_not_found_raises_error():
     service = _create_mock_service(named_ranges=[])
-    with pytest.raises(UserInputError, match="Named range with name 'Unknown' not found"):
+    with pytest.raises(
+        UserInputError, match="Named range with name 'Unknown' not found"
+    ):
         await _unwrap(sheets_tools.manage_named_range)(
             service=service,
             user_google_email="user@example.com",
@@ -324,9 +337,7 @@ async def test_delete_named_range_by_id():
 
 @pytest.mark.asyncio
 async def test_delete_named_range_by_name_resolution():
-    existing_ranges = [
-        {"namedRangeId": "nr_del_id", "name": "TempData"}
-    ]
+    existing_ranges = [{"namedRangeId": "nr_del_id", "name": "TempData"}]
     service = _create_mock_service(named_ranges=existing_ranges)
 
     result = await _unwrap(sheets_tools.manage_named_range)(
@@ -349,7 +360,9 @@ async def test_delete_named_range_by_name_resolution():
 @pytest.mark.asyncio
 async def test_delete_missing_identifier_raises_error():
     service = _create_mock_service()
-    with pytest.raises(UserInputError, match="Either 'named_range_id' or 'name' is required"):
+    with pytest.raises(
+        UserInputError, match="Either 'named_range_id' or 'name' is required"
+    ):
         await _unwrap(sheets_tools.manage_named_range)(
             service=service,
             user_google_email="user@example.com",
@@ -361,7 +374,9 @@ async def test_delete_missing_identifier_raises_error():
 @pytest.mark.asyncio
 async def test_delete_not_found_raises_error():
     service = _create_mock_service(named_ranges=[])
-    with pytest.raises(UserInputError, match="Named range with name 'GhostRange' not found"):
+    with pytest.raises(
+        UserInputError, match="Named range with name 'GhostRange' not found"
+    ):
         await _unwrap(sheets_tools.manage_named_range)(
             service=service,
             user_google_email="user@example.com",
@@ -369,4 +384,3 @@ async def test_delete_not_found_raises_error():
             action="delete",
             name="GhostRange",
         )
-
