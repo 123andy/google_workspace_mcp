@@ -56,6 +56,7 @@ def _create_mock_service(sheets=None, named_ranges=None, add_named_range_reply=N
 
 @pytest.mark.asyncio
 async def test_invalid_action_raises_error():
+    """Test that an invalid action raises UserInputError."""
     service = _create_mock_service()
     with pytest.raises(UserInputError, match="Invalid action 'invalid'"):
         await _unwrap(sheets_tools.manage_named_range)(
@@ -73,6 +74,7 @@ async def test_invalid_action_raises_error():
 
 @pytest.mark.asyncio
 async def test_list_named_ranges_when_empty():
+    """Test listing named ranges when none exist in the spreadsheet."""
     service = _create_mock_service(named_ranges=[])
 
     result = await _unwrap(sheets_tools.manage_named_range)(
@@ -87,6 +89,7 @@ async def test_list_named_ranges_when_empty():
 
 @pytest.mark.asyncio
 async def test_list_named_ranges_with_data():
+    """Test listing named ranges returns formatted details."""
     named_ranges = [
         {
             "namedRangeId": "nr_1",
@@ -131,6 +134,7 @@ async def test_list_named_ranges_with_data():
 
 @pytest.mark.asyncio
 async def test_list_named_ranges_omitted_sheet_id_defaults_to_zero():
+    """Test listing named ranges when sheetId is omitted in API response."""
     named_ranges = [
         {
             "namedRangeId": "nr_zero",
@@ -164,6 +168,7 @@ async def test_list_named_ranges_omitted_sheet_id_defaults_to_zero():
 
 @pytest.mark.asyncio
 async def test_create_named_range_success():
+    """Test successful creation of a named range with mocked response."""
     service = _create_mock_service(
         add_named_range_reply={"namedRangeId": "generated_nr_id", "name": "TaxRate"}
     )
@@ -197,6 +202,7 @@ async def test_create_named_range_success():
 
 @pytest.mark.asyncio
 async def test_create_missing_name_raises_error():
+    """Test creating a named range without name raises UserInputError."""
     service = _create_mock_service()
     with pytest.raises(UserInputError, match="name is required for action='create'"):
         await _unwrap(sheets_tools.manage_named_range)(
@@ -210,6 +216,7 @@ async def test_create_missing_name_raises_error():
 
 @pytest.mark.asyncio
 async def test_create_missing_range_name_raises_error():
+    """Test creating a named range without range_name raises UserInputError."""
     service = _create_mock_service()
     with pytest.raises(
         UserInputError, match="range_name is required for action='create'"
@@ -230,6 +237,7 @@ async def test_create_missing_range_name_raises_error():
 
 @pytest.mark.asyncio
 async def test_update_named_range_by_id_both_fields():
+    """Test updating both name and range of a named range by ID."""
     existing_ranges = [
         {"namedRangeId": "nr_100", "name": "OldName", "range": {"sheetId": 0}}
     ]
@@ -261,6 +269,7 @@ async def test_update_named_range_by_id_both_fields():
 
 @pytest.mark.asyncio
 async def test_update_named_range_by_name_resolution():
+    """Test updating a named range by resolving name to ID."""
     existing_ranges = [
         {
             "namedRangeId": "nr_auto_resolved",
@@ -292,6 +301,7 @@ async def test_update_named_range_by_name_resolution():
 
 @pytest.mark.asyncio
 async def test_update_missing_new_values_raises_error():
+    """Test updating without new_name or new_range raises UserInputError."""
     service = _create_mock_service()
     with pytest.raises(
         UserInputError,
@@ -308,6 +318,7 @@ async def test_update_missing_new_values_raises_error():
 
 @pytest.mark.asyncio
 async def test_update_whitespace_new_values_raises_error():
+    """Test updating with whitespace-only new values raises UserInputError."""
     service = _create_mock_service()
     with pytest.raises(
         UserInputError,
@@ -326,6 +337,7 @@ async def test_update_whitespace_new_values_raises_error():
 
 @pytest.mark.asyncio
 async def test_update_missing_identifier_raises_error():
+    """Test updating without named_range_id or name raises UserInputError."""
     service = _create_mock_service()
     with pytest.raises(
         UserInputError, match="Either 'named_range_id' or 'name' is required"
@@ -341,6 +353,7 @@ async def test_update_missing_identifier_raises_error():
 
 @pytest.mark.asyncio
 async def test_update_whitespace_identifier_raises_error():
+    """Test updating with whitespace-only identifiers raises UserInputError."""
     service = _create_mock_service()
     with pytest.raises(
         UserInputError, match="Either 'named_range_id' or 'name' is required"
@@ -358,6 +371,7 @@ async def test_update_whitespace_identifier_raises_error():
 
 @pytest.mark.asyncio
 async def test_update_not_found_raises_error():
+    """Test updating a non-existent named range raises UserInputError."""
     service = _create_mock_service(named_ranges=[])
     with pytest.raises(
         UserInputError, match="Named range with name 'Unknown' not found"
@@ -379,6 +393,7 @@ async def test_update_not_found_raises_error():
 
 @pytest.mark.asyncio
 async def test_delete_named_range_by_id():
+    """Test deleting a named range by ID."""
     service = _create_mock_service()
 
     result = await _unwrap(sheets_tools.manage_named_range)(
@@ -400,6 +415,7 @@ async def test_delete_named_range_by_id():
 
 @pytest.mark.asyncio
 async def test_delete_named_range_by_name_resolution():
+    """Test deleting a named range by resolving name to ID."""
     existing_ranges = [{"namedRangeId": "nr_del_id", "name": "TempData"}]
     service = _create_mock_service(named_ranges=existing_ranges)
 
@@ -422,6 +438,7 @@ async def test_delete_named_range_by_name_resolution():
 
 @pytest.mark.asyncio
 async def test_delete_missing_identifier_raises_error():
+    """Test deleting without identifier raises UserInputError."""
     service = _create_mock_service()
     with pytest.raises(
         UserInputError, match="Either 'named_range_id' or 'name' is required"
@@ -436,6 +453,7 @@ async def test_delete_missing_identifier_raises_error():
 
 @pytest.mark.asyncio
 async def test_delete_whitespace_identifier_raises_error():
+    """Test deleting with whitespace-only identifiers raises UserInputError."""
     service = _create_mock_service()
     with pytest.raises(
         UserInputError, match="Either 'named_range_id' or 'name' is required"
@@ -452,6 +470,7 @@ async def test_delete_whitespace_identifier_raises_error():
 
 @pytest.mark.asyncio
 async def test_delete_not_found_raises_error():
+    """Test deleting a non-existent named range raises UserInputError."""
     service = _create_mock_service(named_ranges=[])
     with pytest.raises(
         UserInputError, match="Named range with name 'GhostRange' not found"
