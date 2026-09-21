@@ -163,3 +163,61 @@ class TestSendOnlyDegradation:
 
         assert "sent1" in result
         service.users().threads().get.assert_not_called()
+
+
+def _rate_limited_403() -> HttpError:
+    return HttpError(
+        _FakeResp(403), b'{"error": {"errors": [{"reason": "userRateLimitExceeded"}]}}'
+    )
+
+
+@pytest.mark.asyncio
+class TestReadScopeClassifier:
+    """Only a genuine missing-scope 403 is translated into send-only guidance."""
+
+    async def test_rate_limited_403_is_not_reported_as_a_send_only_grant(self):
+        service = Mock()
+        service.users().threads().get.side_effect = _rate_limited_403()
+
+        with pytest.raises(HttpError):
+            await _unwrap(send_gmail_message)(
+                service=service,
+                user_google_email="user@example.com",
+                to="rcpt@example.com",
+                subject="Hi",
+                body="Hello",
+                thread_id="t1",
+                quote_original=True,
+            )
+
+    async def test_forward_403_routes_to_a_draft_not_to_header_fields(self):
+        """No field can stand in for the original of a forward, so the advice
+        must not suggest passing 'in_reply_to'/'references'."""
+        service = Mock()
+        service.users().messages().get().execute.side_effect = _http_error(403)
+
+        with pytest.raises(UserInputError) as exc:
+            await _unwrap(send_gmail_message)(
+                service=service,
+                user_google_email="user@example.com",
+                to="rcpt@example.com",
+                forward_message_id="m1",
+            )
+        text = str(exc.value)
+        assert "forward_message_id" in text and "draft_id" in text
+        assert "in_reply_to" not in text
+
+    async def test_reply_403_keeps_the_header_field_advice(self):
+        service = Mock()
+        service.users().threads().get.side_effect = _http_error(403)
+
+        with pytest.raises(UserInputError, match="in_reply_to"):
+            await _unwrap(send_gmail_message)(
+                service=service,
+                user_google_email="user@example.com",
+                to="rcpt@example.com",
+                subject="Hi",
+                body="Hello",
+                thread_id="t1",
+                quote_original=True,
+            )

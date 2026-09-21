@@ -115,3 +115,164 @@ def test_append_drive_links_plain_and_html():
     assert "https://x/deck" in plain and "Deck" in plain
     html = _append_drive_links_to_body("<p>Hi</p>", links, "html")
     assert '<a href="https://x/deck">Deck</a>' in html
+
+
+# --- A Drive attachment this server cannot read refuses the whole message ---
+
+import base64  # noqa: E402
+import logging  # noqa: E402
+
+import pytest  # noqa: E402
+from googleapiclient.errors import HttpError  # noqa: E402
+
+from core.utils import UserInputError  # noqa: E402
+from gmail.gmail_tools import draft_gmail_message, send_gmail_message  # noqa: E402
+
+
+class _Resp(dict):
+    def __init__(self, status):
+        super().__init__()
+        self.status = status
+        self.reason = "x"
+
+
+def _err(status, content=b"{}"):
+    return HttpError(_Resp(status), content)
+
+
+def _unwrap(tool):
+    fn = tool.fn if hasattr(tool, "fn") else tool
+    while hasattr(fn, "__wrapped__"):
+        fn = fn.__wrapped__
+    return fn
+
+
+def _unreadable_drive(status):
+    drive = Mock()
+    drive.files().get().execute.side_effect = _err(status)
+    return drive
+
+
+INLINE = {
+    "content": base64.b64encode(b"hello").decode(),
+    "filename": "note.txt",
+}
+
+
+def _gmail_service():
+    service = Mock()
+    service.users().messages().send().execute.return_value = {"id": "sent1"}
+    service.users().drafts().create().execute.return_value = {"id": "d1"}
+    service.users().settings().sendAs().list().execute.return_value = {"sendAs": []}
+    service.users().messages().send.reset_mock()
+    service.users().drafts().create.reset_mock()
+    return service
+
+
+@pytest.mark.parametrize("status", [403, 404])
+@pytest.mark.parametrize(
+    "attachments",
+    [[{"drive_file_id": "f1"}], [{"drive_file_id": "f1"}, INLINE]],
+    ids=["drive-only", "drive-plus-inline"],
+)
+def test_unreadable_drive_attachment_refuses_the_send(status, attachments):
+    """Nothing is sent: a partial send would put an incomplete message in
+    someone's inbox, and a sent message cannot be recalled."""
+    service = _gmail_service()
+    with (
+        patch("gmail.gmail_tools.build", return_value=_unreadable_drive(status)),
+        patch("gmail.gmail_tools.get_transport_mode", return_value="streamable-http"),
+        pytest.raises(UserInputError) as exc,
+    ):
+        asyncio.run(
+            _unwrap(send_gmail_message)(
+                service=service,
+                user_google_email="user@example.com",
+                to="rcpt@example.com",
+                subject="Hi",
+                body="Hello",
+                attachments=attachments,
+                include_signature=False,
+            )
+        )
+    text = str(exc.value)
+    assert "f1" in text and f"HTTP {status}" in text
+    assert "draft_id" in text and "nothing was sent" in text
+    service.users.return_value.messages.return_value.send.assert_not_called()
+
+
+def test_unreadable_drive_attachment_refuses_the_draft():
+    service = _gmail_service()
+    with (
+        patch("gmail.gmail_tools.build", return_value=_unreadable_drive(404)),
+        patch("gmail.gmail_tools.get_transport_mode", return_value="streamable-http"),
+        pytest.raises(UserInputError, match="could not be read"),
+    ):
+        asyncio.run(
+            _unwrap(draft_gmail_message)(
+                service=service,
+                user_google_email="user@example.com",
+                to="rcpt@example.com",
+                subject="Hi",
+                body="Hello",
+                attachments=[{"drive_file_id": "f1"}, INLINE],
+                include_signature=False,
+            )
+        )
+    service.users.return_value.drafts.return_value.create.assert_not_called()
+
+
+def test_unreadable_download_also_refuses():
+    """The metadata read can succeed while the download is refused."""
+    drive = Mock()
+    drive.files().get().execute.return_value = {
+        "name": "r.pdf",
+        "mimeType": "application/pdf",
+    }
+    drive.files().get_media().execute.side_effect = _err(403)
+    with (
+        patch("gmail.gmail_tools.build", return_value=drive),
+        patch("gmail.gmail_tools.get_transport_mode", return_value="streamable-http"),
+        pytest.raises(UserInputError, match="HTTP 403"),
+    ):
+        asyncio.run(_resolve_drive_attachments(Mock(), [{"drive_file_id": "f1"}]))
+
+
+def test_server_error_keeps_the_per_attachment_handling():
+    """Only permission-shaped failures abort; a 5xx keeps upstream's design."""
+    with (
+        patch("gmail.gmail_tools.build", return_value=_unreadable_drive(500)),
+        patch("gmail.gmail_tools.get_transport_mode", return_value="streamable-http"),
+    ):
+        resolved, _ = asyncio.run(
+            _resolve_drive_attachments(Mock(), [{"drive_file_id": "f1"}])
+        )
+    assert len(resolved) == 1 and "_resolved_bytes" not in resolved[0]
+
+
+def test_rate_limited_403_keeps_the_per_attachment_handling():
+    drive = Mock()
+    drive.files().get().execute.side_effect = _err(
+        403, b'{"error": {"errors": [{"reason": "userRateLimitExceeded"}]}}'
+    )
+    with (
+        patch("gmail.gmail_tools.build", return_value=drive),
+        patch("gmail.gmail_tools.get_transport_mode", return_value="streamable-http"),
+    ):
+        resolved, _ = asyncio.run(
+            _resolve_drive_attachments(Mock(), [{"drive_file_id": "f1"}])
+        )
+    assert len(resolved) == 1 and "_resolved_bytes" not in resolved[0]
+
+
+def test_unreadable_drive_attachment_logs_a_warning_without_traceback(caplog):
+    with (
+        patch("gmail.gmail_tools.build", return_value=_unreadable_drive(404)),
+        patch("gmail.gmail_tools.get_transport_mode", return_value="streamable-http"),
+        caplog.at_level(logging.WARNING, logger="gmail.gmail_tools"),
+        pytest.raises(UserInputError),
+    ):
+        asyncio.run(_resolve_drive_attachments(Mock(), [{"drive_file_id": "f1"}]))
+    records = [r for r in caplog.records if "f1" in r.getMessage()]
+    assert records and all(r.levelno == logging.WARNING for r in records)
+    assert all(r.exc_info is None for r in records)
