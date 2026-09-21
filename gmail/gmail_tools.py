@@ -1619,6 +1619,11 @@ async def _fetch_thread_reply_context(
         # 400/404 means the thread_id is wrong, not a transient failure. Falling
         # through attaches no threadId, silently creating a standalone draft (no
         # recipient or subject) that still reports success.
+        if _http_error_status(e) == 403:
+            # Insufficient scope (e.g. a send-only grant on send_gmail_message).
+            # Swallowing this would silently drop the quote/derivation the caller
+            # asked for — let callers translate it into actionable guidance.
+            raise
         if _http_error_status(e) in (400, 404):
             raise UserInputError(
                 f"Thread '{thread_id}' was not found, or is not a valid Gmail API "
@@ -3261,6 +3266,28 @@ async def get_gmail_attachment_content(
         return "\n".join(result_lines)
 
 
+def _raise_if_read_scope_missing(exc: HttpError, needs: str) -> None:
+    """Translate a 403 on a Gmail READ into actionable send-only guidance.
+
+    ``send_gmail_message`` deliberately declares only send-class scopes, so that
+    scope-minimal deployments (``--only-tools``) never carry mail-reading
+    power on a send endpoint. Its convenience paths that DO read (reply
+    derivation, quoting, forwarding) then fail at Google with a 403 when the
+    grant is send-only; surface that as guidance instead of a bare HttpError.
+    Anything other than a 403 is re-raised for handle_http_errors.
+    """
+    if _http_error_status(exc) == 403:
+        raise UserInputError(
+            f"{needs} requires Gmail read access, but this server's Gmail "
+            "grant appears to be send-only (gmail.send). Either pass the "
+            "fields explicitly so no fetch is needed ('to', 'in_reply_to', "
+            "'references'), or compose the message as a draft where mail can "
+            "be read (draft_gmail_message) and send it here with "
+            "send_gmail_message(draft_id=...)."
+        ) from exc
+    raise exc
+
+
 @server.tool(
     title="Send Gmail Message",
     annotations=ToolAnnotations(
@@ -3271,13 +3298,13 @@ async def get_gmail_attachment_content(
     ),
 )
 @handle_http_errors("send_gmail_message", service_type="gmail")
-# gmail_read: reply derivation/quoting fetch the thread. gmail.compose is NOT
-# declared here even though drafts.send (the draft_id path) needs it: requiring
-# it at the tool boundary would force re-consent on every existing credential
-# before an ORDINARY send. Anyone drafting via this server already holds it
-# (draft_gmail_message declares it); a compose-less credential gets Google's
-# 403 on drafts.send, translated below into re-auth guidance.
-@require_google_service("gmail", ["gmail_read", GMAIL_SEND_SCOPE])
+# Scope-minimal: send-class scopes ONLY, no reads (the delta invariant — a
+# --only-tools endpoint derives its Google grant from these declarations, so a
+# read scope here would put mail-reading power on a send-only token).
+# GMAIL_COMPOSE_SCOPE is required by the draft_id path (drafts.send is
+# compose-scope — gmail.send does not cover it); read-dependent conveniences
+# degrade with guidance via _raise_if_read_scope_missing.
+@require_google_service("gmail", [GMAIL_SEND_SCOPE, GMAIL_COMPOSE_SCOPE])
 async def send_gmail_message(
     service,
     user_google_email: str,
@@ -3393,6 +3420,14 @@ async def send_gmail_message(
     body (quoted with a "Forwarded message" header), and attachments are carried over.
     In forward mode, body (if any) is prepended as a note and subject is optional.
     Threading, reply, and signature options do not apply when forwarding.
+
+    Scope note: this tool requires only send-class scopes (gmail.send + gmail.compose;
+    no reads). The conveniences that READ mail (reply derivation from thread_id,
+    quote_original, reply_all, and forwarding) additionally need the grant to include
+    Gmail read access; on a send-only grant they fail with guidance instead — pass
+    'to'/'in_reply_to'/'references' explicitly, or compose the message as a draft
+    (draft_gmail_message) where reads are available and send it with
+    send_gmail_message(draft_id=...).
 
     THIS TOOL SENDS IMMEDIATELY AND CANNOT SCHEDULE. Gmail's REST API exposes no
     send-time parameter; Schedule send is a web-UI feature with no API equivalent,
@@ -3638,9 +3673,10 @@ async def send_gmail_message(
                         f"re-authenticating will not help. Retry after a pause. "
                         f"Google reported: {exc}"
                     ) from exc
-                # drafts.send is compose-scope; gmail.send does not cover it. The
-                # scope is deliberately not declared at the tool boundary (see the
-                # decorator note), so a pre-drafts credential can land here.
+                # drafts.send is compose-scope; gmail.send does not cover it. On
+                # this line the tool boundary declares gmail.compose, so a
+                # credential without it is normally stopped before reaching here;
+                # this remains for a grant whose stored scope list is stale.
                 raise UserInputError(
                     f"Sending draft '{draft_id}' uses drafts.send, which needs the "
                     "gmail.compose scope — this account's stored credential does "
@@ -3669,21 +3705,26 @@ async def send_gmail_message(
         logger.info(
             f"[send_gmail_message] Forwarding message '{forward_message_id}' for '{user_google_email}'"
         )
-        return await _forward_gmail_message_impl(
-            service=service,
-            message_id=forward_message_id,
-            to=to,
-            subject=subject,
-            forward_message=body,
-            forward_message_format=body_format,
-            include_attachments=include_forwarded_attachments,
-            include_signature=include_signature,
-            cc=cc,
-            bcc=bcc,
-            from_name=from_name,
-            from_email=from_email,
-            user_google_email=user_google_email,
-        )
+        try:
+            return await _forward_gmail_message_impl(
+                service=service,
+                message_id=forward_message_id,
+                to=to,
+                subject=subject,
+                forward_message=body,
+                forward_message_format=body_format,
+                include_attachments=include_forwarded_attachments,
+                include_signature=include_signature,
+                cc=cc,
+                bcc=bcc,
+                from_name=from_name,
+                from_email=from_email,
+                user_google_email=user_google_email,
+            )
+        except HttpError as exc:
+            _raise_if_read_scope_missing(
+                exc, "Forwarding (reading the original message via forward_message_id)"
+            )
 
     if subject is None or body is None:
         raise UserInputError(
@@ -3716,12 +3757,17 @@ async def send_gmail_message(
     # draft_gmail_message; one thread fetch serves all three.
     reply_context = None
     if thread_id and (quote_original or reply_all or not in_reply_to or not references):
-        reply_context = await _fetch_thread_reply_context(
-            service,
-            thread_id,
-            in_reply_to=in_reply_to,
-            include_bodies=quote_original,
-        )
+        try:
+            reply_context = await _fetch_thread_reply_context(
+                service,
+                thread_id,
+                in_reply_to=in_reply_to,
+                include_bodies=quote_original,
+            )
+        except HttpError as exc:
+            _raise_if_read_scope_missing(
+                exc, "Deriving reply headers/recipients/quote from the thread"
+            )
 
     target_reply = reply_context.get("target") if reply_context else None
     if thread_id and (not in_reply_to or not references):

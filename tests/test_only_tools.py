@@ -50,7 +50,7 @@ import main  # noqa: E402
 from auth.scopes import (  # noqa: E402
     BASE_SCOPES,
     DRIVE_FILE_SCOPE,
-    GMAIL_READONLY_SCOPE,
+    GMAIL_COMPOSE_SCOPE,
     GMAIL_SEND_SCOPE,
     get_scopes_for_tools,
     set_explicit_scopes,
@@ -453,7 +453,9 @@ raise SystemExit("main() was not stopped by the sentinel")
         # The grant is exactly base identity + the two tools' declared scopes.
         # Pinned literally on purpose: if a tool's declaration changes, the
         # consent screen changes, and this failing is the announcement.
+        # On this line send_gmail_message declares send-class scopes only
+        # (gmail.send + gmail.compose for the draft_id path) and NO read scope —
+        # the send-only-endpoint invariant; see test_send_only_scope_guard.py.
         assert payload["scopes"] == sorted(
-            set(BASE_SCOPES)
-            | {GMAIL_SEND_SCOPE, GMAIL_READONLY_SCOPE, DRIVE_FILE_SCOPE}
+            set(BASE_SCOPES) | {GMAIL_SEND_SCOPE, GMAIL_COMPOSE_SCOPE, DRIVE_FILE_SCOPE}
         )
