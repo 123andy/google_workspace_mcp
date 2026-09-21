@@ -1,4 +1,4 @@
-"""Remote-transport guard for the import_to_google_* tools.
+"""Remote-transport guard for the import_to_google_* tools and update_drive_file.
 
 'file_path' resolves on the machine the SERVER runs on. When the server is
 remote (streamable-http) — e.g. a container with no view of the caller's
@@ -6,9 +6,10 @@ disk — a client-side path can never resolve, and before this guard it fell
 through to validate_file_path() and failed with a bare "Path does not
 exist", which reads as a typo rather than a topology mismatch.
 
-The guard lives once in _import_with_conversion and covers all three
-import tools; validate_file_path() additionally names the server boundary
-in its own errors as defense-in-depth for any unguarded path.
+The guard lives once in _import_with_conversion for the three import tools,
+and once in update_drive_file; both build their message with the same helper.
+validate_file_path() additionally names the server boundary in its own errors
+as defense-in-depth for any unguarded path.
 """
 
 import inspect
@@ -44,7 +45,7 @@ STDIO = patch("gdrive.drive_tools.get_transport_mode", return_value="stdio")
 
 
 class TestRemoteFilePathRejected:
-    """All three import tools reject file_path on a remote transport, BEFORE
+    """The import tools and update_drive_file reject file_path remotely, BEFORE
     touching the Drive API, with an error that names working alternatives."""
 
     @pytest.mark.asyncio
@@ -136,8 +137,8 @@ class TestRemoteFilePathRejected:
         self, _mode, tool, kwargs
     ):
         """The routes are read from each tool's real signature, not restated
-        here, so a parameter added or removed upstream fails this test instead
-        of leaving the guidance quietly wrong."""
+        here, so if upstream adds or removes one of these three parameters on
+        a tool, this test fails instead of leaving the guidance quietly wrong."""
         fn = _unwrap(tool)
         params = set(inspect.signature(fn).parameters)
         has = {"content", "base64_content", "file_url"} & params
@@ -151,6 +152,34 @@ class TestRemoteFilePathRejected:
             )
         advice = str(exc.value).split("Instead,", 1)[1]
         assert set(re.findall(r"'(\w+)'", advice)) == has
+
+    @pytest.mark.asyncio
+    @REMOTE
+    async def test_update_offers_content_for_text_formats_only(self, _mode):
+        """update_drive_file has no base64_content, and its 'content' rejects
+        binary formats with advice to use file_path. Unqualified, the guard
+        would send a .docx caller round in a circle."""
+        with pytest.raises(UserInputError) as exc:
+            await _unwrap(update_drive_file)(
+                service=Mock(),
+                user_google_email="user@example.com",
+                file_id="abc123",
+                file_path="/Users/someone/report.docx",
+            )
+        assert "for text formats, send it inline via 'content'" in str(exc.value)
+
+    @pytest.mark.asyncio
+    @REMOTE
+    async def test_update_guard_answers_before_the_mode_check(self, _mode):
+        """The mode check's own advice names file_path, so the guard runs first."""
+        with pytest.raises(UserInputError, match="unavailable in remote"):
+            await _unwrap(update_drive_file)(
+                service=Mock(),
+                user_google_email="user@example.com",
+                file_id="abc123",
+                file_path="/Users/someone/notes.md",
+                mode="append",
+            )
 
 
 class TestWorkingRoutesUntouched:
@@ -285,9 +314,10 @@ class TestRemoteDecorationBoots:
 
 class TestGuardReachableThroughFastMCP:
     """exclude_args only removes file_path from the ADVERTISED schema. FastMCP
-    does not enforce that closed schema on incoming calls, so a client holding
-    an older schema can still send file_path and it reaches the function — the
-    guard is what answers, and it is what keeps a hidden parameter from
+    validates incoming calls against the function signature, and an
+    exclude_args parameter is still in it, so a client holding an older schema
+    can still send file_path and it reaches the function — the guard is what
+    answers, and it is what keeps a hidden parameter from
     resolving on the server's disk. The other tests call the functions
     directly and cannot see this, so go through a real client, in a subprocess
     because the schema is fixed at import time by the transport."""
@@ -320,8 +350,22 @@ async def main():
 
 asyncio.run(main())
 """
+        # Modes that reshape the tool signature (OAuth 2.1 drops
+        # user_google_email, which this call sends) must not leak in from the
+        # developer's shell.
+        inherited = {
+            k: v
+            for k, v in os.environ.items()
+            if k
+            not in (
+                "MCP_ENABLE_OAUTH21",
+                "EXTERNAL_OAUTH21_PROVIDER",
+                "WORKSPACE_MCP_STATELESS_MODE",
+                "MCP_SINGLE_USER_MODE",
+            )
+        }
         env = {
-            **os.environ,
+            **inherited,
             "GOOGLE_OAUTH_CLIENT_ID": "test-client-id",
             "GOOGLE_OAUTH_CLIENT_SECRET": "test-client-secret",
         }

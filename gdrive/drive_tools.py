@@ -1328,11 +1328,14 @@ def _remote_file_path_error(inline_params: tuple[str, ...]) -> UserInputError:
     has, so the message only ever names routes that exist on that tool.
     """
     inline = " or ".join(f"'{name}'" for name in inline_params)
+    # 'content' carries text only. A tool without 'base64_content' has no inline
+    # route for a binary file, and must not send a .docx caller towards one.
+    qualifier = "" if "base64_content" in inline_params else "for text formats, "
     return UserInputError(
         "'file_path' is unavailable in remote (streamable-http) mode: it "
         "resolves on the MCP server's filesystem, which is not the caller's. "
         "Instead, pass 'file_url' if the file is already at a URL the server "
-        f"can reach, or send it inline via {inline}."
+        f"can reach, or, {qualifier}send it inline via {inline}."
     )
 
 
@@ -1489,8 +1492,8 @@ async def import_to_google_doc(
 
     Remote (streamable-http) servers: prefer 'file_url' when the file is already
     at a URL the server can reach, so its contents stay out of the caller's
-    context. Otherwise pass 'content' or 'base64_content'. 'file_path' is not offered —
-    it would resolve on the server's disk, not the caller's.
+    context. Otherwise pass 'content' or 'base64_content'. 'file_path' is not
+    offered — it would resolve on the server's disk, not the caller's.
     Local (stdio) servers: prefer 'file_path' for files on disk, so file contents
     stay out of the caller's context.
 
@@ -1656,8 +1659,8 @@ async def import_to_google_sheets(
 
     Remote (streamable-http) servers: prefer 'file_url' when the file is already
     at a URL the server can reach, so its contents stay out of the caller's
-    context. Otherwise pass 'content' or 'base64_content'. 'file_path' is not offered —
-    it would resolve on the server's disk, not the caller's.
+    context. Otherwise pass 'content' or 'base64_content'. 'file_path' is not
+    offered — it would resolve on the server's disk, not the caller's.
     Local (stdio) servers: prefer 'file_path' for files on disk, so file contents
     stay out of the caller's context.
 
@@ -2063,7 +2066,7 @@ async def update_drive_file(
             shortcut resource.
         properties (Optional[dict]): Custom key-value properties for the file.
         content (Optional[str]): New text content for text-based formats (markdown, TXT, HTML).
-        file_path (Optional[str]): Local file path for binary formats (DOCX, ODT). Supports file:// URLs.
+        file_path (Optional[str]): Offered by LOCAL (stdio) servers only — remote servers omit this parameter. Server-side file path for binary formats (DOCX, ODT). Supports file:// URLs.
         file_url (Optional[str]): Remote http(s) URL to fetch new content from.
         source_format (Optional[str]): Source format hint for conversion
             (md, markdown, docx, txt, html, rtf, odt). Auto-detected when omitted, and
@@ -2080,6 +2083,14 @@ async def update_drive_file(
     """
     logger.info(f"[update_drive_file] Updating file {file_id} for {user_google_email}")
 
+    # Same guard as _import_with_conversion, and first, so no other check can
+    # answer with advice that names file_path: exclude_args hides file_path from
+    # the remote schema, but a client with a cached schema can still send it —
+    # and the path would resolve on the SERVER's filesystem, not the caller's.
+    if file_path is not None and get_transport_mode() == "streamable-http":
+        # update_drive_file has no base64_content parameter.
+        raise _remote_file_path_error(("content",))
+
     if mode not in CONTENT_UPDATE_MODES:
         raise ValueError(
             f"Unsupported mode: '{mode}'. Supported: {', '.join(CONTENT_UPDATE_MODES)}."
@@ -2091,13 +2102,6 @@ async def update_drive_file(
             f"mode='{mode}' requires 'content' (the text to add). "
             "'file_path' and 'file_url' are only supported with mode='replace'."
         )
-
-    # Same guard as _import_with_conversion: exclude_args hides file_path from
-    # the remote schema, but a client with a cached schema can still send it —
-    # and the path would resolve on the SERVER's filesystem, not the caller's.
-    if file_path is not None and get_transport_mode() == "streamable-http":
-        # update_drive_file has no base64_content parameter.
-        raise _remote_file_path_error(("content",))
 
     replacing_content = any(x is not None for x in (content, file_path, file_url))
     current_file_fields = (
