@@ -70,11 +70,21 @@ class TestSendDraft:
         assert "Draft r-1 sent" in result and "m-9" in result
 
     async def test_not_found_becomes_actionable_error(self):
+        """The guidance has to be true as well as actionable.
+
+        drafts.list is the only call that reads the drafts resource, so
+        draft_gmail_message(action='list') is the only way to recover a Draft
+        ID. search_gmail_messages returns Message IDs and Thread IDs, which
+        drafts.send/update/delete all reject — naming it here would send the
+        model to fetch an identifier that tool cannot emit, so the absence is
+        asserted as well as the presence."""
         service = Mock()
         service.users().drafts().send().execute.side_effect = _http_error(404)
 
-        with pytest.raises(UserInputError, match="in:drafts"):
+        with pytest.raises(UserInputError, match=r"action='list'") as exc:
             await _send(service, draft_id="r-gone")
+        assert "search_gmail_messages" not in str(exc.value)
+        assert "in:drafts" not in str(exc.value)
 
     async def test_invalid_id_also_actionable(self):
         """Gmail answers a malformed/stale draft id with 400 — same guidance."""
