@@ -2715,7 +2715,9 @@ async def _manage_named_range_impl(
             if new_name_clean != existing_name:
                 update_payload["name"] = new_name_clean
                 fields.append("name")
-                applied_desc.append(f"renamed from '{existing_name}' to '{new_name_clean}'")
+                applied_desc.append(
+                    f"renamed from '{existing_name}' to '{new_name_clean}'"
+                )
 
         if new_range and new_range.strip():
             new_range_clean = new_range.strip()
