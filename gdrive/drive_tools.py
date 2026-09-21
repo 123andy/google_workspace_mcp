@@ -36,6 +36,7 @@ from core.utils import (
     stdio_only_args,
     encode_image_content,
     OfficeXmlExtractionError,
+    OfficeXmlTooLargeError,
     extract_office_xml_text,
     extract_pdf_text,
     handle_http_errors,
@@ -417,6 +418,9 @@ async def get_drive_file_content(
             office_text = await asyncio.to_thread(
                 extract_office_xml_text, file_content_bytes, mime_type
             )
+        except OfficeXmlTooLargeError as e:
+            # Not damaged, and not to be retried as raw text: say what happened.
+            office_text = f"[Could not read '{mime_type}' file - {e}]"
         except OfficeXmlExtractionError as e:
             office_text = (
                 f"[Could not read '{mime_type}' file - it appears damaged or is "

@@ -28,6 +28,7 @@ from core.file_limits import (
 from core.utils import (
     GOOGLE_API_WRITE_RETRIES,
     OfficeXmlExtractionError,
+    OfficeXmlTooLargeError,
     extract_office_xml_text,
     handle_http_errors,
     UserInputError,
@@ -365,6 +366,9 @@ async def get_doc_content(
 
         try:
             office_text = extract_office_xml_text(file_content_bytes, mime_type)
+        except OfficeXmlTooLargeError as e:
+            # Not damaged, and not to be retried as raw text: say what happened.
+            office_text = f"[Could not read '{mime_type}' file - {e}]"
         except OfficeXmlExtractionError as e:
             office_text = (
                 f"[Could not read '{mime_type}' file - it appears damaged or is "
