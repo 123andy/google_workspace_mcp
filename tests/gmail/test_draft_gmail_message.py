@@ -1942,3 +1942,90 @@ async def test_send_gmail_message_does_not_fetch_thread_for_a_new_message():
     )
 
     assert mock_service.users.return_value.threads.return_value.get.call_count == 0
+
+
+def _thread_lookup_error(status, reason):
+    return HttpError(
+        resp=SimpleNamespace(status=status, reason=reason),
+        content=b'{"error":{"message":"' + reason.encode() + b'"}}',
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,reason",
+    [
+        (400, "Invalid id value"),  # e.g. the FMfcg... token from a Gmail web URL
+        (404, "Requested entity was not found."),  # well-formed but unknown
+    ],
+)
+async def test_draft_gmail_message_rejects_an_unresolvable_thread_id(status, reason):
+    """A thread_id Gmail rejects must fail loudly, not yield an orphan draft.
+
+    Previously the lookup error was swallowed, no reply headers could be
+    derived, threadId was therefore left off the request, and the tool reported
+    "Draft created!" for a standalone draft with no recipient and no subject.
+    """
+    mock_service = _mock_gmail_service()
+    mock_service.users().threads().get().execute.side_effect = _thread_lookup_error(
+        status, reason
+    )
+    mock_service.users().drafts().create.reset_mock()
+
+    with pytest.raises(UserInputError, match="not a valid Gmail API") as excinfo:
+        await _unwrap(draft_gmail_message)(
+            service=mock_service,
+            user_google_email="primary@example.com",
+            subject="",  # blank -> derive "Re: ..." from the thread, as a reply would
+            body="Test 1",
+            thread_id="FMfcgzBCDFGHJKLMNPQRSTVWXZbcdfgh",
+        )
+
+    # Nothing was written, and the advice names tools that can supply the ID.
+    mock_service.users().drafts().create.assert_not_called()
+    assert "search_gmail_messages" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_draft_gmail_message_keeps_the_soft_fallback_for_transient_errors():
+    """A 5xx on the thread lookup is NOT the caller's fault: the existing
+    behaviour (warn, fall back to an unthreaded draft) is deliberately kept."""
+    mock_service = _mock_gmail_service()
+    mock_service.users().threads().get().execute.side_effect = _thread_lookup_error(
+        503, "Backend Error"
+    )
+    mock_service.users().drafts().create().execute.return_value = {"id": "draft_x"}
+
+    result = await _unwrap(draft_gmail_message)(
+        service=mock_service,
+        user_google_email="primary@example.com",
+        to="recipient@example.com",
+        subject="Re: hello",
+        body="Body",
+        thread_id="18c2f3a4b5d6e7f8",
+    )
+
+    assert "draft_x" in result
+
+
+@pytest.mark.asyncio
+async def test_send_gmail_message_rejects_an_unresolvable_thread_id():
+    """The send path shares the helper, so it gets the same clear error before
+    anything is sent."""
+    mock_service = _mock_gmail_service()
+    mock_service.users().threads().get().execute.side_effect = _thread_lookup_error(
+        400, "Invalid id value"
+    )
+    mock_service.users().messages().send.reset_mock()
+
+    with pytest.raises(UserInputError, match="not a valid Gmail API"):
+        await _unwrap(send_gmail_message)(
+            service=mock_service,
+            user_google_email="primary@example.com",
+            to="recipient@example.com",
+            subject="Re: hello",
+            body="Body",
+            thread_id="FMfcgzBCDFGHJKLMNPQRSTVWXZbcdfgh",
+        )
+
+    mock_service.users().messages().send.assert_not_called()

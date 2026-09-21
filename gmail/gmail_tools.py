@@ -916,6 +916,20 @@ async def _fetch_thread_reply_context(
         request = service.users().threads().get(**request_kwargs)
         thread = await asyncio.to_thread(request.execute)
     except Exception as e:
+        # A 400/404 is not a transient failure: Gmail is saying the thread_id
+        # itself is wrong. Falling through would let draft_gmail_message create
+        # a standalone draft with no recipient or subject and still report
+        # success, because threadId is only attached once reply headers could
+        # be derived. The usual cause is the token from a Gmail web URL
+        # (mail.google.com/.../#inbox/FMfcg...), which is not an API thread ID.
+        if _http_error_status(e) in (400, 404):
+            raise UserInputError(
+                f"Thread '{thread_id}' was not found, or is not a valid Gmail API "
+                "thread ID. Use the Thread ID returned by search_gmail_messages or "
+                "get_gmail_thread_content (a hex string such as "
+                "'18c2f3a4b5d6e7f8'). The token in a Gmail web URL is a different "
+                "identifier and cannot be used here."
+            ) from e
         logger.warning(f"Failed to fetch reply context for thread {thread_id}: {e}")
         return None
 
