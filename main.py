@@ -598,9 +598,8 @@ def main():
             args.transport = "stdio"
 
     # Set the transport before tools are imported (further down in main), so
-    # decoration-time schema adaptation sees it: e.g. file-path parameters are
-    # excluded from tool schemas on remote transports, where a client-side path
-    # can never resolve.
+    # anything evaluated at tool-decoration time sees the real transport, as
+    # fastmcp_server.py already does.
     set_transport_mode(args.transport)
 
     _env_http_port = os.getenv("WORKSPACE_MCP_HTTP_PORT", "").strip()
@@ -921,9 +920,6 @@ def main():
             fatal(ui, "GCS credential store verification failed", str(e))
 
     try:
-        # (transport mode was set just after argument resolution, before tool
-        # imports — see above)
-
         # Configure auth initialization for FastMCP lifecycle events
         if args.transport == "streamable-http":
             configure_server_for_http()
