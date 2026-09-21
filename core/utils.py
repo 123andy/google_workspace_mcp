@@ -23,6 +23,7 @@ from googleapiclient.errors import HttpError
 from .api_enablement import get_api_enablement_message
 from auth.google_auth import GoogleAuthenticationError
 from auth.oauth_config import is_oauth21_enabled, is_external_oauth21_provider
+from .file_limits import get_max_office_xml_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -332,6 +333,136 @@ class OfficeXmlExtractionError(Exception):
     """Raised when an Office file cannot be read."""
 
 
+class OfficeXmlTooLargeError(OfficeXmlExtractionError):
+    """Raised when an Office file expands beyond the configured limits.
+
+    A subclass, so callers that only know OfficeXmlExtractionError still stop
+    cleanly; callers that know it can say the file is too large rather than
+    damaged.
+    """
+
+
+# An Office file is a ZIP archive. Nothing the archive says about itself is
+# trusted further than it can be checked: the budget below bounds the bytes
+# expanded out of it, whatever the compressed size was.
+_ZIP_READ_CHUNK_BYTES = 64 * 1024
+
+# OPC packaging (ECMA-376 Part 2) allows only these two. It matters here because
+# ZipExtFile.read(n) passes a length bound to the decompressor for DEFLATE only:
+# BZIP2 and LZMA members are decompressed a whole block at a time and sliced
+# afterwards, so a counted read cannot bound them.
+_OFFICE_ZIP_COMPRESSION = (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+
+
+def _office_extraction_too_large(
+    total_bytes: int, name: str, *, reason: str, activity: str
+) -> OfficeXmlTooLargeError:
+    """Build the common actionable error for either extraction boundary."""
+    return OfficeXmlTooLargeError(
+        f"{reason} the extraction limit of {total_bytes:,} bytes (exceeded while "
+        f"{activity} {name}; set by WORKSPACE_MCP_MAX_OFFICE_XML_BYTES). To read "
+        "it anyway, convert it to a native Google file in Drive (File > Save as "
+        "Google Docs, Sheets or Slides) and read the converted file: Google "
+        "exports native files as text itself, so nothing is expanded here."
+    )
+
+
+class _ExpansionBudget:
+    """Bytes one Office file may still expand to, across all of its parts."""
+
+    def __init__(self, total_bytes: Optional[int]) -> None:
+        self.total_bytes = total_bytes
+        self.used = 0
+
+    def remaining(self) -> Optional[int]:
+        """Bytes that may still be read; None when expansion is uncapped."""
+        if self.total_bytes is None:
+            return None
+        return self.total_bytes - self.used
+
+    def too_large(self, name: str) -> OfficeXmlTooLargeError:
+        assert self.total_bytes is not None
+        return _office_extraction_too_large(
+            self.total_bytes,
+            name,
+            reason="the file expands beyond",
+            activity="reading",
+        )
+
+
+class _ExtractedTextBudget:
+    """UTF-8 bytes of text one Office file may produce.
+
+    This is independent of the XML expansion budget. In particular, XLSX can
+    reference one shared string from many cells, making the extracted text much
+    larger than the XML that describes it.
+    """
+
+    def __init__(self, total_bytes: Optional[int]) -> None:
+        self.total_bytes = total_bytes
+        self.used = 0
+
+    def join(
+        self,
+        parts: list[str],
+        separator: str,
+        member: str,
+        *,
+        prefix: str = "",
+    ) -> str:
+        """Join ``parts`` only after proving the result fits the text budget."""
+        if self.total_bytes is not None:
+            size = self.used + len(prefix.encode("utf-8"))
+            separator_size = len(separator.encode("utf-8"))
+            for index, part in enumerate(parts):
+                if index:
+                    size += separator_size
+                size += len(part.encode("utf-8"))
+                if size > self.total_bytes:
+                    raise _office_extraction_too_large(
+                        self.total_bytes,
+                        member,
+                        reason="the extracted text exceeds",
+                        activity="extracting text from",
+                    )
+            self.used = size
+        return separator.join(parts)
+
+
+def _read_zip_member(zf: zipfile.ZipFile, name: str, budget: _ExpansionBudget) -> bytes:
+    """Read one ZIP member without expanding past the budget.
+
+    Raises KeyError when the member is absent, like ZipFile.read. The declared
+    size is checked first because it is free, but it is only a claim: the read
+    itself is counted, and stops at the limit whatever the header said.
+    """
+    info = zf.getinfo(name)
+    limit = budget.remaining()
+    if limit is None:
+        return zf.read(info)
+    if info.compress_type not in _OFFICE_ZIP_COMPRESSION:
+        raise OfficeXmlExtractionError(
+            f"{name} uses a compression method Office files do not allow"
+        )
+    if info.file_size > limit:
+        raise budget.too_large(name)
+
+    chunks: list[bytes] = []
+    read = 0
+    with zf.open(info) as member:
+        while True:
+            # One byte past the limit is enough to know the limit was exceeded.
+            chunk = member.read(min(_ZIP_READ_CHUNK_BYTES, limit - read + 1))
+            if not chunk:
+                break
+            read += len(chunk)
+            if read > limit:
+                raise budget.too_large(name)
+            chunks.append(chunk)
+    budget.used += read
+    return b"".join(chunks)
+
+
 def _xml_name(tag: str) -> tuple[Optional[str], str]:
     """Return an ElementTree tag's namespace URI and local name."""
     if tag.startswith("{") and "}" in tag:
@@ -417,10 +548,12 @@ def _relationship_id(element: Any) -> Optional[str]:
     return None
 
 
-def _word_related_text_targets(zf: zipfile.ZipFile, document_root: Any) -> list[str]:
+def _word_related_text_targets(
+    zf: zipfile.ZipFile, document_root: Any, budget: _ExpansionBudget
+) -> list[str]:
     """Return active Word text parts using OPC relationships, not filenames."""
     try:
-        relationships_xml = zf.read("word/_rels/document.xml.rels")
+        relationships_xml = _read_zip_member(zf, "word/_rels/document.xml.rels", budget)
     except KeyError:
         return []
     relationships_root = ET.fromstring(relationships_xml)
@@ -548,18 +681,20 @@ def _alternate_content_skip_set(
     return skip
 
 
-def _read_part(zf: zipfile.ZipFile, name: str) -> bytes:
+def _read_part(zf: zipfile.ZipFile, name: str, budget: _ExpansionBudget) -> bytes:
     """Read a ZIP member the file cannot be valid without."""
     try:
-        return zf.read(name)
+        return _read_zip_member(zf, name, budget)
     except KeyError as e:
         raise OfficeXmlExtractionError(f"missing required part: {name}") from e
 
 
-def _read_shared_strings(zf: zipfile.ZipFile) -> Optional[List[str]]:
+def _read_shared_strings(
+    zf: zipfile.ZipFile, budget: _ExpansionBudget
+) -> Optional[List[str]]:
     """Return workbook shared strings, or None when the part is absent."""
     try:
-        shared_strings_xml = zf.read("xl/sharedStrings.xml")
+        shared_strings_xml = _read_zip_member(zf, "xl/sharedStrings.xml", budget)
     except KeyError:
         return None
     root = ET.fromstring(shared_strings_xml)
@@ -684,44 +819,59 @@ def extract_office_xml_text(file_bytes: bytes, mime_type: str) -> Optional[str]:
     if mime_type not in _OFFICE_XML_MIME_TYPES:
         return None
 
+    # Outside the try: an invalid setting is a configuration error, and must not
+    # be reported as a damaged file.
+    max_bytes = get_max_office_xml_bytes()
+    budget = _ExpansionBudget(max_bytes)
+    text_budget = _ExtractedTextBudget(max_bytes)
+
     try:
         with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
             parsed_members: dict[str, tuple[Any, dict[Any, dict[str, str]]]] = {}
             shared_strings: Optional[List[str]] = None
             if mime_type == _DOCX_MIME:
                 document = _parse_xml_with_choice_namespaces(
-                    _read_part(zf, "word/document.xml")
+                    _read_part(zf, "word/document.xml", budget)
                 )
                 parsed_members["word/document.xml"] = document
                 targets = ["word/document.xml"]
-                targets.extend(_word_related_text_targets(zf, document[0]))
+                targets.extend(_word_related_text_targets(zf, document[0], budget))
             elif mime_type == _PPTX_MIME:
-                ET.fromstring(_read_part(zf, "ppt/presentation.xml"))
+                ET.fromstring(_read_part(zf, "ppt/presentation.xml", budget))
                 targets = [n for n in zf.namelist() if n.startswith("ppt/slides/slide")]
             else:
-                ET.fromstring(_read_part(zf, "xl/workbook.xml"))
+                ET.fromstring(_read_part(zf, "xl/workbook.xml", budget))
                 targets = [
                     n
                     for n in zf.namelist()
                     if n.startswith("xl/worksheets/sheet") and "drawing" not in n
                 ]
-                shared_strings = _read_shared_strings(zf)
+                shared_strings = _read_shared_strings(zf, budget)
 
             pieces: List[str] = []
             for member in targets:
                 if mime_type == _XLSX_MIME:
-                    xml_root = ET.fromstring(_read_part(zf, member))
+                    xml_root = ET.fromstring(_read_part(zf, member, budget))
                     member_texts = _spreadsheet_texts(xml_root, shared_strings, member)
                     sep = " "
                 else:
                     xml_root, choice_namespaces = parsed_members.get(
                         member
-                    ) or _parse_xml_with_choice_namespaces(_read_part(zf, member))
+                    ) or _parse_xml_with_choice_namespaces(
+                        _read_part(zf, member, budget)
+                    )
                     member_texts = _paragraph_texts(xml_root, choice_namespaces)
                     # Paragraph boundaries carry meaning; keep them as newlines.
                     sep = "\n"
                 if member_texts:
-                    pieces.append(sep.join(member_texts))
+                    pieces.append(
+                        text_budget.join(
+                            member_texts,
+                            sep,
+                            member,
+                            prefix="\n\n" if pieces else "",
+                        )
+                    )
 
             text = "\n\n".join(pieces).strip(" ")
             return text or None
