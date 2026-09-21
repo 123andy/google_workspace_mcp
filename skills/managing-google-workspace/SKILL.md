@@ -155,6 +155,7 @@ For parameters: [references/docs.md](references/docs.md)
 | Create spreadsheet | `create_spreadsheet` |
 | Create sheet (tab) | `create_sheet` |
 | Move rows between sheets | `move_sheet_rows` |
+| Manage named ranges | `manage_named_range` |
 | List spreadsheets | `list_spreadsheets` |
 | Comments | `manage_spreadsheet_comment` / `list_spreadsheet_comments` |
 
