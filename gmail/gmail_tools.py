@@ -818,27 +818,117 @@ def _extract_attachments(payload: dict) -> List[Dict[str, Any]]:
     """
     attachments = []
 
-    def search_parts(part):
+    def search_parts(part, in_attached_message=False):
         """Recursively search for attachments in message parts"""
         # Check if this part is an attachment
         if part.get("filename") and part.get("body", {}).get("attachmentId"):
+            # A file inside a wrapped email (message/rfc822) is still fetched
+            # with the OUTER message's ID, so it stays listed -- but flagged, so
+            # the read tools can say it is not the wrapper's own attachment.
+            # The filename itself is left exact: forwarding and downloading
+            # both match on it.
             attachments.append(
                 {
                     "filename": part["filename"],
                     "mimeType": part.get("mimeType", "application/octet-stream"),
                     "size": part.get("body", {}).get("size", 0),
                     "attachmentId": part["body"]["attachmentId"],
+                    "inAttachedMessage": in_attached_message,
                 }
             )
 
         # Recursively search sub-parts
         if "parts" in part:
+            nested = in_attached_message or (
+                (part.get("mimeType") or "").lower() == "message/rfc822"
+            )
             for subpart in part["parts"]:
-                search_parts(subpart)
+                search_parts(subpart, nested)
 
     # Start searching from the root payload
     search_parts(payload)
     return attachments
+
+
+ATTACHED_MESSAGE_MAX_DEPTH = 3
+ATTACHED_MESSAGE_MAX_COUNT = 5
+ATTACHED_MESSAGE_HEADER_LIMIT = 1000
+
+
+def _render_attached_messages(
+    payload: dict, body_format: Literal["text", "html"] = "text"
+) -> str:
+    """Render emails wrapped inside this one (message/rfc822 parts) as text.
+
+    _extract_message_bodies only descends into multipart/* containers, so a
+    wrapped email -- forward-as-attachment, a group moderation notice, the
+    original inside a bounce, each entry of a digest -- was invisible to the
+    read tools, while _extract_attachments DOES descend and listed the wrapped
+    email's files as if they were the wrapper's. The wrapped message's own MIME
+    tree is the child of the message/rfc822 part.
+
+    Returns "" when there is no message/rfc822 part, so other messages render
+    unchanged.
+    Every bound is announced in the output: nesting depth, the number of wrapped
+    messages shown, each body's length and each header line's length. The
+    wrapped headers are printed as the attachment claims them -- unlike the
+    wrapper's, they never passed the receiving server's sender checks.
+    """
+    blocks: List[str] = []
+    counts = {"shown": 0, "over_limit": 0, "too_deep": 0}
+    names = ["From", "To", "Cc", "Subject", "Date"]
+
+    def visit(part: dict, depth: int) -> None:
+        for child in part.get("parts") or []:
+            mime_type = (child.get("mimeType") or "").lower()
+            if mime_type == "message/rfc822" and child.get("parts"):
+                if depth > ATTACHED_MESSAGE_MAX_DEPTH:
+                    counts["too_deep"] += 1
+                    continue
+                if counts["shown"] >= ATTACHED_MESSAGE_MAX_COUNT:
+                    counts["over_limit"] += 1
+                    continue
+                counts["shown"] += 1
+                inner = child["parts"][0]
+                # Fall back to the rfc822 part's own headers if the wrapped
+                # message's are not on its root part.
+                headers = _extract_headers(inner, names) or _extract_headers(
+                    child, names
+                )
+                bodies = _extract_message_bodies(inner)
+                body = _format_body_content(
+                    bodies.get("text", ""), bodies.get("html", ""), body_format
+                )
+                lines = [
+                    f"--- ATTACHED MESSAGE {counts['shown']} (headers as claimed "
+                    "by the attachment, unverified) ---"
+                ]
+                for name in names:
+                    if name in headers:
+                        value = headers[name]
+                        if len(value) > ATTACHED_MESSAGE_HEADER_LIMIT:
+                            value = (
+                                value[:ATTACHED_MESSAGE_HEADER_LIMIT] + " [truncated]"
+                            )
+                        lines.append(f"{name}: {value}")
+                lines += ["", _truncate_content(body, HTML_BODY_TRUNCATE_LIMIT)]
+                blocks.append("\n".join(lines))
+                visit(inner, depth + 1)
+            else:
+                visit(child, depth)
+
+    visit(payload, 1)
+    if counts["over_limit"]:
+        blocks.append(
+            f"--- {counts['over_limit']} more attached message(s) not shown "
+            f"(limit {ATTACHED_MESSAGE_MAX_COUNT}) ---"
+        )
+    if counts["too_deep"]:
+        blocks.append(
+            f"--- {counts['too_deep']} attached message(s) nested more than "
+            f"{ATTACHED_MESSAGE_MAX_DEPTH} deep not shown ---"
+        )
+    return "".join(f"\n\n{block}" for block in blocks)
 
 
 def _find_attachment_metadata(payload: dict, attachment_id: str) -> Optional[dict]:
@@ -1882,7 +1972,10 @@ async def get_gmail_message_content(
     attachments = _extract_attachments(payload)
 
     content_lines = _format_message_header_lines(headers)
-    content_lines.append(f"\n--- BODY ---\n{body_data or '[No text/plain body found]'}")
+    content_lines.append(
+        f"\n--- BODY ---\n{body_data or '[No text/plain body found]'}"
+        f"{_render_attached_messages(payload, body_format)}"
+    )
 
     # Add attachment information if present
     if attachments:
@@ -1890,7 +1983,7 @@ async def get_gmail_message_content(
         for attachment_index, att in enumerate(attachments):
             size_kb = att["size"] / 1024
             content_lines.append(
-                f"{attachment_index + 1}. {att['filename']} ({att['mimeType']}, {size_kb:.1f} KB)\n"
+                f"{attachment_index + 1}. {att['filename']} ({att['mimeType']}, {size_kb:.1f} KB){' [in attached message]' if att.get('inAttachedMessage') else ''}\n"
                 f"   Attachment ID: {att['attachmentId']}\n"
                 f"   Use get_gmail_attachment_content(message_id='{message_id}', "
                 f"attachment_id='{att['attachmentId']}', attachment_index={attachment_index}) to download"
@@ -2076,7 +2169,7 @@ async def get_gmail_messages_content_batch(
                         html_body = bodies.get("html", "")
                         body_data = _format_body_content(
                             text_body, html_body, body_format=body_format
-                        )
+                        ) + _render_attached_messages(payload, body_format)
                         body_label = "BODY"
 
                     attachments = _extract_attachments(payload)
@@ -2092,7 +2185,7 @@ async def get_gmail_messages_content_batch(
                         for attachment_index, att in enumerate(attachments):
                             size_kb = att["size"] / 1024
                             msg_output += (
-                                f"{attachment_index + 1}. {att['filename']} ({att['mimeType']}, {size_kb:.1f} KB)\n"
+                                f"{attachment_index + 1}. {att['filename']} ({att['mimeType']}, {size_kb:.1f} KB){' [in attached message]' if att.get('inAttachedMessage') else ''}\n"
                                 f"   Attachment ID: {att['attachmentId']}\n"
                                 f"   Use get_gmail_attachment_content(message_id='{mid}', "
                                 f"attachment_id='{att['attachmentId']}', attachment_index={attachment_index}) to download\n"
@@ -3346,7 +3439,7 @@ def _format_thread_content(
             # Format body content with HTML fallback
             body_data = _format_body_content(
                 text_body, html_body, body_format=body_format
-            )
+            ) + _render_attached_messages(payload, body_format)
             body_label = "BODY"
 
         # Extract attachment metadata for this message
@@ -3398,7 +3491,7 @@ def _format_thread_content(
             for attachment_index, att in enumerate(attachments):
                 size_kb = att["size"] / 1024
                 content_lines.append(
-                    f"{attachment_index + 1}. {att['filename']} ({att['mimeType']}, {size_kb:.1f} KB)\n"
+                    f"{attachment_index + 1}. {att['filename']} ({att['mimeType']}, {size_kb:.1f} KB){' [in attached message]' if att.get('inAttachedMessage') else ''}\n"
                     f"   Attachment ID: {att['attachmentId']}\n"
                     f"   Use get_gmail_attachment_content(message_id='{message_id}', "
                     f"attachment_id='{att['attachmentId']}', attachment_index={attachment_index}) to download"
