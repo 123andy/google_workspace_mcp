@@ -888,3 +888,60 @@ class TestExpansionLimits:
     def test_too_large_is_still_an_extraction_error(self):
         """Callers that predate the subclass must keep stopping cleanly."""
         assert issubclass(OfficeXmlTooLargeError, OfficeXmlExtractionError)
+
+
+class TestChoiceNamespaceScope:
+    """mc:Choice/@Requires names PREFIXES, so each Choice is resolved against the
+    prefix map in scope where it starts. The maps are shared while the scope is
+    unchanged, so they must be refreshed at every scope change, in and out."""
+
+    _MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+    _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    _WPS = "http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
+
+    @classmethod
+    def _alternate(cls, label: str) -> str:
+        return (
+            '<mc:AlternateContent><mc:Choice Requires="x">'
+            f"<w:p><w:r><w:t>CHOICE-{label}</w:t></w:r></w:p></mc:Choice>"
+            f"<mc:Fallback><w:p><w:r><w:t>FALLBACK-{label}</w:t></w:r></w:p>"
+            "</mc:Fallback></mc:AlternateContent>"
+        )
+
+    def _document(self) -> str:
+        # x is supported at the root, shadowed by an unsupported namespace inside
+        # the middle wrapper only, and supported again once that wrapper ends.
+        return (
+            f'<w:document xmlns:w="{self._W}" xmlns:mc="{self._MC}" '
+            f'xmlns:x="{self._WPS}"><w:body>'
+            f"{self._alternate('1')}"
+            f'<w:sdt xmlns:x="urn:example:unsupported">{self._alternate("2")}'
+            f"{self._alternate('3')}</w:sdt>"
+            f"{self._alternate('4')}"
+            "</w:body></w:document>"
+        )
+
+    def test_each_choice_sees_the_prefix_map_in_scope_where_it_starts(self):
+        root, maps = utils._parse_xml_with_choice_namespaces(self._document().encode())
+        choices = list(root.iter(f"{{{self._MC}}}Choice"))
+        assert [maps[choice]["x"] for choice in choices] == [
+            self._WPS,
+            "urn:example:unsupported",
+            "urn:example:unsupported",
+            self._WPS,
+        ]
+
+    def test_a_shadowed_prefix_selects_the_fallback_only_while_shadowed(self):
+        data = _zip(**{"word/document.xml": self._document()})
+        assert extract_office_xml_text(data, DOCX_MIME) == (
+            "CHOICE-1\nFALLBACK-2\nFALLBACK-3\nCHOICE-4"
+        )
+
+    def test_choices_in_an_unchanged_scope_share_one_map(self):
+        """Copying the map per Choice cost (prefixes x Choice elements)."""
+        root, maps = utils._parse_xml_with_choice_namespaces(self._document().encode())
+        first, second, third, fourth = root.iter(f"{{{self._MC}}}Choice")
+        assert maps[second] is maps[third]
+        assert maps[first] is not maps[second]
+        assert maps[fourth] is not maps[third]
+        assert maps[first] == maps[fourth]

@@ -423,10 +423,18 @@ def _xml_name(tag: str) -> tuple[Optional[str], str]:
 def _parse_xml_with_choice_namespaces(
     xml_content: bytes,
 ) -> tuple[Any, dict[Any, dict[str, str]]]:
-    """Parse XML and retain the in-scope prefix map for each mc:Choice."""
+    """Parse XML and retain the in-scope prefix map for each mc:Choice.
+
+    The maps are read-only and may be shared: every mc:Choice that starts while
+    the scope is unchanged gets the SAME dict. Copying the map per element cost
+    (declared prefixes x Choice elements), which a document controls on both
+    sides.
+    """
     namespaces: dict[str, str] = {}
     namespace_stack: list[tuple[str, Any]] = []
     choice_namespaces: dict[Any, dict[str, str]] = {}
+    # A copy of `namespaces` as of the last scope change, made on demand.
+    snapshot: Optional[dict[str, str]] = None
     missing = object()
     xml_root = None
 
@@ -438,18 +446,22 @@ def _parse_xml_with_choice_namespaces(
             prefix = prefix or ""
             namespace_stack.append((prefix, namespaces.get(prefix, missing)))
             namespaces[prefix] = uri
+            snapshot = None
         elif event == "end-ns":
             prefix, previous = namespace_stack.pop()
             if previous is missing:
                 namespaces.pop(prefix, None)
             else:
                 namespaces[prefix] = previous
+            snapshot = None
         else:
             element = value
             if xml_root is None:
                 xml_root = element
             if element.tag == f"{{{_MARKUP_COMPATIBILITY_NAMESPACE}}}Choice":
-                choice_namespaces[element] = namespaces.copy()
+                if snapshot is None:
+                    snapshot = namespaces.copy()
+                choice_namespaces[element] = snapshot
 
     if xml_root is None:
         raise ET.ParseError("XML member has no root element")
