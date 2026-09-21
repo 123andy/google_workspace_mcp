@@ -1386,10 +1386,9 @@ async def _import_with_conversion(
     )
     logger.debug(f"[{tool_name}] File Name: '{file_name}'")
 
-    # A client-side path can NEVER resolve on a remote server — without this
+    # A client-side path can never resolve on a remote server; without this
     # guard it falls through to validate_file_path() and fails with a bare
-    # "Path does not exist", which reads as a typo rather than a topology
-    # mismatch and sends callers off checking spelling and permissions.
+    # "Path does not exist", which reads as a typo, not a topology mismatch.
     if file_path is not None and get_transport_mode() == "streamable-http":
         raise _remote_file_path_error(inline_params)
 
@@ -2087,10 +2086,9 @@ async def update_drive_file(
     """
     logger.info(f"[update_drive_file] Updating file {file_id} for {user_google_email}")
 
-    # Same guard as _import_with_conversion, and first, so no other check can
-    # answer with advice that names file_path: exclude_args hides file_path from
-    # the remote schema, but a client with a cached schema can still send it —
-    # and the path would resolve on the SERVER's filesystem, not the caller's.
+    # Same guard as _import_with_conversion, run first so no earlier check
+    # answers with advice that names file_path. exclude_args hides it from the
+    # remote schema, but a cached-schema client can still send it.
     if file_path is not None and get_transport_mode() == "streamable-http":
         # update_drive_file has no base64_content parameter.
         raise _remote_file_path_error(("content",))
