@@ -499,6 +499,90 @@ async def resolve_folder_id(
     return resolved_id
 
 
+async def place_file_in_folder(
+    drive_service: Any,
+    file_id: str,
+    folder_id: str,
+    *,
+    tool_name: str = "place_file_in_folder",
+) -> str:
+    """
+    Re-parent a freshly created Drive file into ``folder_id``.
+
+    The Docs and Sheets ``create`` endpoints always drop the new file in My Drive
+    root; neither accepts a parent. To honour a caller-supplied ``folder_id`` the
+    file has to be re-parented with this follow-up Drive call.
+
+    Always moves the file, so call it only when a move is actually wanted::
+
+        if folder_id and folder_id != "root":
+            await place_file_in_folder(drive_service, file_id, folder_id)
+
+    ``folder_id`` may be a folder ID, a folder shortcut, or anything else
+    ``resolve_folder_id`` accepts; it is resolved to a real folder ID first, so a
+    non-folder target raises before any move happens. The file's other existing
+    parents are removed so the file lands in exactly one place.
+
+    Args:
+        drive_service: Authenticated Drive service.
+        file_id: ID of the file to move.
+        folder_id: Destination folder. Must name a real folder, not ``"root"``.
+        tool_name: Calling tool, for log prefixes.
+
+    Returns:
+        The resolved destination folder ID.
+    """
+    resolved_folder_id = await resolve_folder_id(drive_service, folder_id)
+    existing = await asyncio.to_thread(
+        drive_service.files()
+        .get(fileId=file_id, fields="parents", supportsAllDrives=True)
+        .execute
+    )
+    # The destination is excluded so a caller naming the file's current parent
+    # outright (e.g. the literal My Drive root ID, which sidesteps the "root"
+    # alias) does not send the same ID as both addParents and removeParents.
+    remove_parents = ",".join(
+        parent for parent in existing.get("parents", []) if parent != resolved_folder_id
+    )
+    await asyncio.to_thread(
+        drive_service.files()
+        .update(
+            fileId=file_id,
+            addParents=resolved_folder_id,
+            removeParents=remove_parents,
+            fields="id, parents",
+            supportsAllDrives=True,
+        )
+        .execute
+    )
+    logger.info(
+        f"[{tool_name}] Moved file {file_id} into folder {resolved_folder_id} "
+        f"(removed parents: '{remove_parents}')"
+    )
+    return resolved_folder_id
+
+
+def folder_note(folder_id: Optional[str]) -> str:
+    """Confirmation-message fragment naming the destination folder, if any."""
+    if not folder_id or folder_id == "root":
+        return ""
+    return f" Placed in folder '{folder_id}'."
+
+
+def folder_move_failed_note(folder_id: str, error: Exception) -> str:
+    """
+    Confirmation-message fragment for a file that was created but not moved.
+
+    The file already exists in My Drive root at this point, so its ID has to
+    reach the caller: raising instead would strand an invisible copy that a
+    retry would duplicate.
+    """
+    return (
+        f" WARNING: left in My Drive root - could not move it into folder "
+        f"'{folder_id}': {error}"
+    )
+
+
 DOWNLOAD_CHUNK_SIZE_BYTES = 256 * 1024  # 256 KB
 UPLOAD_CHUNK_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB (Google recommended minimum)
 MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB safety limit for URL downloads

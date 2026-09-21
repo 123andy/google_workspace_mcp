@@ -83,7 +83,7 @@ SERVICE_PERMISSION_LEVELS: Dict[str, List[Tuple[str, List[str]]]] = {
     ],
     "sheets": [
         ("readonly", [SHEETS_READONLY_SCOPE, DRIVE_READONLY_SCOPE]),
-        ("full", [SHEETS_WRITE_SCOPE, DRIVE_READONLY_SCOPE]),
+        ("full", [SHEETS_WRITE_SCOPE, DRIVE_READONLY_SCOPE, DRIVE_FILE_SCOPE]),
     ],
     "chat": [
         (

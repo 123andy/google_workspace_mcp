@@ -25,6 +25,11 @@ from core.file_limits import (
     download_media_bytes,
     ensure_within_file_size_limit,
 )
+from gdrive.drive_helpers import (
+    folder_move_failed_note,
+    folder_note,
+    place_file_in_folder,
+)
 from core.utils import (
     GOOGLE_API_WRITE_RETRIES,
     OfficeXmlExtractionError,
@@ -493,27 +498,20 @@ async def create_doc(
     )
     doc_id = doc.get("documentId")
 
+    placement_note = folder_note(folder_id)
     if folder_id and folder_id != "root":
-        from gdrive.drive_helpers import resolve_folder_id
-
-        resolved_folder_id = await resolve_folder_id(drive_service, folder_id)
-        existing = await asyncio.to_thread(
-            drive_service.files()
-            .get(fileId=doc_id, fields="parents", supportsAllDrives=True)
-            .execute
-        )
-        remove_parents = ",".join(existing.get("parents", []))
-        await asyncio.to_thread(
-            drive_service.files()
-            .update(
-                fileId=doc_id,
-                addParents=resolved_folder_id,
-                removeParents=remove_parents,
-                fields="id, parents",
-                supportsAllDrives=True,
+        try:
+            await place_file_in_folder(
+                drive_service, doc_id, folder_id, tool_name="create_doc"
             )
-            .execute
-        )
+        except Exception as e:
+            # The doc exists either way; report it with its ID rather than
+            # raising and leaving an orphan in My Drive root.
+            logger.warning(
+                f"[create_doc] Created doc {doc_id} but could not move it into "
+                f"folder '{folder_id}': {e}"
+            )
+            placement_note = folder_move_failed_note(folder_id, e)
 
     if content:
         requests = [{"insertText": {"location": {"index": 1}, "text": content}}]
@@ -527,11 +525,9 @@ async def create_doc(
         content_note = f"Initial content: {len(content)} characters inserted."
     else:
         content_note = "Document is empty (body starts at index 1, total length 2)."
-    folder_note = (
-        f" Placed in folder '{folder_id}'." if folder_id and folder_id != "root" else ""
-    )
     msg = (
-        f"Created Google Doc '{title}' (ID: {doc_id}) for {user_google_email}.{folder_note} "
+        f"Created Google Doc '{title}' (ID: {doc_id}) for {user_google_email}."
+        f"{placement_note} "
         f"{content_note} "
         f"Use batch_update_doc with end_of_segment=true to append content. "
         f"Link: {link}"

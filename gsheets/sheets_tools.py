@@ -12,7 +12,12 @@ from typing import List, Optional, Union
 
 from mcp.types import ToolAnnotations
 
-from auth.service_decorator import require_google_service
+from auth.service_decorator import require_google_service, require_multiple_services
+from gdrive.drive_helpers import (
+    folder_move_failed_note,
+    folder_note,
+    place_file_in_folder,
+)
 from core.server import server
 from core.utils import handle_http_errors, UserInputError, StringList
 from core.comments import create_comment_tools
@@ -1207,12 +1212,27 @@ async def manage_conditional_formatting(
     ),
 )
 @handle_http_errors("create_spreadsheet", service_type="sheets")
-@require_google_service("sheets", "sheets_write")
+@require_multiple_services(
+    [
+        {
+            "service_type": "sheets",
+            "scopes": "sheets_write",
+            "param_name": "sheets_service",
+        },
+        {
+            "service_type": "drive",
+            "scopes": "drive_file",
+            "param_name": "drive_service",
+        },
+    ]
+)
 async def create_spreadsheet(
-    service,
+    sheets_service,
+    drive_service,
     user_google_email: str,
     title: str,
     sheet_names: Optional[StringList] = None,
+    folder_id: str = "root",
 ) -> str:
     """
     Creates a new Google Spreadsheet.
@@ -1221,12 +1241,15 @@ async def create_spreadsheet(
         user_google_email (str): The user's Google email address. Required.
         title (str): The title of the new spreadsheet. Required.
         sheet_names (Optional[List[str]]): List of sheet names to create. If not provided, creates one sheet with default name.
+        folder_id (str): The ID of the parent folder. Defaults to 'root'. For shared
+            drives, this must be a folder ID within the shared drive.
 
     Returns:
         str: Information about the newly created spreadsheet including ID, URL, and locale.
     """
     logger.info(
-        f"[create_spreadsheet] Invoked. Email: '{user_google_email}', title_len={len(title)}"
+        f"[create_spreadsheet] Invoked. Email: '{user_google_email}', "
+        f"title_len={len(title)}, folder_id='{folder_id}'"
     )
 
     spreadsheet_body = {"properties": {"title": title}}
@@ -1237,7 +1260,7 @@ async def create_spreadsheet(
         ]
 
     spreadsheet = await asyncio.to_thread(
-        service.spreadsheets()
+        sheets_service.spreadsheets()
         .create(
             body=spreadsheet_body,
             fields="spreadsheetId,spreadsheetUrl,properties(title,locale)",
@@ -1250,8 +1273,24 @@ async def create_spreadsheet(
     spreadsheet_url = spreadsheet.get("spreadsheetUrl")
     locale = properties.get("locale", "Unknown")
 
+    placement_note = folder_note(folder_id)
+    if folder_id and folder_id != "root":
+        try:
+            await place_file_in_folder(
+                drive_service, spreadsheet_id, folder_id, tool_name="create_spreadsheet"
+            )
+        except Exception as e:
+            # The spreadsheet exists either way; report it with its ID rather
+            # than raising and leaving an orphan in My Drive root.
+            logger.warning(
+                f"[create_spreadsheet] Created spreadsheet {spreadsheet_id} but could "
+                f"not move it into folder '{folder_id}': {e}"
+            )
+            placement_note = folder_move_failed_note(folder_id, e)
+
     text_output = (
-        f"Successfully created spreadsheet '{title}' for {user_google_email}. "
+        f"Successfully created spreadsheet '{title}' for {user_google_email}."
+        f"{placement_note} "
         f"ID: {spreadsheet_id} | URL: {spreadsheet_url} | Locale: {locale}"
     )
 
