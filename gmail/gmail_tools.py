@@ -1950,6 +1950,31 @@ async def _resolve_url_attachments(
     return resolved
 
 
+def _unreadable_drive_attachment_error(drive_file_id: str, exc: Exception):
+    """Return a routing UserInputError when a Drive attachment cannot be read.
+
+    Only for a 403/404 that is not a rate limit. The Drive client here runs on
+    the Gmail tool's own grant; with ``drive.file`` that grant reaches only
+    files this server's OAuth client created or opened, so an ordinary file
+    answers "not found". Sending without it would put an incomplete message in
+    someone's inbox, so the whole send or draft is refused instead. Other
+    failures keep the existing per-attachment handling. Returns None otherwise.
+    """
+    status = _http_error_status(exc)
+    if status not in (403, 404) or (
+        status == 403 and _is_quota_or_rate_limit_error(exc)
+    ):
+        return None
+    return UserInputError(
+        f"Drive file '{drive_file_id}' could not be read with this server's "
+        f"Drive access (HTTP {status}), so nothing was sent or saved. Attach it "
+        "to a draft on a server whose Drive access can read it "
+        "(draft_gmail_message with the same drive_file_id) and send that draft "
+        "with send_gmail_message(draft_id=...), or pass the file inline via "
+        "'content'."
+    )
+
+
 async def _resolve_drive_attachments(
     service,
     attachments: Optional[List[Dict[str, Any]]],
@@ -2012,6 +2037,15 @@ async def _resolve_drive_attachments(
                 .execute
             )
         except Exception as exc:
+            unreadable = _unreadable_drive_attachment_error(drive_file_id, exc)
+            if unreadable is not None:
+                logger.warning(
+                    "Drive file %s is not readable with this server's Drive "
+                    "access (HTTP %s); refusing the message",
+                    drive_file_id,
+                    _http_error_status(exc),
+                )
+                raise unreadable from exc
             logger.exception("Failed to read Drive file %s", drive_file_id)
             resolved.append(_build_attachment_error_entry(att, exc))
             continue
@@ -2047,6 +2081,15 @@ async def _resolve_drive_attachments(
                     att.get("mime_type") or source_mime or "application/octet-stream"
                 )
         except Exception as exc:
+            unreadable = _unreadable_drive_attachment_error(drive_file_id, exc)
+            if unreadable is not None:
+                logger.warning(
+                    "Drive file %s could not be downloaded with this server's "
+                    "Drive access (HTTP %s); refusing the message",
+                    drive_file_id,
+                    _http_error_status(exc),
+                )
+                raise unreadable from exc
             logger.exception("Failed to download Drive file %s", drive_file_id)
             resolved.append(_build_attachment_error_entry(att, exc))
             continue
@@ -3296,7 +3339,23 @@ async def get_gmail_attachment_content(
         return "\n".join(result_lines)
 
 
-def _raise_if_read_scope_missing(exc: HttpError, needs: str) -> None:
+_READ_SCOPE_REMEDY_REPLY = (
+    "Either pass the fields explicitly so no fetch is needed ('to', "
+    "'in_reply_to', 'references'), or compose the message as a draft where "
+    "mail can be read (draft_gmail_message) and send it here with "
+    "send_gmail_message(draft_id=...)."
+)
+_READ_SCOPE_REMEDY_FORWARD = (
+    "A forward must read the original message, so no field can stand in for "
+    "it: compose the forward on a server with Gmail read access "
+    "(draft_gmail_message with forward_message_id), then send that draft here "
+    "with send_gmail_message(draft_id=...)."
+)
+
+
+def _raise_if_read_scope_missing(
+    exc: HttpError, needs: str, remedy: str = _READ_SCOPE_REMEDY_REPLY
+) -> None:
     """Translate a 403 on a Gmail READ into actionable send-only guidance.
 
     ``send_gmail_message`` deliberately declares only send-class scopes, so that
@@ -3304,16 +3363,13 @@ def _raise_if_read_scope_missing(exc: HttpError, needs: str) -> None:
     power on a send endpoint. Its convenience paths that DO read (reply
     derivation, quoting, forwarding) then fail at Google with a 403 when the
     grant is send-only; surface that as guidance instead of a bare HttpError.
-    Anything other than a 403 is re-raised for handle_http_errors.
+    A rate-limit or quota 403 is not a missing scope: it, and anything other
+    than a 403, is re-raised for handle_http_errors.
     """
-    if _http_error_status(exc) == 403:
+    if _http_error_status(exc) == 403 and not _is_quota_or_rate_limit_error(exc):
         raise UserInputError(
             f"{needs} requires Gmail read access, but this server's Gmail "
-            "grant appears to be send-only (gmail.send). Either pass the "
-            "fields explicitly so no fetch is needed ('to', 'in_reply_to', "
-            "'references'), or compose the message as a draft where mail can "
-            "be read (draft_gmail_message) and send it here with "
-            "send_gmail_message(draft_id=...)."
+            f"grant appears to be send-only (gmail.send). {remedy}"
         ) from exc
     raise exc
 
@@ -3413,7 +3469,7 @@ async def send_gmail_message(
     attachments: Annotated[
         Optional[DictList],
         Field(
-            description='Optional list of attachments. Each can have: "drive_file_id" (attach a Drive file by ID — the option to use for anything already in Drive, and the only one that works in remote/streamable-http mode), OR "content" (standard base64, not urlsafe) + "filename", OR "url" (fetch from a PUBLIC URL — do NOT pass a link minted by get_drive_file_download_url or get_gmail_attachment_content; those point back at this server and are rejected), OR "path" (local file path, auto-encodes; stdio transport only — unavailable in remote mode). Optional "mime_type". Optional "content_id" (string) makes the attachment inline-rendered: it lands in a multipart/related part with `Content-ID: <content_id>` and `Content-Disposition: inline`, and the HTML body can reference it via `<img src="cid:<content_id>">` (RFC 2392). Without `content_id` the attachment is a regular multipart/mixed attachment. Example: [{"drive_file_id": "1AbC...", "filename": "report.pdf"}]',
+            description='Optional list of attachments. Each can have: "drive_file_id" (attach a Drive file by ID — the option to use for anything already in Drive that this server can read), OR "content" (standard base64, not urlsafe) + "filename", OR "url" (fetch from a PUBLIC URL — do NOT pass a link minted by get_drive_file_download_url or get_gmail_attachment_content; those point back at this server and are rejected), OR "path" (local file path, auto-encodes; stdio transport only — unavailable in remote mode). Optional "mime_type". Optional "content_id" (string) makes the attachment inline-rendered: it lands in a multipart/related part with `Content-ID: <content_id>` and `Content-Disposition: inline`, and the HTML body can reference it via `<img src="cid:<content_id>">` (RFC 2392). Without `content_id` the attachment is a regular multipart/mixed attachment. Example: [{"drive_file_id": "1AbC...", "filename": "report.pdf"}]',
         ),
     ] = None,
     include_signature: Annotated[
@@ -3492,7 +3548,7 @@ async def send_gmail_message(
               - 'content' (required): Standard base64-encoded file content (not urlsafe)
               - 'filename' (required): Name of the file
               - 'mime_type' (optional): MIME type (defaults to 'application/octet-stream')
-            Option 3 - Google Drive file (works remotely; the server reads Drive on your behalf):
+            Option 3 - Google Drive file (works remotely; the server reads it with its own Drive access):
               - 'drive_file_id' (required): ID of a Drive file to attach
               - 'as_link' (optional, default false): if true, the file's share link is added to
                 the message body instead of attaching the bytes; if false/omitted, the server
@@ -3753,7 +3809,9 @@ async def send_gmail_message(
             )
         except HttpError as exc:
             _raise_if_read_scope_missing(
-                exc, "Forwarding (reading the original message via forward_message_id)"
+                exc,
+                "Forwarding (reading the original message via forward_message_id)",
+                _READ_SCOPE_REMEDY_FORWARD,
             )
 
     if subject is None or body is None:
@@ -4166,7 +4224,7 @@ async def draft_gmail_message(
     attachments: Annotated[
         Optional[DictList],
         Field(
-            description="Optional list of attachments. Each can have: 'drive_file_id' (attach a Drive file by ID — the option to use for anything already in Drive, and the only one that works in remote/streamable-http mode), OR 'content' (standard base64, not urlsafe) + 'filename', OR 'url' (fetch from a PUBLIC URL — do NOT pass a link minted by get_drive_file_download_url or get_gmail_attachment_content; those point back at this server and are rejected), OR 'path' (local file path, auto-encodes; stdio transport only — unavailable in remote mode). Optional 'mime_type'. Optional 'content_id' (string) makes the attachment inline-rendered: it lands in a multipart/related part with `Content-ID: <content_id>` and `Content-Disposition: inline`, and the HTML body can reference it via `<img src=\"cid:<content_id>\">` (RFC 2392). Without `content_id` the attachment is a regular multipart/mixed attachment.",
+            description="Optional list of attachments. Each can have: 'drive_file_id' (attach a Drive file by ID — the option to use for anything already in Drive that this server can read), OR 'content' (standard base64, not urlsafe) + 'filename', OR 'url' (fetch from a PUBLIC URL — do NOT pass a link minted by get_drive_file_download_url or get_gmail_attachment_content; those point back at this server and are rejected), OR 'path' (local file path, auto-encodes; stdio transport only — unavailable in remote mode). Optional 'mime_type'. Optional 'content_id' (string) makes the attachment inline-rendered: it lands in a multipart/related part with `Content-ID: <content_id>` and `Content-Disposition: inline`, and the HTML body can reference it via `<img src=\"cid:<content_id>\">` (RFC 2392). Without `content_id` the attachment is a regular multipart/mixed attachment.",
         ),
     ] = None,
     include_signature: Annotated[
@@ -4280,7 +4338,7 @@ async def draft_gmail_message(
               - 'content' (required): Standard base64-encoded file content (not urlsafe)
               - 'filename' (required): Name of the file
               - 'mime_type' (optional): MIME type (defaults to 'application/octet-stream')
-            Option 3 - Google Drive file (works remotely; the server reads Drive on your behalf):
+            Option 3 - Google Drive file (works remotely; the server reads it with its own Drive access):
               - 'drive_file_id' (required): ID of a Drive file to attach
               - 'as_link' (optional, default false): if true, the file's share link is added to
                 the message body instead of attaching the bytes; if false/omitted, the server
