@@ -648,6 +648,8 @@ def _grid_range_to_a1(grid_range: dict, sheet_titles: dict[int, str]) -> str:
     Falls back to the sheet ID if the title is unknown.
     """
     sheet_id = grid_range.get("sheetId")
+    if sheet_id is None and 0 in sheet_titles:
+        sheet_id = 0
     sheet_title = sheet_titles.get(sheet_id, f"Sheet {sheet_id}")
 
     start_row = grid_range.get("startRowIndex")

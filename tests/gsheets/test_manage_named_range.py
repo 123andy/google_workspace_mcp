@@ -129,6 +129,34 @@ async def test_list_named_ranges_with_data():
     assert "nr_2" in result
 
 
+@pytest.mark.asyncio
+async def test_list_named_ranges_omitted_sheet_id_defaults_to_zero():
+    named_ranges = [
+        {
+            "namedRangeId": "nr_zero",
+            "name": "FirstSheetData",
+            "range": {
+                # sheetId is omitted by Google Sheets API protobuf when 0
+                "startRowIndex": 0,
+                "endRowIndex": 5,
+                "startColumnIndex": 0,
+                "endColumnIndex": 2,
+            },
+        },
+    ]
+    service = _create_mock_service(named_ranges=named_ranges)
+
+    result = await _unwrap(sheets_tools.manage_named_range)(
+        service=service,
+        user_google_email="user@example.com",
+        spreadsheet_id="sheet123",
+        action="list",
+    )
+
+    assert "FirstSheetData" in result
+    assert "Sheet1!A1:B5" in result
+
+
 # ===========================================================================
 # Action: Create
 # ===========================================================================
