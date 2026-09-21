@@ -1301,7 +1301,19 @@ async def _fetch_draft_raw(service, draft_id: str) -> tuple[bytes, Dict[str, Any
                     "the body (and any attachments you want kept) along with the "
                     "addressing to rebuild the draft."
                 )
-            ensure_within_file_size_limit(size_estimate, file_id=draft_id, kind="draft")
+            try:
+                ensure_within_file_size_limit(
+                    size_estimate, file_id=draft_id, kind="draft"
+                )
+            except FileTooLargeError as exc:
+                # Same conversion the forward-attachment path makes: a configured
+                # cap rejecting the input is a caller-correctable condition, not
+                # an unexpected failure, and must not be retried as one.
+                raise UserInputError(
+                    f"{exc} Nothing was written. To change this draft anyway, "
+                    "re-pass the body (and any attachments you want kept) along "
+                    "with the addressing to rebuild it."
+                ) from exc
 
         draft = await asyncio.to_thread(
             service.users()
@@ -3267,11 +3279,26 @@ async def send_gmail_message(
             )
         except HttpError as exc:
             status = _http_error_status(exc)
-            if status in (400, 404):
+            if status == 404:
                 raise UserInputError(
                     f"Draft '{draft_id}' was not found — it may have already been "
                     "sent or deleted, or its ID rotated after being discarded and "
                     "recreated in the Gmail UI. " + _RECOVER_DRAFT_ID
+                ) from exc
+            if status == 400:
+                # Gmail uses 400 for two unrelated things: a malformed Draft ID,
+                # and a draft that EXISTS but cannot be sent (e.g. "Recipient
+                # address required" — drafts may be saved without recipients).
+                # Claiming "not found" for the second sends the caller to
+                # re-list a draft that is right there, find it, and retry
+                # forever. Do not guess which it is: report Google's own reason
+                # and give the remedy for each.
+                raise UserInputError(
+                    f"Gmail rejected sending draft '{draft_id}'. Google reported: "
+                    f"{exc}. If the draft is missing something it needs to be "
+                    "sent — a recipient, for instance — fix it with "
+                    "draft_gmail_message(action='update') and send again. If the "
+                    "Draft ID itself is malformed or stale: " + _RECOVER_DRAFT_ID
                 ) from exc
             if status == 403:
                 # Gmail overloads 403: authorization, quota, rate limit and

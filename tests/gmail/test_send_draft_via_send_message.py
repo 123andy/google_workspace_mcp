@@ -86,13 +86,27 @@ class TestSendDraft:
         assert "search_gmail_messages" not in str(exc.value)
         assert "in:drafts" not in str(exc.value)
 
-    async def test_invalid_id_also_actionable(self):
-        """Gmail answers a malformed/stale draft id with 400 — same guidance."""
+    async def test_a_400_is_not_reported_as_a_missing_draft(self):
+        """Gmail answers 400 for two unrelated things: a malformed Draft ID, and
+        a draft that EXISTS but cannot be sent. Claiming "not found" for the
+        second sends the caller to re-list a draft that is right there, find
+        it, and retry forever — so the message must not assert it is missing,
+        must carry Google's reason, and must offer both remedies."""
         service = Mock()
-        service.users().drafts().send().execute.side_effect = _http_error(400)
+        service.users().drafts().send().execute.side_effect = _http_error(
+            400,
+            b'{"error": {"code": 400, "message": "Recipient address required", '
+            b'"errors": [{"reason": "invalidArgument"}]}}',
+        )
 
-        with pytest.raises(UserInputError, match="not found"):
-            await _send(service, draft_id="not-a-draft-id")
+        with pytest.raises(UserInputError, match="Gmail rejected sending") as exc:
+            await _send(service, draft_id="r-no-recipient")
+
+        message = str(exc.value)
+        assert "was not found" not in message
+        assert "Recipient address required" in message
+        assert "action='update'" in message  # remedy: the draft is unsendable
+        assert "action='list'" in message  # remedy: the ID itself is bad
 
     async def test_missing_compose_scope_becomes_reauth_guidance(self):
         """gmail.compose is deliberately NOT declared at the tool boundary (it

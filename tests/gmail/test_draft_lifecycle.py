@@ -957,8 +957,6 @@ class TestAddressingOnlyUpdatePatchesInPlace:
     async def test_oversized_draft_is_refused_before_the_raw_fetch(self, monkeypatch):
         """Fail closed. Falling back to the rebuild path would silently discard
         the body and attachments this path exists to protect."""
-        from core.file_limits import FileTooLargeError
-
         monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", "1024")
         service = _patch_service()
         service.users().drafts().get().execute.side_effect = [
@@ -967,8 +965,12 @@ class TestAddressingOnlyUpdatePatchesInPlace:
         ]
         service.users().drafts().get.reset_mock()
 
-        with pytest.raises(FileTooLargeError):
+        # A configured cap rejecting the input is caller-correctable, so it is a
+        # UserInputError (as on the forward-attachment path), and it says how to
+        # proceed instead of surfacing as an unexpected failure.
+        with pytest.raises(UserInputError, match="Nothing was written") as excinfo:
             await _call(service, action="update", draft_id="r-1", cc="new@example.com")
+        assert "attachments" in str(excinfo.value)
 
         # Refused on the cheap probe; the raw fetch never happened.
         real_gets = [c for c in service.users().drafts().get.call_args_list if c.kwargs]
