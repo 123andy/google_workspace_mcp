@@ -648,6 +648,8 @@ def _grid_range_to_a1(grid_range: dict, sheet_titles: dict[int, str]) -> str:
     Falls back to the sheet ID if the title is unknown.
     """
     sheet_id = grid_range.get("sheetId")
+    if sheet_id is None and 0 in sheet_titles:
+        sheet_id = 0
     sheet_title = sheet_titles.get(sheet_id, f"Sheet {sheet_id}")
 
     start_row = grid_range.get("startRowIndex")
@@ -670,8 +672,14 @@ def _grid_range_to_a1(grid_range: dict, sheet_titles: dict[int, str]) -> str:
     end_label = f"{col_label(end_col - 1 if end_col is not None else None)}{row_label(end_row - 1 if end_row is not None else None)}"
 
     if start_label and end_label:
+        # Collapse to a single label only for a bounded single cell (both a
+        # column and a row). Column-only (e.g. "A") or row-only (e.g. "1")
+        # ranges must keep the "start:end" form to stay valid A1 (A:A, 1:1).
+        is_single_cell = start_col is not None and start_row is not None
         range_ref = (
-            start_label if start_label == end_label else f"{start_label}:{end_label}"
+            start_label
+            if start_label == end_label and is_single_cell
+            else f"{start_label}:{end_label}"
         )
     elif start_label:
         range_ref = start_label
@@ -1227,3 +1235,60 @@ async def _fetch_grid_metadata(
         )
 
     return hyperlink_section, notes_section
+
+
+def _find_named_range(
+    named_ranges: List[dict],
+    target_id: Optional[str] = None,
+    target_name: Optional[str] = None,
+) -> Optional[dict]:
+    """Find a named range in a list of named ranges by ID or name.
+
+    Matches by target_id first if provided, then by target_name (exact match first,
+    then case-insensitive match).
+    """
+    if target_id:
+        target_id_str = str(target_id).strip()
+        for nr in named_ranges:
+            if nr.get("namedRangeId") == target_id_str:
+                return nr
+
+    if target_name:
+        name_clean = target_name.strip()
+        name_lower = name_clean.lower()
+        # Exact match
+        for nr in named_ranges:
+            if nr.get("name") == name_clean:
+                return nr
+        # Case-insensitive match fallback
+        for nr in named_ranges:
+            if (nr.get("name") or "").strip().lower() == name_lower:
+                return nr
+
+    return None
+
+
+def _format_named_ranges_list(
+    named_ranges: List[dict],
+    sheet_titles: dict[int, str],
+    spreadsheet_id: str,
+    user_google_email: str,
+) -> str:
+    """Format a list of named ranges into a human-readable markdown table."""
+    if not named_ranges:
+        return f"No named ranges found in spreadsheet '{spreadsheet_id}' for {user_google_email}."
+
+    header = (
+        f"Found {len(named_ranges)} named range(s) in spreadsheet '{spreadsheet_id}' for {user_google_email}:\n\n"
+        "| Name | Range | Named Range ID |\n"
+        "| :--- | :--- | :--- |\n"
+    )
+    rows = []
+    for nr in named_ranges:
+        nr_name = nr.get("name", "(unnamed)")
+        nr_id = nr.get("namedRangeId", "(unknown)")
+        grid_range = nr.get("range", {})
+        a1_repr = _grid_range_to_a1(grid_range, sheet_titles)
+        rows.append(f"| {nr_name} | {a1_repr} | {nr_id} |")
+
+    return header + "\n".join(rows)
