@@ -991,12 +991,9 @@ async def _fetch_thread_reply_context(
         request = service.users().threads().get(**request_kwargs)
         thread = await asyncio.to_thread(request.execute)
     except Exception as e:
-        # A 400/404 is not a transient failure: Gmail is saying the thread_id
-        # itself is wrong. Falling through would let draft_gmail_message create
-        # a standalone draft with no recipient or subject and still report
-        # success, because threadId is only attached once reply headers could
-        # be derived. The usual cause is the token from a Gmail web URL
-        # (mail.google.com/.../#inbox/FMfcg...), which is not an API thread ID.
+        # 400/404 means the thread_id is wrong, not a transient failure. Falling
+        # through attaches no threadId, silently creating a standalone draft (no
+        # recipient or subject) that still reports success.
         if _http_error_status(e) in (400, 404):
             raise UserInputError(
                 f"Thread '{thread_id}' was not found, or is not a valid Gmail API "
