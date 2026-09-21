@@ -7,6 +7,7 @@ MCP tools for reading, writing, formatting, and managing Google Sheets. All tool
 - Read & Write: read_sheet_values, modify_sheet_values
 - Create: create_spreadsheet, create_sheet, move_sheet_rows
 - Formatting: format_sheet_range, manage_conditional_formatting
+- Named Ranges: manage_named_range
 - Comments: list_spreadsheet_comments, manage_spreadsheet_comment
 - Tips
 
@@ -137,6 +138,24 @@ Add, update, or delete conditional formatting rules.
 | rule_index | integer | for update/delete | | 0-based index of the rule |
 | gradient_points | array or string | no | | List of gradient point dicts for color-scale rules. Overrides boolean rule parameters |
 | sheet_name | string | no | first sheet | Sheet name for locating the rule (used by update/delete) |
+
+---
+
+## Named Ranges
+
+### manage_named_range
+List, create, update, or delete named ranges in a spreadsheet.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes | | |
+| spreadsheet_id | string | yes | | Spreadsheet ID or URL |
+| action | string | yes | | `list`, `create`, `update`, or `delete` |
+| name | string | for create | | Name of the named range (required for `create`; optional identifier for `update`/`delete`) |
+| range_name | string | for create | | Target cell or range in A1 notation, e.g. `Sheet1!A1:D10`, `A1:B5` (required for `create`) |
+| named_range_id | string | no | | ID of the named range (optional identifier for `update`/`delete`) |
+| new_name | string | no | | New name for the named range (action `update`) |
+| new_range | string | no | | New A1-style range for the named range (action `update`) |
 
 ---
 
