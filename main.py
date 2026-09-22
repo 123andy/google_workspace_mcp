@@ -597,11 +597,6 @@ def main():
         else:
             args.transport = "stdio"
 
-    # Set the transport before tools are imported (further down in main), so
-    # anything evaluated at tool-decoration time sees the real transport, as
-    # fastmcp_server.py already does.
-    set_transport_mode(args.transport)
-
     _env_http_port = os.getenv("WORKSPACE_MCP_HTTP_PORT", "").strip()
     http_port = None
     if _env_http_port:
@@ -920,6 +915,9 @@ def main():
             fatal(ui, "GCS credential store verification failed", str(e))
 
     try:
+        # Set transport mode for OAuth callback handling
+        set_transport_mode(args.transport)
+
         # Configure auth initialization for FastMCP lifecycle events
         if args.transport == "streamable-http":
             configure_server_for_http()

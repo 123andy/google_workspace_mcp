@@ -173,22 +173,17 @@ def local_file_access_enabled() -> bool:
     """
     if is_stateless_mode():
         return False
-    # strip(): a stray space or newline around the value (YAML, .env) must not
-    # leave local files enabled; this setting fails closed.
+    # Stray whitespace from YAML or .env files must not leave local files enabled.
     return os.environ.get(_DISABLE_LOCAL_FILES_ENV, "").strip().lower() != "true"
 
 
 def hide_local_file_args(*names: str):
     """Tool decorator: drop server-side path parameters when local files are off.
 
-    FastMCP builds a tool's input schema from ``inspect.signature``, which
-    honours ``__signature__``; ``require_google_service`` hides ``service`` (and
-    ``user_google_email`` under OAuth 2.1) the same way. Apply this directly
-    under ``@server.tool`` so the rewritten signature is what FastMCP sees.
-    A hidden parameter is then rejected by FastMCP's argument validation before
-    the tool runs, so a client with a cached schema cannot reach it. No-op when
-    local file access is enabled. The names are checked against the signature
-    either way, so a stale name fails at import rather than silently.
+    Rewrites ``__signature__``, as ``require_google_service`` does, so apply it
+    directly under ``@server.tool``. FastMCP then omits the parameters from the
+    schema and rejects them if a client with a cached schema sends them anyway.
+    Names are checked either way, so a stale one fails at import.
     """
 
     def decorator(func):
