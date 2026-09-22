@@ -170,7 +170,9 @@ def local_file_access_enabled() -> bool:
     """
     if is_stateless_mode():
         return False
-    return os.environ.get(_DISABLE_LOCAL_FILES_ENV, "").lower() != "true"
+    # strip(): a stray space or newline around the value (YAML, .env) must not
+    # leave local files enabled; this setting fails closed.
+    return os.environ.get(_DISABLE_LOCAL_FILES_ENV, "").strip().lower() != "true"
 
 
 def hide_local_file_args(*names: str):

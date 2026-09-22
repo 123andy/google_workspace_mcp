@@ -89,6 +89,20 @@ class TestLocalFileAccessSetting:
         with patch("core.utils.is_stateless_mode", return_value=False):
             assert not local_file_access_enabled()
 
+    @pytest.mark.parametrize("value", [" true ", "TRUE", "true\n"])
+    def test_disabled_by_untidy_true(self, value, monkeypatch):
+        """A stray space or newline (YAML, .env) must not silently re-enable
+        local files: the setting fails closed."""
+        monkeypatch.setenv("WORKSPACE_MCP_DISABLE_LOCAL_FILES", value)
+        with patch("core.utils.is_stateless_mode", return_value=False):
+            assert not local_file_access_enabled()
+
+    @pytest.mark.parametrize("value", ["false", ""])
+    def test_enabled_by_non_true(self, value, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_MCP_DISABLE_LOCAL_FILES", value)
+        with patch("core.utils.is_stateless_mode", return_value=False):
+            assert local_file_access_enabled()
+
     def test_disabled_by_stateless_mode(self, monkeypatch):
         monkeypatch.delenv("WORKSPACE_MCP_DISABLE_LOCAL_FILES", raising=False)
         with patch("core.utils.is_stateless_mode", return_value=True):
