@@ -155,6 +155,7 @@ For parameters: [references/docs.md](references/docs.md)
 | Create spreadsheet | `create_spreadsheet` |
 | Create sheet (tab) | `create_sheet` |
 | Move rows between sheets | `move_sheet_rows` |
+| Manage named ranges | `manage_named_range` |
 | List spreadsheets | `list_spreadsheets` |
 | Comments | `manage_spreadsheet_comment` / `list_spreadsheet_comments` |
 
@@ -233,18 +234,17 @@ For parameters: [references/chat.md](references/chat.md)
 
 | Task | Tool |
 |------|------|
-| List projects | `list_script_projects` |
-| Get project | `get_script_project` |
-| Create project | `create_script_project` |
-| Delete project | `delete_script_project` |
-| Get file content | `get_script_content` |
-| Update file content | `update_script_content` |
+| Projects/files (list/get) | `get_script_project` (`action`) |
+| Projects (create/delete) | `manage_script_project` (`action`) |
+| File content (update) | `manage_script_content` (`action="update"`) |
 | Run function | `run_script_function` |
 | Generate trigger code | `generate_trigger_code` |
-| Manage deployments | `manage_deployment` / `list_deployments` |
-| Versions | `create_version` / `get_version` / `list_versions` |
-| Execution metrics | `get_script_metrics` |
-| Process history | `list_script_processes` |
+| Deployments (list) | `list_script_deployments` |
+| Deployments (create/update/delete) | `manage_deployment` (`action`) |
+| Versions (list/get) | `get_script_version` (`action`) |
+| Versions (create) | `manage_script_version` (`action="create"`) |
+| Execution metrics / process history | `get_script_activity` (`action="metrics"` / `"processes"`) |
+| Current user's triggers (list/delete) | `manage_script_trigger` (`action`) |
 
 For parameters: [references/apps-script.md](references/apps-script.md)
 

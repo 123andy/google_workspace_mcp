@@ -54,6 +54,8 @@ from auth.scopes import (
     SCRIPT_DEPLOYMENTS_READONLY_SCOPE,
     SCRIPT_PROCESSES_READONLY_SCOPE,
     SCRIPT_METRICS_SCOPE,
+    SCRIPT_EXTERNAL_REQUEST_SCOPE,
+    SCRIPT_SCRIPTAPP_SCOPE,
 )
 
 logger = logging.getLogger(__name__)
@@ -136,7 +138,9 @@ SERVICE_PERMISSION_LEVELS: Dict[str, List[Tuple[str, List[str]]]] = {
                 SCRIPT_DEPLOYMENTS_SCOPE,
                 SCRIPT_PROCESSES_READONLY_SCOPE,
                 SCRIPT_METRICS_SCOPE,
-                DRIVE_FILE_SCOPE,
+                SCRIPT_EXTERNAL_REQUEST_SCOPE,
+                SCRIPT_SCRIPTAPP_SCOPE,
+                DRIVE_SCOPE,
             ],
         ),
     ],
