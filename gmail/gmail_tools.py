@@ -58,6 +58,7 @@ from core.config import (
 )
 from core.http_utils import ssrf_safe_stream
 from core.utils import (
+    local_file_access_enabled,
     GOOGLE_API_WRITE_RETRIES,
     handle_http_errors,
     validate_file_path,
@@ -1990,8 +1991,10 @@ async def _resolve_drive_attachments(
       ``get_media``; native Docs/Sheets/Slides are exported to PDF) and attaches it as
       binary. With ``as_link: true`` the file is **not** attached — its share link is
       returned to be appended to the body instead.
-    * ``path`` (local file): rejected in remote (streamable-http) mode — it resolves on
-      the server, not the caller.
+    * ``path`` (local file): rejected when local file access is disabled on this
+      server (``WORKSPACE_MCP_DISABLE_LOCAL_FILES=true``, or stateless mode) — it
+      resolves on the server, not the caller. The same setting governs the Drive
+      tools' ``file_path`` (``core.utils.local_file_access_enabled``).
 
     Returns ``(resolved_attachments, link_lines)`` where ``link_lines`` are
     ``"name: url"`` strings for any ``as_link`` Drive references.
@@ -1999,7 +2002,7 @@ async def _resolve_drive_attachments(
     if not attachments:
         return attachments, []
 
-    remote = get_transport_mode() == "streamable-http"
+    local_files_ok = local_file_access_enabled()
     drive_service = None
     resolved: List[Dict[str, Any]] = []
     link_lines: List[Dict[str, str]] = []
@@ -2008,14 +2011,16 @@ async def _resolve_drive_attachments(
         drive_file_id = att.get("drive_file_id")
 
         if not drive_file_id:
-            if att.get("path") and remote:
+            if att.get("path") and not local_files_ok:
                 resolved.append(
                     _build_attachment_error_entry(
                         att,
                         ValueError(
-                            "Local file attachments ('path') are unavailable in remote "
-                            "(streamable-http) mode. Use 'drive_file_id' to attach a "
-                            "Drive file, 'content' (base64), or 'url'."
+                            "Local file attachments ('path') are unavailable: local "
+                            "file access is disabled on this server "
+                            "(WORKSPACE_MCP_DISABLE_LOCAL_FILES=true). Use "
+                            "'drive_file_id' to attach a Drive file, 'content' "
+                            "(base64), or 'url'."
                         ),
                     )
                 )
@@ -3469,7 +3474,7 @@ async def send_gmail_message(
     attachments: Annotated[
         Optional[DictList],
         Field(
-            description='Optional list of attachments. Each can have: "drive_file_id" (attach a Drive file by ID — the option to use for anything already in Drive that this server can read), OR "content" (standard base64, not urlsafe) + "filename", OR "url" (fetch from a PUBLIC URL — do NOT pass a link minted by get_drive_file_download_url or get_gmail_attachment_content; those point back at this server and are rejected), OR "path" (local file path, auto-encodes; stdio transport only — unavailable in remote mode). Optional "mime_type". Optional "content_id" (string) makes the attachment inline-rendered: it lands in a multipart/related part with `Content-ID: <content_id>` and `Content-Disposition: inline`, and the HTML body can reference it via `<img src="cid:<content_id>">` (RFC 2392). Without `content_id` the attachment is a regular multipart/mixed attachment. Example: [{"drive_file_id": "1AbC...", "filename": "report.pdf"}]',
+            description='Optional list of attachments. Each can have: "drive_file_id" (attach a Drive file by ID — the option to use for anything already in Drive that this server can read), OR "content" (standard base64, not urlsafe) + "filename", OR "url" (fetch from a PUBLIC URL — do NOT pass a link minted by get_drive_file_download_url or get_gmail_attachment_content; those point back at this server and are rejected), OR "path" (local file path, auto-encodes; only where the server can read local files — rejected when WORKSPACE_MCP_DISABLE_LOCAL_FILES=true). Optional "mime_type". Optional "content_id" (string) makes the attachment inline-rendered: it lands in a multipart/related part with `Content-ID: <content_id>` and `Content-Disposition: inline`, and the HTML body can reference it via `<img src="cid:<content_id>">` (RFC 2392). Without `content_id` the attachment is a regular multipart/mixed attachment. Example: [{"drive_file_id": "1AbC...", "filename": "report.pdf"}]',
         ),
     ] = None,
     include_signature: Annotated[
@@ -3540,7 +3545,7 @@ async def send_gmail_message(
         forward_message_id (Optional[str]): Gmail message ID to forward. When set, the tool forwards that message.
         include_forwarded_attachments (bool): Whether to carry over the original attachments when forwarding. Defaults to True.
         attachments (Optional[List[Dict[str, Any]]]): Optional list of attachments. Each dict can contain:
-            Option 1 - Local file path (auto-encodes; local/stdio mode only — rejected when the server runs remotely):
+            Option 1 - Local file path (auto-encodes; rejected when local file access is disabled on the server, WORKSPACE_MCP_DISABLE_LOCAL_FILES=true):
               - 'path' (required): File path to attach
               - 'filename' (optional): Override filename
               - 'mime_type' (optional): Override MIME type (auto-detected if not provided)
@@ -4224,7 +4229,7 @@ async def draft_gmail_message(
     attachments: Annotated[
         Optional[DictList],
         Field(
-            description="Optional list of attachments. Each can have: 'drive_file_id' (attach a Drive file by ID — the option to use for anything already in Drive that this server can read), OR 'content' (standard base64, not urlsafe) + 'filename', OR 'url' (fetch from a PUBLIC URL — do NOT pass a link minted by get_drive_file_download_url or get_gmail_attachment_content; those point back at this server and are rejected), OR 'path' (local file path, auto-encodes; stdio transport only — unavailable in remote mode). Optional 'mime_type'. Optional 'content_id' (string) makes the attachment inline-rendered: it lands in a multipart/related part with `Content-ID: <content_id>` and `Content-Disposition: inline`, and the HTML body can reference it via `<img src=\"cid:<content_id>\">` (RFC 2392). Without `content_id` the attachment is a regular multipart/mixed attachment.",
+            description="Optional list of attachments. Each can have: 'drive_file_id' (attach a Drive file by ID — the option to use for anything already in Drive that this server can read), OR 'content' (standard base64, not urlsafe) + 'filename', OR 'url' (fetch from a PUBLIC URL — do NOT pass a link minted by get_drive_file_download_url or get_gmail_attachment_content; those point back at this server and are rejected), OR 'path' (local file path, auto-encodes; only where the server can read local files — rejected when WORKSPACE_MCP_DISABLE_LOCAL_FILES=true). Optional 'mime_type'. Optional 'content_id' (string) makes the attachment inline-rendered: it lands in a multipart/related part with `Content-ID: <content_id>` and `Content-Disposition: inline`, and the HTML body can reference it via `<img src=\"cid:<content_id>\">` (RFC 2392). Without `content_id` the attachment is a regular multipart/mixed attachment.",
         ),
     ] = None,
     include_signature: Annotated[
@@ -4330,7 +4335,7 @@ async def draft_gmail_message(
         references (Optional[str]): Optional RFC Message-ID ancestry chain. Normally
             omit when thread_id is provided; the chain is derived automatically.
         attachments (List[Dict[str, Any]]): Optional list of attachments. Each dict can contain:
-            Option 1 - Local file path (auto-encodes; local/stdio mode only — rejected when the server runs remotely):
+            Option 1 - Local file path (auto-encodes; rejected when local file access is disabled on the server, WORKSPACE_MCP_DISABLE_LOCAL_FILES=true):
               - 'path' (required): File path to attach
               - 'filename' (optional): Override filename
               - 'mime_type' (optional): Override MIME type (auto-detected if not provided)
