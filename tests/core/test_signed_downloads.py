@@ -191,6 +191,133 @@ class TestStartupLog:
         assert caplog.records == []
 
 
+class TestStartupValidation:
+    """Flag on over streamable-http: refuse to start unless links can work. The
+    autouse fixture supplies a valid external URL and key; each test removes one."""
+
+    @pytest.fixture(autouse=True)
+    def flag_on(self, monkeypatch):
+        monkeypatch.setenv(sd.FLAG_ENV, "true")
+
+    def _no_key(self, monkeypatch):
+        from auth import oauth_config
+
+        monkeypatch.delenv("GOOGLE_OAUTH_CLIENT_SECRET")
+        monkeypatch.setattr(
+            oauth_config,
+            "get_oauth_config",
+            lambda: type("C", (), {"client_secret": None})(),
+        )
+        sd._signing_key.cache_clear()
+
+    def test_valid_logs_the_base_url_once(self, caplog):
+        with caplog.at_level(logging.INFO, logger=sd.__name__):
+            sd.validate_startup("streamable-http")
+        messages = [r.getMessage() for r in caplog.records]
+        assert messages == [
+            f"{sd.FLAG_ENV} is on: signed download links will use base URL "
+            "https://mcp.example.com; /attachments/signed/* must be publicly "
+            "reachable there."
+        ]
+
+    def test_missing_external_url_refuses(self, monkeypatch):
+        monkeypatch.delenv("WORKSPACE_EXTERNAL_URL")
+        with pytest.raises(ValueError) as exc:
+            sd.validate_startup("streamable-http")
+        assert str(exc.value) == (
+            f"{sd.FLAG_ENV}=true requires WORKSPACE_EXTERNAL_URL; set it to the "
+            "absolute http:// or https:// URL clients reach this server at "
+            "(e.g. https://mcp.example.com)."
+        )
+
+    @pytest.mark.parametrize("value", ["", "  "])
+    def test_empty_external_url_refuses(self, monkeypatch, value):
+        monkeypatch.setenv("WORKSPACE_EXTERNAL_URL", value)
+        with pytest.raises(ValueError, match="requires WORKSPACE_EXTERNAL_URL"):
+            sd.validate_startup("streamable-http")
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "mcp.example.com",
+            "/mcp",
+            "//mcp.example.com",
+            "ftp://mcp.example.com",
+            "https://",
+            " https://mcp.example.com",
+            "https://mcp.example.com ",
+        ],
+    )
+    def test_non_absolute_http_external_url_refuses(self, monkeypatch, value):
+        monkeypatch.setenv("WORKSPACE_EXTERNAL_URL", value)
+        with pytest.raises(ValueError) as exc:
+            sd.validate_startup("streamable-http")
+        assert str(exc.value) == (
+            f"Invalid WORKSPACE_EXTERNAL_URL={value!r} for {sd.FLAG_ENV}=true; "
+            "expected an absolute http:// or https:// URL "
+            "(e.g. https://mcp.example.com)."
+        )
+
+    @pytest.mark.parametrize(
+        "value", ["http://10.0.0.5:8000", "https://mcp.example.com/"]
+    )
+    def test_absolute_http_or_https_is_accepted(self, monkeypatch, value):
+        monkeypatch.setenv("WORKSPACE_EXTERNAL_URL", value)
+        sd.validate_startup("streamable-http")
+
+    def test_no_key_material_refuses(self, monkeypatch):
+        self._no_key(monkeypatch)
+        with pytest.raises(ValueError) as exc:
+            sd.validate_startup("streamable-http")
+        assert str(exc.value) == (
+            f"{sd.FLAG_ENV}=true requires signing key material; set "
+            "GOOGLE_OAUTH_CLIENT_SECRET or FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY."
+        )
+
+    def test_key_check_is_the_minting_key_function(self, monkeypatch):
+        """No parallel reimplementation: the check calls ``_signing_key``."""
+        calls = []
+
+        def fake_key():
+            calls.append(1)
+            raise RuntimeError("no key")
+
+        fake_key.cache_clear = lambda: None  # the autouse fixture clears it
+        monkeypatch.setattr(sd, "_signing_key", fake_key)
+        with pytest.raises(ValueError, match="signing key material"):
+            sd.validate_startup("streamable-http")
+        assert calls == [1]
+
+    def test_fastmcp_jwt_material_alone_is_enough(self, monkeypatch):
+        self._no_key(monkeypatch)
+        monkeypatch.setenv("FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY", "material")
+        sd.validate_startup("streamable-http")
+
+    def test_one_line_per_problem(self, monkeypatch):
+        monkeypatch.delenv("WORKSPACE_EXTERNAL_URL")
+        self._no_key(monkeypatch)
+        with pytest.raises(ValueError) as exc:
+            sd.validate_startup("streamable-http")
+        lines = str(exc.value).split("\n")
+        assert len(lines) == 2
+        assert "WORKSPACE_EXTERNAL_URL" in lines[0] and sd.FLAG_ENV in lines[0]
+        assert "GOOGLE_OAUTH_CLIENT_SECRET" in lines[1] and sd.FLAG_ENV in lines[1]
+
+    @pytest.mark.parametrize(
+        "flag, transport", [(None, "streamable-http"), ("true", "stdio")]
+    )
+    def test_flag_off_or_stdio_neither_checks_nor_logs(
+        self, monkeypatch, caplog, flag, transport
+    ):
+        if flag is None:
+            monkeypatch.delenv(sd.FLAG_ENV)
+        monkeypatch.delenv("WORKSPACE_EXTERNAL_URL")
+        self._no_key(monkeypatch)
+        with caplog.at_level(logging.DEBUG, logger=sd.__name__):
+            sd.validate_startup(transport)
+        assert caplog.records == []
+
+
 class TestToken:
     def test_round_trip_carries_ref_owner_and_names(self):
         url = _mint(
