@@ -10,9 +10,11 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+from auth.scopes import DRIVE_FILE_SCOPE
 from gdrive.drive_helpers import (
     folder_move_failed_note,
     folder_note,
+    place_created_file_in_folder,
     place_file_in_folder,
 )
 
@@ -152,3 +154,33 @@ def test_folder_move_failed_note_names_folder_and_reason():
 
 def test_folder_note_names_destination():
     assert folder_note("folder-abc") == " Placed in folder 'folder-abc'."
+
+
+def test_placement_still_requires_drive_file_scope():
+    """
+    Moving the Drive requirement off the create tools must not drop it.
+
+    create_doc and create_spreadsheet no longer declare drive.file, so this
+    helper is the only thing standing between a Sheets- or Docs-only credential
+    and arbitrary-folder placement. It authenticates Drive itself, which fails
+    closed: without drive.file the move raises and the file stays in root.
+    """
+    assert place_created_file_in_folder._required_google_scopes == [DRIVE_FILE_SCOPE]
+
+
+@pytest.mark.asyncio
+async def test_place_created_file_in_folder_delegates_to_the_move():
+    """The decorated wrapper adds authentication and nothing else."""
+    service = _drive_mock(parents=["root"])
+
+    with _patch_resolve("resolved-folder"):
+        resolved = await place_created_file_in_folder.__wrapped__(
+            service,
+            user_google_email="user@example.com",
+            file_id="file-1",
+            folder_id="folder-abc",
+            tool_name="create_doc",
+        )
+
+    assert resolved == "resolved-folder"
+    assert service.files().update.call_args.kwargs["addParents"] == "resolved-folder"
