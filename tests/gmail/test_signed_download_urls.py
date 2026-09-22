@@ -43,7 +43,7 @@ def _service(payload=b"bytes", filename="report.pdf"):
 
 @pytest.fixture
 def enabled(monkeypatch):
-    monkeypatch.setenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", "true")
+    monkeypatch.setenv("WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS", "true")
     monkeypatch.setattr(sd, "get_transport_mode", lambda: "streamable-http")
     monkeypatch.delenv("WORKSPACE_MCP_MAX_FILE_BYTES", raising=False)
 
@@ -99,12 +99,12 @@ async def test_stateless_fallback_is_loud_when_url_cannot_be_minted(
         )
     assert "downloaded successfully" not in result
     assert "NO download URL could be issued" in result
-    assert "Re-authenticate" in result
+    assert "could not recover usable credentials" in result
 
 
 @pytest.mark.asyncio
 async def test_stateless_wording_unchanged_when_feature_off(monkeypatch):
-    monkeypatch.delenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", raising=False)
+    monkeypatch.delenv("WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS", raising=False)
     monkeypatch.delenv("WORKSPACE_MCP_MAX_FILE_BYTES", raising=False)
     monkeypatch.setattr("auth.oauth_config.is_stateless_mode", lambda: True)
     result = await _unwrap(get_gmail_attachment_content)(
