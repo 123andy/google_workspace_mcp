@@ -32,6 +32,7 @@ from core.file_limits import (
 from core.utils import (
     GOOGLE_API_WRITE_RETRIES,
     IMAGE_MIME_TYPES,
+    hide_local_file_args,
     encode_image_content,
     OfficeXmlExtractionError,
     OfficeXmlTooLargeError,
@@ -1439,6 +1440,7 @@ async def _import_with_conversion(
         openWorldHint=True,
     ),
 )
+@hide_local_file_args("file_path")
 @handle_http_errors("import_to_google_doc", service_type="drive")
 @require_google_service("drive", "drive_file")
 async def import_to_google_doc(
@@ -1458,9 +1460,9 @@ async def import_to_google_doc(
 
     Google Drive automatically converts the source file to native Google Docs format,
     preserving formatting like headings, lists, bold, italic, etc.
-    Binary sources may be passed directly as base64_content. For batch operations,
-    prefer file_path for files on disk so callers do not need
-    to load full file contents into their context.
+    Binary sources may be passed directly as base64_content. On a local server a
+    file on disk can also be passed by path (preferred for batch operations, so
+    callers do not need to load full file contents into their context).
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -1518,6 +1520,7 @@ async def import_to_google_doc(
         openWorldHint=True,
     ),
 )
+@hide_local_file_args("file_path")
 @handle_http_errors("import_to_google_slides", service_type="drive")
 @require_google_service("drive", "drive_file")
 async def import_to_google_slides(
@@ -1536,9 +1539,9 @@ async def import_to_google_slides(
 
     Google Drive automatically converts the source presentation to native Google Slides format,
     preserving slides, layouts, text, and images.
-    Binary sources may be passed directly as base64_content. For batch operations,
-    prefer file_path for files on disk so callers do not need
-    to load full file contents into their context.
+    Binary sources may be passed directly as base64_content. On a local server a
+    file on disk can also be passed by path (preferred for batch operations, so
+    callers do not need to load full file contents into their context).
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -1589,6 +1592,7 @@ async def import_to_google_slides(
         openWorldHint=True,
     ),
 )
+@hide_local_file_args("file_path")
 @handle_http_errors("import_to_google_sheets", service_type="drive")
 @require_google_service("drive", "drive_file")
 async def import_to_google_sheets(
@@ -1608,9 +1612,9 @@ async def import_to_google_sheets(
 
     Google Drive automatically converts the source spreadsheet to native Google Sheets format,
     preserving rows, columns, sheets, and values.
-    Binary sources may be passed directly as base64_content. For batch operations,
-    prefer file_path for files on disk so callers do not need
-    to load full file contents into their context.
+    Binary sources may be passed directly as base64_content. On a local server a
+    file on disk can also be passed by path (preferred for batch operations, so
+    callers do not need to load full file contents into their context).
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -1942,6 +1946,7 @@ async def check_drive_file_public_access(
         openWorldHint=True,
     ),
 )
+@hide_local_file_args("file_path")
 @handle_http_errors("update_drive_file", is_read_only=False, service_type="drive")
 @require_google_service("drive", "drive_file")
 async def update_drive_file(
@@ -1973,8 +1978,9 @@ async def update_drive_file(
     """
     Updates metadata, properties, and/or content of a Google Drive file.
 
-    Providing one of ``content``, ``file_path``, or ``file_url`` replaces the file's
-    content in place, preserving the existing file ID, sharing, comments, and links.
+    Providing new content (inline as ``content``, fetched from ``file_url``, or on a
+    local server read from a file path) replaces the file's content in place,
+    preserving the existing file ID, sharing, comments, and links.
     For native Google Docs/Sheets/Slides the source is uploaded with its source MIME
     type so the Drive API applies the same format conversion as import_to_google_doc
     (markdown headings, tables, bold, etc.). For any other file (.md, .txt, .pdf, ...)
@@ -2016,7 +2022,7 @@ async def update_drive_file(
         source_format (Optional[str]): Source format hint for conversion
             (md, markdown, docx, txt, html, rtf, odt). Auto-detected when omitted, and
             ignored for non-Google files, which are uploaded without conversion.
-            Provide at most one of content/file_path/file_url.
+            Provide at most one content source.
         mode (str): How to apply the new content — 'replace' (default), 'append', or
             'prepend'. Append/prepend require 'content' and a UTF-8 text file such as
             .md or .txt; a newline is inserted at the seam if neither side has one.
@@ -2036,8 +2042,8 @@ async def update_drive_file(
         raise ValueError(f"mime_type cannot be set when mode='{mode}'.")
     if mode != "replace" and content is None:
         raise ValueError(
-            f"mode='{mode}' requires 'content' (the text to add). "
-            "'file_path' and 'file_url' are only supported with mode='replace'."
+            f"mode='{mode}' requires 'content' (the text to add); other content "
+            "sources are only supported with mode='replace'."
         )
 
     replacing_content = any(x is not None for x in (content, file_path, file_url))

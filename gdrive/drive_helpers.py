@@ -28,7 +28,7 @@ from core.http_utils import (
     redact_url as _redact_url,
     ssrf_safe_stream as _ssrf_safe_stream,
 )
-from core.utils import validate_file_path
+from core.utils import local_file_access_enabled, validate_file_path
 
 logger = logging.getLogger(__name__)
 
@@ -889,17 +889,19 @@ async def _resolve_import_media(
     Returns ``(media, source_mime_type, closeable)``; when the source is a remote URL,
     ``closeable`` is the download stream the caller must close after upload (else None).
     """
+    # Name file_path only where the tool schema advertises it.
+    path_source = "'file_path', " if local_file_access_enabled() else ""
     source_count = sum(
         1 for x in (content, file_path, file_url, base64_content) if x is not None
     )
     if source_count == 0:
         raise ValueError(
-            "You must provide one of: 'content', 'file_path', 'file_url', or "
+            f"You must provide one of: 'content', {path_source}'file_url', or "
             "'base64_content'."
         )
     if source_count > 1:
         raise ValueError(
-            "Provide only one of: 'content', 'file_path', 'file_url', or "
+            f"Provide only one of: 'content', {path_source}'file_url', or "
             "'base64_content'."
         )
     if base64_sha256 is not None and base64_content is None:
@@ -929,10 +931,13 @@ async def _resolve_import_media(
 
     if content is not None:
         if not _is_text_like_mime_type(source_mime_type):
+            binary_sources = (
+                "'file_path' or 'file_url'" if path_source else "'file_url'"
+            )
             raise ValueError(
                 f"[{tool_name}] 'content' is only valid for text-based source formats, "
                 f"but the source resolves to '{source_mime_type}' (a binary format). "
-                f"Provide a 'file_path' or 'file_url' for binary formats instead."
+                f"Provide {binary_sources} for binary formats instead."
             )
         file_data = content.encode("utf-8")
         logger.info(f"[{tool_name}] Using content: {len(file_data)} bytes")

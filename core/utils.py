@@ -11,6 +11,7 @@ import zipfile
 import ssl
 import asyncio
 import functools
+import inspect
 
 from pathlib import Path
 from typing import Annotated, Any, List, Optional
@@ -22,7 +23,12 @@ from fastmcp.exceptions import ToolError
 from googleapiclient.errors import HttpError
 from .api_enablement import get_api_enablement_message
 from auth.google_auth import GoogleAuthenticationError
-from auth.oauth_config import is_oauth21_enabled, is_external_oauth21_provider
+from auth.oauth_config import (
+    get_transport_mode,
+    is_external_oauth21_provider,
+    is_oauth21_enabled,
+    is_stateless_mode,
+)
 from .file_limits import get_max_office_xml_bytes
 
 logger = logging.getLogger(__name__)
@@ -153,6 +159,46 @@ that send ``'{"key":"val"}'`` instead of ``{"key": "val"}``.
 # Override via ALLOWED_FILE_DIRS env var (os.pathsep-separated paths).
 _ALLOWED_FILE_DIRS_ENV = "ALLOWED_FILE_DIRS"
 
+# Operators of hosted deployments, where the server cannot see the caller's
+# disk, set this to stop tools reading server-side paths. Transport alone is not
+# a reliable signal: streamable-http on localhost shares the caller's filesystem.
+_DISABLE_LOCAL_FILES_ENV = "WORKSPACE_MCP_DISABLE_LOCAL_FILES"
+
+
+def local_file_access_enabled() -> bool:
+    """Return whether tools may read files from the server's filesystem.
+
+    Disabled by ``WORKSPACE_MCP_DISABLE_LOCAL_FILES=true``, and implied by
+    stateless mode, which already denotes a diskless hosted deployment.
+    """
+    if is_stateless_mode():
+        return False
+    # Stray whitespace from YAML or .env files must not leave local files enabled.
+    return os.environ.get(_DISABLE_LOCAL_FILES_ENV, "").strip().lower() != "true"
+
+
+def hide_local_file_args(*names: str):
+    """Tool decorator: drop server-side path parameters when local files are off.
+
+    Rewrites ``__signature__``, as ``require_google_service`` does, so apply it
+    directly under ``@server.tool``. FastMCP then omits the parameters from the
+    schema and rejects them if a client with a cached schema sends them anyway.
+    Names are checked either way, so a stale one fails at import.
+    """
+
+    def decorator(func):
+        sig = inspect.signature(func)
+        missing = [name for name in names if name not in sig.parameters]
+        if missing:
+            raise ValueError(f"{func.__name__} has no parameter(s) {missing} to hide.")
+        if not local_file_access_enabled():
+            func.__signature__ = sig.replace(
+                parameters=[p for p in sig.parameters.values() if p.name not in names]
+            )
+        return func
+
+    return decorator
+
 
 def _get_allowed_file_dirs() -> list[Path]:
     """Return the list of directories from which local file access is permitted."""
@@ -192,13 +238,31 @@ def validate_file_path(file_path: str) -> Path:
         Path: The resolved, validated Path object.
 
     Raises:
+        UserInputError: If local file access is disabled on this server.
+        FileNotFoundError: If the path does not exist on the server.
         ValueError: If the path is outside allowed directories or targets
                     a sensitive location.
     """
+    if not local_file_access_enabled():
+        raise UserInputError(
+            "Local file access is disabled on this server: file paths resolve "
+            "on the server's filesystem, not the caller's. Provide the file by "
+            "URL or as inline content instead."
+        )
+
     resolved = Path(file_path).resolve()
 
     if not resolved.exists():
-        raise FileNotFoundError(f"Path does not exist: {resolved}")
+        # Over HTTP the server may be on another machine, where a caller-side
+        # path can never exist, so say so rather than imply a typo.
+        hint = (
+            " Paths resolve on the MCP server's filesystem; if the server runs "
+            "on a different machine than the client, provide the file by URL "
+            "or as inline content instead."
+            if get_transport_mode() == "streamable-http"
+            else ""
+        )
+        raise FileNotFoundError(f"Path does not exist: {resolved}.{hint}")
 
     # Block sensitive file patterns regardless of allowlist
     resolved_str = str(resolved)
