@@ -258,7 +258,7 @@ Optional per-download payload ceiling for container deployments: set `WORKSPACE_
 
 Office files (`.docx`, `.xlsx`, `.pptx`) are ZIP archives, so the ceiling above bounds only their compressed size. Text extraction separately applies `WORKSPACE_MCP_MAX_OFFICE_XML_BYTES` (default `26214400`, 25 MiB) as independent limits on expanded XML and extracted UTF-8 text. A file beyond either limit is reported as too large to extract. These limits bound input and output size, not process memory: the parsed XML tree measured roughly 14 to 30 times the XML size, so lower the value on small containers. `0` removes both limits; invalid or negative values fail server startup.
 
-Advanced OAuth 2.1 deployments affected by concurrent client token refreshes can tune FastMCP's early-refresh threshold and client-facing access-token lifetime, and deployments that want to bound how long per-login records stay in the OAuth proxy storage backend can shorten the client-facing refresh-token lifetime. See [`.env.oauth21`](.env.oauth21) for the bounded settings, recommended values, and security tradeoffs. The first two settings reduce how often the race occurs; they do not add a grace period to FastMCP's one-time-use refresh-token rotation.
+Advanced OAuth 2.1 deployments affected by concurrent client token refreshes can tune FastMCP's early-refresh threshold and client-facing access-token lifetime. See [`.env.oauth21`](.env.oauth21) for the bounded settings, recommended values, and security tradeoffs. These settings reduce how often the race occurs; they do not add a grace period to FastMCP's one-time-use refresh-token rotation.
 
 ## Security Best Practices
 
