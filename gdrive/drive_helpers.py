@@ -23,6 +23,7 @@ from urllib.request import url2pathname
 import httpx
 from googleapiclient.http import MediaIoBaseUpload
 
+from auth.service_decorator import require_google_service
 from core.http_utils import (
     redact_url as _redact_url,
     ssrf_safe_stream as _ssrf_safe_stream,
@@ -497,6 +498,97 @@ async def resolve_folder_id(
             f"Resolved ID '{resolved_id}' (from '{folder_id}') is not a folder; mimeType={mime_type}."
         )
     return resolved_id
+
+
+async def place_file_in_folder(
+    drive_service: Any,
+    file_id: str,
+    folder_id: str,
+    *,
+    tool_name: str = "place_file_in_folder",
+) -> str:
+    """
+    Move ``file_id`` into ``folder_id`` (ID or shortcut), removing its other parents.
+
+    The Docs and Sheets create endpoints accept no parent, so new files land in
+    My Drive root and must be re-parented afterwards. Returns the resolved folder ID.
+    """
+    resolved_folder_id = await resolve_folder_id(drive_service, folder_id)
+    existing = await asyncio.to_thread(
+        drive_service.files()
+        .get(fileId=file_id, fields="parents", supportsAllDrives=True)
+        .execute
+    )
+    # Skip the destination so a file already there is not both added and removed.
+    remove_parents = ",".join(
+        parent for parent in existing.get("parents", []) if parent != resolved_folder_id
+    )
+    await asyncio.to_thread(
+        drive_service.files()
+        .update(
+            fileId=file_id,
+            addParents=resolved_folder_id,
+            removeParents=remove_parents,
+            fields="id, parents",
+            supportsAllDrives=True,
+        )
+        .execute
+    )
+    logger.info(
+        f"[{tool_name}] Moved file {file_id} into folder {resolved_folder_id} "
+        f"(removed parents: '{remove_parents}')"
+    )
+    return resolved_folder_id
+
+
+@require_google_service("drive", "drive_file")
+async def place_created_file_in_folder(
+    service,
+    user_google_email: str,
+    file_id: str,
+    folder_id: str,
+    tool_name: str = "place_created_file_in_folder",
+) -> str:
+    """
+    Authenticate Drive on demand, then run ``place_file_in_folder``.
+
+    Kept off the calling tool's decorator so the ``folder_id="root"`` default
+    needs no Drive scope (and no full-Drive scope under domain-wide delegation).
+    """
+    return await place_file_in_folder(service, file_id, folder_id, tool_name=tool_name)
+
+
+async def move_new_file_to_folder(
+    user_google_email: str,
+    file_id: str,
+    folder_id: Optional[str],
+    tool_name: str,
+) -> str:
+    """
+    Move a just-created file into ``folder_id`` and return a note for the reply.
+
+    A failed move is reported, not raised: the file already exists in My Drive
+    root, so the caller still needs its ID.
+    """
+    if not folder_id or folder_id == "root":
+        return ""
+    try:
+        await place_created_file_in_folder(
+            user_google_email=user_google_email,
+            file_id=file_id,
+            folder_id=folder_id,
+            tool_name=tool_name,
+        )
+    except Exception as e:
+        logger.warning(
+            f"[{tool_name}] Created file {file_id} but could not move it into "
+            f"folder '{folder_id}': {e}"
+        )
+        return (
+            f" WARNING: left in My Drive root - could not move it into folder "
+            f"'{folder_id}': {e}"
+        )
+    return f" Placed in folder '{folder_id}'."
 
 
 DOWNLOAD_CHUNK_SIZE_BYTES = 256 * 1024  # 256 KB
