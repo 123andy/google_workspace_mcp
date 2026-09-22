@@ -637,6 +637,10 @@ def main():
 
     validate_streamable_http_auth(args.transport)
     signed_downloads.log_if_ignored(args.transport)
+    try:
+        signed_downloads.validate_startup(args.transport)
+    except ValueError as exc:
+        parser.error(str(exc))
     resolve_callback_port_for_transport(args.transport)
 
     # Set port and base URI once for reuse throughout the function
