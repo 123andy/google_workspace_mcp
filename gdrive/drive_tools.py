@@ -28,6 +28,7 @@ from mcp.types import (
 
 from auth.service_decorator import require_google_service
 from auth.oauth_config import is_stateless_mode
+from core import signed_downloads
 from core.attachment_storage import get_attachment_storage, get_attachment_url
 from core.file_limits import (
     FileTooLargeError,
@@ -467,7 +468,9 @@ async def get_drive_file_download_url(
     Downloads a Google Drive file and saves it to local disk.
 
     In stdio mode, returns the local file path for direct access.
-    In HTTP mode, returns a temporary download URL (valid for 1 hour).
+    In HTTP mode, returns a download URL: with signed download URLs enabled on the
+    server, a link that streams from Drive on demand and expires within ~15 minutes
+    (fetch it promptly); otherwise a server-stored copy valid for 1 hour.
     In stateless mode (no file storage), returns the file itself as an embedded
     resource, up to WORKSPACE_MCP_STATELESS_INLINE_MAX_BYTES (default 10 MiB,
     and never more than WORKSPACE_MCP_MAX_FILE_BYTES when that is set).
@@ -558,6 +561,32 @@ async def get_drive_file_download_url(
             if not output_filename.endswith(".pdf"):
                 output_filename = f"{Path(output_filename).stem}.pdf"
 
+    # Signed URL: the route streams the file from Drive at download time (exporting
+    # native files when "emt" is set), so nothing is downloaded or stored here.
+    ref = {"fid": file_id, **({"emt": export_mime_type} if export_mime_type else {})}
+    signed = signed_downloads.offer_url(
+        user_google_email,
+        source="drive",
+        ref=ref,
+        filename=output_filename,
+        mime_type=output_mime_type,
+    )
+    if signed:
+        url, ttl = signed
+        logger.info(
+            "[get_drive_file_download_url] Returning signed download URL (no download)"
+        )
+        return "\n".join(
+            [
+                "File ready — streamed on demand (no base64, nothing stored).",
+                f"File: {file_name}",
+                f"File ID: {file_id}",
+                f"MIME Type: {output_mime_type}",
+                *signed_downloads.url_lines(url, ttl, "file"),
+            ]
+        )
+    no_url = signed_downloads.enabled()
+
     # Stateless mode has no attachment storage to hand out a URL from, so the
     # file itself goes back as an embedded resource, up to inline_max_bytes.
     inline_max_bytes = get_stateless_inline_max_bytes() if is_stateless_mode() else None
@@ -600,6 +629,7 @@ async def get_drive_file_download_url(
                 f"MIME Type: {output_mime_type}",
                 "\nStateless mode: the file is attached to this result as an "
                 f"embedded resource ({output_filename}).",
+                *([signed_downloads.UNAVAILABLE_NOTE] if no_url else []),
             ]
         )
         if export_mime_type:
@@ -654,6 +684,8 @@ async def get_drive_file_download_url(
             download_url = get_attachment_url(result.file_id)
             result_lines.append(f"\n📎 Download URL: {download_url}")
             result_lines.append("\nThe file will expire after 1 hour.")
+            if no_url:
+                result_lines.append(signed_downloads.UNAVAILABLE_NOTE)
 
         if export_mime_type:
             result_lines.append(
