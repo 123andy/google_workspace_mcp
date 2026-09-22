@@ -379,3 +379,44 @@ def test_gmail_attach_logs_length_not_filename(caplog):
     assert SECRET not in info_text
     assert secret_name not in info_text
     assert file_path not in info_text
+
+
+def _resumable_session_ok():
+    response = Mock()
+    response.status = 200
+    response.get = Mock(return_value="https://upload.example/session")
+    return response, b""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool, kwargs",
+    [
+        ("create_drive_file", {"mime_type": "application/pdf"}),
+        ("import_to_google_doc", {"source_format": "docx"}),
+    ],
+)
+async def test_resumable_upload_url_logs_event_not_file_name(caplog, tool, kwargs):
+    """A file name is user content; the return_upload_url paths log the event at
+    INFO and the name only at DEBUG (via the invocation log)."""
+    import gdrive.drive_tools as drive_tools
+
+    service = Mock()
+    service.files().get().execute.return_value = {
+        "id": "root",
+        "mimeType": "application/vnd.google-apps.folder",
+    }
+    service._http.request.return_value = _resumable_session_ok()
+
+    with caplog.at_level(logging.DEBUG):
+        await _unwrap(getattr(drive_tools, tool))(
+            service=service,
+            user_google_email="user@example.com",
+            file_name=f"{SECRET}.bin",
+            return_upload_url=True,
+            **kwargs,
+        )
+
+    info_text = _info_text(caplog)
+    assert "Returned resumable upload URL" in info_text
+    assert SECRET not in info_text

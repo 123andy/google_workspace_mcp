@@ -8,6 +8,7 @@ import asyncio
 import base64
 import logging
 import io
+import json
 
 from typing import Optional, List, Dict, Any
 from tempfile import NamedTemporaryFile, SpooledTemporaryFile
@@ -91,6 +92,23 @@ CONTENT_UPDATE_MODES = ("replace", "append", "prepend")
 # Bytes held in memory per streamed download chunk.
 DOWNLOAD_CHUNK_SIZE = 8 * 1024 * 1024
 _CONTENT_UPDATE_LOCKS: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+
+
+def _native_replace_format_map(target_mime_type: str) -> Optional[Dict[str, str]]:
+    """Import allowlist for replacing a native file's content; None if not native.
+
+    Raises for a native Google type Drive cannot import content into.
+    """
+    format_map = IMPORT_FORMATS_BY_GOOGLE_MIME_TYPE.get(target_mime_type)
+    if format_map is None and target_mime_type.startswith(GOOGLE_APPS_MIME_PREFIX):
+        supported_targets = ", ".join(
+            mime for mime in IMPORT_FORMATS_BY_GOOGLE_MIME_TYPE
+        )
+        raise ValueError(
+            "Content replacement is not supported for this Google Apps type "
+            f"({target_mime_type}). Editable Google types: {supported_targets}."
+        )
+    return format_map
 
 
 def _get_content_update_lock(file_id: str) -> asyncio.Lock:
@@ -1000,6 +1018,74 @@ async def create_drive_folder(
     )
 
 
+_RESUMABLE_UPLOAD_BASE = "https://www.googleapis.com/upload/drive/v3/files"
+
+
+async def _initiate_resumable_upload_session(
+    service,
+    *,
+    upload_mime_type: str,
+    file_metadata: Optional[Dict[str, Any]] = None,
+    file_id: Optional[str] = None,
+) -> str:
+    """Open a Drive resumable upload session and return its pre-authorized URL.
+
+    ``file_id`` absent: POST creates a new file; present: PATCH replaces that
+    file's content. The caller PUTs the bytes to the returned URL with no
+    Authorization header, so the payload never passes through this server;
+    only this initiation call uses the user's authorized transport.
+    """
+    path = f"/{file_id}" if file_id else ""
+    url = f"{_RESUMABLE_UPLOAD_BASE}{path}?uploadType=resumable&supportsAllDrives=true"
+    # service._http is the discovery Resource's private handle on the user's
+    # AuthorizedHttp; the client library has no public call for a raw resumable
+    # initiation, so this depends on that attribute name.
+    response, content = await asyncio.to_thread(
+        service._http.request,
+        url,
+        method="PATCH" if file_id else "POST",
+        body=json.dumps(file_metadata or {}),
+        headers={
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Upload-Content-Type": upload_mime_type,
+        },
+    )
+    status = int(response.status)
+    if status not in (200, 201):
+        # An HttpError keeps Google's reason and gets handle_http_errors' formatting,
+        # log scrubbing and 401/403 re-auth guidance, like any other Drive call.
+        raise HttpError(response, content, uri=url)
+    upload_url = response.get("location")
+    if not upload_url:
+        raise Exception(
+            "Resumable upload session was created but Google returned no session URL."
+        )
+    return upload_url
+
+
+def _reject_sources_with_upload_url(verb: str, **sources: Any) -> None:
+    """Refuse return_upload_url alongside any inline or server-side source."""
+    given = [f"'{name}'" for name, value in sources.items() if value is not None]
+    if given:
+        raise ValueError(
+            f"return_upload_url {verb} via a resumable PUT; do not also pass "
+            f"{', '.join(given)}."
+        )
+
+
+def _resumable_upload_result(summary: str, upload_url: str, mime_type: str) -> str:
+    return (
+        f"{summary}\n\n"
+        f"Upload URL (no Authorization header required):\n{upload_url}\n\n"
+        "Send the bytes with a single PUT, e.g.:\n"
+        f"  curl -X PUT -H 'Content-Type: {mime_type}' --data-binary @<file> '{upload_url}'\n\n"
+        "The session takes one upload; an interrupted PUT can be resumed with "
+        "Content-Range until Google expires the session (about a week). The file "
+        "is created, or its content replaced, only when the upload completes, and "
+        "the final PUT's response body is the file's metadata (including its id)."
+    )
+
+
 @server.tool(
     title="Create Drive File",
     annotations=ToolAnnotations(
@@ -1022,12 +1108,15 @@ async def create_drive_file(
     base64_content: Optional[str] = None,
     content_mime_type: Optional[str] = None,
     base64_sha256: Optional[str] = None,
+    return_upload_url: bool = False,
 ) -> str:
     """
     Creates a new file in Google Drive, supporting creation within shared drives.
     Accepts direct text content, inline base64 bytes, or a fileUrl to fetch content from.
     This stores the supplied bytes without converting them to Google Docs, Sheets, or
     Slides. Use the matching import_to_google_* tool for Google-native conversion.
+    For large or binary files, or when this server is remote, set
+    return_upload_url=True and PUT the bytes straight to Google instead.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -1039,20 +1128,58 @@ async def create_drive_file(
         base64_content (Optional[str]): Standard base64-encoded file bytes.
         content_mime_type (Optional[str]): MIME type for base64_content uploads.
         base64_sha256 (Optional[str]): Expected SHA-256 of decoded base64_content. Recommended for binary payload integrity checks.
+        return_upload_url (bool): Return a Google resumable-upload session URL for a new file of mime_type instead of creating it from inline content; the caller PUTs the bytes there directly (no Authorization header). Not combinable with other content sources.
 
     Returns:
-        str: Confirmation message of the successful file creation with file link.
+        str: Confirmation message of the successful file creation with file link,
+            or the resumable upload URL.
     """
     logger.info(
         f"[create_drive_file] Invoked. Email: '{user_google_email}', "
         f"file_name_len={len(file_name) if file_name else 0}, Folder ID: {folder_id}, "
-        f"has_fileUrl={bool(fileUrl)}"
+        f"has_fileUrl={bool(fileUrl)}, return_upload_url={return_upload_url}"
     )
     logger.debug(f"[create_drive_file] File Name: {file_name}")
 
     mime_type = mime_type.strip().lower()
     if content_mime_type is not None:
         content_mime_type = content_mime_type.strip().lower()
+
+    if return_upload_url:
+        _reject_sources_with_upload_url(
+            "creates the file",
+            content=content,
+            fileUrl=fileUrl,
+            base64_content=base64_content,
+            content_mime_type=content_mime_type,
+            base64_sha256=base64_sha256,
+        )
+        if mime_type == FOLDER_MIME_TYPE:
+            raise ValueError("return_upload_url is not applicable to folders.")
+        if not mime_type or mime_type.startswith(GOOGLE_APPS_MIME_PREFIX):
+            raise ValueError(
+                "return_upload_url needs mime_type to be the MIME type of the bytes "
+                "to be uploaded; Google-native files cannot be created from uploaded "
+                "bytes with create_drive_file. Use import_to_google_doc, "
+                "import_to_google_sheets, or import_to_google_slides so Drive receives "
+                "separate source and target MIME types."
+            )
+        upload_url = await _initiate_resumable_upload_session(
+            service,
+            upload_mime_type=mime_type,
+            file_metadata={
+                "name": file_name,
+                "parents": [await resolve_folder_id(service, folder_id)],
+                "mimeType": mime_type,
+            },
+        )
+        logger.info("[create_drive_file] Returned resumable upload URL.")
+        return _resumable_upload_result(
+            f"Resumable upload session created for new file '{file_name}' "
+            f"(folder '{folder_id}', for {user_google_email}).",
+            upload_url,
+            mime_type,
+        )
 
     has_existing_content_source = content is not None or bool(fileUrl)
     if (
@@ -1365,6 +1492,7 @@ async def _import_with_conversion(
     base64_content: Optional[str],
     base64_sha256: Optional[str],
     inline_params: tuple[str, ...] = ("content", "base64_content"),
+    return_upload_url: bool = False,
 ) -> str:
     """
     Shared implementation for the import_to_google_* tools.
@@ -1395,6 +1523,47 @@ async def _import_with_conversion(
     # validate_file_path() refusal.
     if file_path is not None and not local_file_access_enabled():
         raise _file_path_disabled_error(inline_params)
+
+    if return_upload_url:
+        _reject_sources_with_upload_url(
+            "uploads the source",
+            content=content,
+            file_path=file_path,
+            file_url=file_url,
+            base64_content=base64_content,
+            base64_sha256=base64_sha256,
+        )
+        supported = ", ".join(ext.lstrip(".") for ext in format_map)
+        if not source_format:
+            raise ValueError(
+                "source_format is required with return_upload_url so the upload's "
+                f"Content-Type is known (one of: {supported})."
+            )
+        source_mime_type = format_map.get(f".{source_format.lower().lstrip('.')}")
+        if source_mime_type is None:
+            raise ValueError(
+                f"Unsupported source_format: '{source_format}'. Supported: {supported}."
+            )
+        doc_name = Path(file_name).stem if Path(file_name).suffix else file_name
+        # body.mimeType is the Google Apps target; the PUT carries the source type,
+        # so Drive converts exactly as it does for an inline import.
+        upload_url = await _initiate_resumable_upload_session(
+            service,
+            upload_mime_type=source_mime_type,
+            file_metadata={
+                "name": doc_name,
+                "parents": [await resolve_folder_id(service, folder_id)],
+                "mimeType": target_mime_type,
+            },
+        )
+        logger.info(f"[{tool_name}] Returned resumable upload URL.")
+        return _resumable_upload_result(
+            f"Resumable upload session created to import '{doc_name}' as {target_label} "
+            f"({source_mime_type} → {target_mime_type}, folder '{folder_id}', "
+            f"for {user_google_email}).",
+            upload_url,
+            source_mime_type,
+        )
 
     media, source_mime_type, remote_file_data = await _resolve_import_media(
         tool_name=tool_name,
@@ -1487,6 +1656,7 @@ async def import_to_google_doc(
     folder_id: str = "root",
     base64_content: Optional[str] = None,
     base64_sha256: Optional[str] = None,
+    return_upload_url: bool = False,
 ) -> str:
     """
     Imports a file (Markdown, DOCX, TXT, HTML, RTF, ODT) into Google Docs format with automatic conversion.
@@ -1508,9 +1678,10 @@ async def import_to_google_doc(
         folder_id (str): The ID of the parent folder. Defaults to 'root'.
         base64_content (Optional[str]): Standard base64-encoded bytes for a binary source such as DOCX or ODT.
         base64_sha256 (Optional[str]): Expected SHA-256 of decoded base64_content. Recommended for binary payload integrity checks.
+        return_upload_url (bool): Return a Google resumable-upload session URL instead of ingesting the source here; the caller PUTs the source bytes there directly (no Authorization header) and Drive converts them. Requires source_format; not combinable with other content sources.
 
     Returns:
-        str: Confirmation message with the new Google Doc link.
+        str: Confirmation message with the new Google Doc link, or the resumable upload URL.
 
     Examples:
         # Import a markdown file from disk (preferred for batch operations)
@@ -1524,6 +1695,9 @@ async def import_to_google_doc(
 
         # Import from URL
         import_to_google_doc(file_name="Remote Doc", file_url="https://example.com/doc.md")
+
+        # Get an upload URL and PUT a DOCX to it directly (hosted servers, large files)
+        import_to_google_doc(file_name="Report", source_format="docx", return_upload_url=True)
     """
     return await _import_with_conversion(
         service,
@@ -1541,6 +1715,7 @@ async def import_to_google_doc(
         folder_id=folder_id,
         base64_content=base64_content,
         base64_sha256=base64_sha256,
+        return_upload_url=return_upload_url,
     )
 
 
@@ -1566,6 +1741,7 @@ async def import_to_google_slides(
     folder_id: str = "root",
     base64_content: Optional[str] = None,
     base64_sha256: Optional[str] = None,
+    return_upload_url: bool = False,
 ) -> str:
     """
     Imports a presentation (PPTX, PPT, ODP) into Google Slides format with automatic conversion.
@@ -1586,9 +1762,10 @@ async def import_to_google_slides(
         folder_id (str): The ID of the parent folder. Defaults to 'root'.
         base64_content (Optional[str]): Standard base64-encoded bytes for a PPTX or ODP source.
         base64_sha256 (Optional[str]): Expected SHA-256 of decoded base64_content. Recommended for binary payload integrity checks.
+        return_upload_url (bool): Return a Google resumable-upload session URL instead of ingesting the source here; the caller PUTs the source bytes there directly (no Authorization header) and Drive converts them. Requires source_format; not combinable with other content sources.
 
     Returns:
-        str: Confirmation message with the new Google Slides link.
+        str: Confirmation message with the new Google Slides link, or the resumable upload URL.
 
     Examples:
         # Import a local PowerPoint file (preferred for batch operations)
@@ -1596,6 +1773,9 @@ async def import_to_google_slides(
 
         # Import from URL
         import_to_google_slides(file_name="Remote Deck", file_url="https://example.com/deck.pptx")
+
+        # Get an upload URL and PUT a PPTX to it directly (hosted servers, large files)
+        import_to_google_slides(file_name="Deck", source_format="pptx", return_upload_url=True)
     """
     return await _import_with_conversion(
         service,
@@ -1614,6 +1794,7 @@ async def import_to_google_slides(
         base64_content=base64_content,
         base64_sha256=base64_sha256,
         inline_params=("base64_content",),
+        return_upload_url=return_upload_url,
     )
 
 
@@ -1640,6 +1821,7 @@ async def import_to_google_sheets(
     folder_id: str = "root",
     base64_content: Optional[str] = None,
     base64_sha256: Optional[str] = None,
+    return_upload_url: bool = False,
 ) -> str:
     """
     Imports a spreadsheet (XLSX, XLS, ODS, CSV, TSV) into Google Sheets format with automatic conversion.
@@ -1661,9 +1843,10 @@ async def import_to_google_sheets(
         folder_id (str): The ID of the parent folder. Defaults to 'root'.
         base64_content (Optional[str]): Standard base64-encoded bytes for an XLSX, XLS, or ODS source.
         base64_sha256 (Optional[str]): Expected SHA-256 of decoded base64_content. Recommended for binary payload integrity checks.
+        return_upload_url (bool): Return a Google resumable-upload session URL instead of ingesting the source here; the caller PUTs the source bytes there directly (no Authorization header) and Drive converts them. Requires source_format; not combinable with other content sources.
 
     Returns:
-        str: Confirmation message with the new Google Sheets link.
+        str: Confirmation message with the new Google Sheets link, or the resumable upload URL.
 
     Examples:
         # Import a local Excel file (preferred for batch operations)
@@ -1674,6 +1857,9 @@ async def import_to_google_sheets(
 
         # Import from URL
         import_to_google_sheets(file_name="Remote Sheet", file_url="https://example.com/data.xlsx")
+
+        # Get an upload URL and PUT an XLSX to it directly (hosted servers, large files)
+        import_to_google_sheets(file_name="Budget", source_format="xlsx", return_upload_url=True)
     """
     return await _import_with_conversion(
         service,
@@ -1691,6 +1877,7 @@ async def import_to_google_sheets(
         folder_id=folder_id,
         base64_content=base64_content,
         base64_sha256=base64_sha256,
+        return_upload_url=return_upload_url,
     )
 
 
@@ -2008,6 +2195,7 @@ async def update_drive_file(
     file_url: Optional[str] = None,  # Remote URL to fetch content from
     source_format: Optional[str] = None,  # Format hint (md, docx, txt, html, rtf, odt)
     mode: str = "replace",  # replace | append | prepend
+    return_upload_url: bool = False,
 ) -> str:
     """
     Updates metadata, properties, and/or content of a Google Drive file.
@@ -2038,7 +2226,9 @@ async def update_drive_file(
         description (Optional[str]): New description for the file.
         mime_type (Optional[str]): New MIME type (note: changing type may require
             content upload). For a shortcut ID, this must accompany content and applies
-            to the resolved target.
+            to the resolved target. With return_upload_url it names the MIME type of
+            the bytes to be uploaded; on a native Google file (where it is required)
+            it names only that and leaves the file's type untouched.
         add_parents (Optional[str]): Comma-separated folder IDs to add as parents.
         remove_parents (Optional[str]): Comma-separated folder IDs to remove from parents.
         starred (Optional[bool]): Whether to star/unstar the file.
@@ -2061,9 +2251,14 @@ async def update_drive_file(
             .md or .txt; a newline is inserted at the seam if neither side has one.
             For native Google Docs use insert_doc_elements, modify_doc_text, or
             find_and_replace_doc, which edit in place instead of rewriting the file.
+        return_upload_url (bool): Return a Google resumable-upload session URL to
+            PUT the replacement bytes to directly (no Authorization header); any
+            metadata changes are applied once the session is open. Only with
+            mode='replace'; not combinable with content/file_path/file_url.
 
     Returns:
-        str: Confirmation message with details of the updates applied.
+        str: Confirmation message with details of the updates applied, or the
+            resumable upload URL.
     """
     logger.info(f"[update_drive_file] Updating file {file_id} for {user_google_email}")
 
@@ -2077,6 +2272,21 @@ async def update_drive_file(
         raise ValueError(
             f"Unsupported mode: '{mode}'. Supported: {', '.join(CONTENT_UPDATE_MODES)}."
         )
+    if return_upload_url:
+        if mode != "replace":
+            raise ValueError(
+                "return_upload_url replaces the file's whole content; it cannot be "
+                f"combined with mode='{mode}'."
+            )
+        _reject_sources_with_upload_url(
+            "replaces the content",
+            content=content,
+            file_path=file_path,
+            file_url=file_url,
+            source_format=source_format,
+        )
+        if mime_type is not None:
+            mime_type = mime_type.strip().lower() or None
     if mode != "replace" and mime_type is not None:
         raise ValueError(f"mime_type cannot be set when mode='{mode}'.")
     if mode != "replace" and content is None:
@@ -2085,7 +2295,9 @@ async def update_drive_file(
             "'file_path' and 'file_url' are only supported with mode='replace'."
         )
 
-    replacing_content = any(x is not None for x in (content, file_path, file_url))
+    replacing_content = return_upload_url or any(
+        x is not None for x in (content, file_path, file_url)
+    )
     current_file_fields = (
         "name, description, mimeType, parents, starred, trashed, webViewLink, "
         "writersCanShare, copyRequiresWriterPermission, properties"
@@ -2207,6 +2419,50 @@ async def update_drive_file(
     if update_body:
         query_params["body"] = update_body
 
+    if return_upload_url:
+        current_mime = current_file.get("mimeType") or ""
+        # Same rule as the inline replace path: a native target must be an
+        # editable Google type, and its import allowlist bounds the upload's type.
+        format_map = _native_replace_format_map(current_mime)
+        if format_map is not None:
+            # On a native file mime_type describes the bytes to be uploaded, not a
+            # metadata change: Drive rejects metadata mimeType changes there, and
+            # the file's own type is the conversion target. Non-native files keep
+            # it in the metadata body, as the inline path sends it.
+            update_body.pop("mimeType", None)
+            if not update_body:
+                query_params.pop("body", None)
+        upload_mime = mime_type or current_mime or "application/octet-stream"
+        if upload_mime.startswith(GOOGLE_APPS_MIME_PREFIX):
+            # A native type is the conversion TARGET; it can never describe the
+            # uploaded bytes, and Google would reject or mis-convert the PUT.
+            raise ValueError(
+                f"This file is a native Google type ({upload_mime}); pass mime_type "
+                "with the MIME type of the bytes you will upload (e.g. 'text/markdown') "
+                "so Drive knows what it is converting from."
+            )
+        if format_map is not None and upload_mime not in format_map.values():
+            raise ValueError(
+                f"Unsupported mime_type for a {current_mime} upload: '{upload_mime}'. "
+                f"Supported: {', '.join(dict.fromkeys(format_map.values()))}."
+            )
+        # Open the session first: it has no effect until the PUT, so a failed
+        # initiation leaves the file untouched instead of half-updated.
+        upload_url = await _initiate_resumable_upload_session(
+            service, upload_mime_type=upload_mime, file_id=file_id
+        )
+        if any(k in query_params for k in ("body", "addParents", "removeParents")):
+            await asyncio.to_thread(
+                service.files().update(**query_params).execute, num_retries=0
+            )
+        logger.info(f"[update_drive_file] Returned resumable upload URL for {file_id}.")
+        return _resumable_upload_result(
+            "Resumable upload session created to replace the content of "
+            f"'{current_file.get('name', file_id)}' (ID {file_id}, for {user_google_email}).",
+            upload_url,
+            upload_mime,
+        )
+
     # Native Google files take replacement content through Drive's import conversion
     # (the engine import_to_google_doc uses); any other file has nothing to convert,
     # so its bytes stream back verbatim under the same file ID.
@@ -2220,17 +2476,7 @@ async def update_drive_file(
     try:
         if replacing_content:
             target_mime_type = mime_type or current_file.get("mimeType") or ""
-            format_map = IMPORT_FORMATS_BY_GOOGLE_MIME_TYPE.get(target_mime_type)
-            if format_map is None and target_mime_type.startswith(
-                GOOGLE_APPS_MIME_PREFIX
-            ):
-                supported_targets = ", ".join(
-                    mime for mime in IMPORT_FORMATS_BY_GOOGLE_MIME_TYPE
-                )
-                raise ValueError(
-                    "Content replacement is not supported for this Google Apps type "
-                    f"({target_mime_type}). Editable Google types: {supported_targets}."
-                )
+            format_map = _native_replace_format_map(target_mime_type)
 
             if mode != "replace":
                 if format_map is not None:
