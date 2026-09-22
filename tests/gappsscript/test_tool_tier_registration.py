@@ -1,14 +1,5 @@
-"""
-Regression test for the class of bug where a new @server.tool in
-gappsscript/apps_script_tools.py is registered but silently pruned at
-startup because core/tool_tiers.yaml's appscript section doesn't list it.
-
-core/tool_registry.py:filter_server_tools removes any registered tool whose
-name isn't present in the enabled tier/service set built from tool_tiers.yaml
-(see fork_tools/__init__.py's "Tier-filter survival" note for the same trap
-hitting tools registered outside this file). A tool can be fully implemented,
-tested in isolation, and still never reach a client because of this.
-"""
+"""Every appscript tool must be listed in core/tool_tiers.yaml, or
+core/tool_registry.py:filter_server_tools silently prunes it at startup."""
 
 import os
 import sys

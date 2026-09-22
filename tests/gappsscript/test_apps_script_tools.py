@@ -7,6 +7,8 @@ Tests all Apps Script tools with mocked API responses
 import asyncio
 import json
 import os
+import shutil
+import subprocess
 import sys
 import threading
 from typing import get_type_hints
@@ -46,6 +48,7 @@ from gappsscript.apps_script_tools import (
     _delete_script_trigger_impl,
     _ensure_trigger_admin_file,
     _TRIGGER_ADMIN_FILE_NAME,
+    _TRIGGER_ADMIN_MARKER,
     _TRIGGER_ADMIN_SOURCE,
     manage_deployment,
     get_script_project,
@@ -1104,6 +1107,67 @@ async def test_ensure_trigger_admin_file_rejects_user_file_collision():
 
 
 @pytest.mark.asyncio
+async def test_ensure_trigger_admin_file_refreshes_stale_helper():
+    """A helper written by an older server version is overwritten, not rejected."""
+    mock_service = Mock()
+    mock_service.projects().getContent().execute.return_value = {
+        "files": [
+            {
+                "name": _TRIGGER_ADMIN_FILE_NAME,
+                "type": "SERVER_JS",
+                "source": _TRIGGER_ADMIN_MARKER + "\nfunction __mcpOld() {}",
+            }
+        ]
+    }
+
+    await _ensure_trigger_admin_file(mock_service, "script123")
+
+    _, call_kwargs = mock_service.projects().updateContent.call_args
+    assert call_kwargs["body"]["files"] == [
+        {
+            "name": _TRIGGER_ADMIN_FILE_NAME,
+            "type": "SERVER_JS",
+            "source": _TRIGGER_ADMIN_SOURCE,
+        }
+    ]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+@pytest.mark.parametrize(
+    "trigger_id, handler_function, expected_ids",
+    [
+        ("1", None, ["1"]),
+        (None, "sendReport", ["1", "2"]),
+        ("1", "sendReport", ["1"]),
+        ("3", "sendReport", []),
+        (None, None, []),
+    ],
+)
+def test_trigger_admin_delete_requires_every_selector_to_match(
+    trigger_id, handler_function, expected_ids
+):
+    """Run the helper JS against a fake ScriptApp to check selector semantics."""
+    harness = f"""
+    var store = [["1", "sendReport"], ["2", "sendReport"], ["3", "cleanup"]].map(
+      function (p) {{
+        return {{getUniqueId: () => p[0], getHandlerFunction: () => p[1]}};
+      }});
+    var ScriptApp = {{
+      getProjectTriggers: () => store.slice(),
+      deleteTrigger: (t) => {{ store = store.filter((x) => x !== t); }}
+    }};
+    {_TRIGGER_ADMIN_SOURCE}
+    console.log(__mcpDeleteTrigger({json.dumps(trigger_id)}, {json.dumps(handler_function)}));
+    """
+    result = subprocess.run(
+        ["node", "-e", harness], capture_output=True, text=True, check=True
+    )
+
+    deleted = json.loads(result.stdout)
+    assert [trigger["uniqueId"] for trigger in deleted] == expected_ids
+
+
+@pytest.mark.asyncio
 async def test_resolve_execution_deployment_id_uses_latest_api_executable():
     mock_service = Mock()
     mock_service.projects().deployments().list().execute.return_value = {
@@ -1309,7 +1373,7 @@ async def test_delete_script_trigger_by_handler():
 
 @pytest.mark.asyncio
 async def test_delete_script_trigger_by_id_and_handler():
-    """Both selectors are forwarded so the helper can match on either."""
+    """Both selectors are forwarded so the helper can require both to match."""
     mock_service = Mock()
     mock_service.projects().getContent().execute.return_value = {"files": []}
     mock_service.scripts().run().execute.return_value = {
