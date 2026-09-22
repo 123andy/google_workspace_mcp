@@ -970,12 +970,18 @@ def _render_attached_messages(
 
 
 async def _resolve_attachment_name(
-    service, message_id: str, attachment_id: str, size_bytes: Optional[int] = None
+    service,
+    message_id: str,
+    attachment_id: str,
+    size_bytes: Optional[int] = None,
+    attachment_index: Optional[int] = None,
 ) -> tuple[Optional[str], Optional[str]]:
     """Best-effort ``(filename, mimeType)`` for an attachment from the MIME tree.
 
-    Exact ID match first; then, when ``size_bytes`` is known, the single attachment
-    of that size (IDs rotate between fetches, sizes do not); then the only attachment.
+    Exact ID match first; then the attachment at ``attachment_index`` (the ordinal
+    the listing emitted next to the ID, stable across the ID rotation Gmail does
+    between fetches); then, when ``size_bytes`` is known, the single attachment of
+    that size; then the only attachment.
     """
     filename = mime_type = None
     try:
@@ -995,6 +1001,17 @@ async def _resolve_attachment_name(
             if att.get("attachmentId") == attachment_id:
                 filename, mime_type = att.get("filename"), att.get("mimeType")
                 break
+        if (
+            not filename
+            and attachment_index is not None
+            and 0 <= attachment_index < len(attachments)
+        ):
+            matched = attachments[attachment_index]
+            filename, mime_type = matched.get("filename"), matched.get("mimeType")
+            logger.info(
+                f"Attachment {attachment_id} not in current metadata (IDs rotate); "
+                f"named by attachment_index={attachment_index} as '{filename}'"
+            )
         if not filename and attachments and size_bytes is not None:
             size_matches = [
                 att
@@ -3183,8 +3200,14 @@ async def get_gmail_attachment_content(
     signed_wanted = not return_base64 and signed_downloads.enabled()
     if signed_wanted:
         if not filename:
+            # Without a size cap there was no metadata pass above, and the
+            # caller's ID may already be stale: the index selects the same part.
             filename, mime_type = await _resolve_attachment_name(
-                service, message_id, attachment_id
+                service,
+                message_id,
+                attachment_id,
+                size_bytes=declared_size,
+                attachment_index=attachment_index,
             )
         signed = await download_handles.shorten_signed_url(
             signed_downloads.offer_url(
@@ -3204,7 +3227,12 @@ async def get_gmail_attachment_content(
                 [
                     "Attachment ready — streamed on demand (no base64, nothing stored).",
                     f"Message ID: {message_id}",
-                    f"Filename: {filename or 'unknown'}",
+                    # The route serves a nameless part as "attachment": say so
+                    # here rather than printing a placeholder.
+                    f"Filename: {filename}"
+                    if filename
+                    else "Filename: attachment (Gmail gave this part no name; "
+                    "the download is served under that name)",
                     *signed_downloads.url_lines(url, ttl, "attachment"),
                     "\nNote: Attachment IDs are ephemeral. Always use IDs from the most "
                     "recent message fetch.",
@@ -3284,7 +3312,11 @@ async def get_gmail_attachment_content(
         # with the full nested MIME tree and size-based fallback heuristics.
         if not filename:
             resolved_name, resolved_mime = await _resolve_attachment_name(
-                service, message_id, attachment_id, size_bytes
+                service,
+                message_id,
+                attachment_id,
+                size_bytes,
+                attachment_index=attachment_index,
             )
             if resolved_name or resolved_mime:
                 filename, mime_type = resolved_name, resolved_mime
