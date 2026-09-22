@@ -705,9 +705,8 @@ def _sheet_children(node: Any, local_name: str) -> List[Any]:
 def _rich_text(node: Any) -> str:
     """Text of a rich-text container: a shared-string ``<si>`` or an inline ``<is>``.
 
-    Both hold either a single ``<t>`` or runs ``<r><t>…</t></r>``. Phonetic
-    guides ``<rPh>`` also carry ``<t>``, but are annotations, not the cell's
-    text, so they are skipped. One helper for both kinds so they cannot drift.
+    Both hold a single ``<t>`` or runs ``<r><t>...</t></r>``. Phonetic guides
+    ``<rPh>`` also carry ``<t>`` but are annotations, so they are skipped.
     """
     parts: List[str] = []
     for child in node:
@@ -756,27 +755,25 @@ def _spreadsheet_texts(
     xml_root: Any, shared_strings: Optional[List[str]], member: str
 ) -> List[str]:
     """Return cell values from one worksheet in document order."""
+    namespace = _xml_name(xml_root.tag)[0]
+    if namespace not in _SPREADSHEETML_NAMESPACES:
+        return []
+    ns = f"{{{namespace}}}"
     texts: List[str] = []
-    for cell in xml_root.iter():
-        namespace, local_name = _xml_name(cell.tag)
-        if namespace not in _SPREADSHEETML_NAMESPACES or local_name != "c":
-            continue
+    for cell in xml_root.iter(f"{ns}c"):
         cell_type = cell.get("t")
-        if cell_type == "inlineStr":
-            # The text lives in <is>, not <v>; an empty or absent <is> is an
-            # empty cell, like a cell with no <v>.
-            for inline in _sheet_children(cell, "is"):
-                if text := _rich_text(inline):
-                    texts.append(text)
+        inline = cell.find(f"{ns}is")
+        if cell_type == "inlineStr" and inline is not None:
+            if text := _rich_text(inline):
+                texts.append(text)
             continue
-        values = _sheet_children(cell, "v")
-        if not values or values[0].text is None:
+        value = cell.find(f"{ns}v")
+        if value is None or value.text is None:
             continue
-        value = values[0].text
         if cell_type == "s":
-            texts.append(_shared_string(shared_strings, value, member))
+            texts.append(_shared_string(shared_strings, value.text, member))
         else:
-            texts.append(value)
+            texts.append(value.text)
     return texts
 
 

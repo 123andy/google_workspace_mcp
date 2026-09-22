@@ -1055,6 +1055,17 @@ class TestSpreadsheetTextFidelity:
         )
         assert extract_office_xml_text(data, XLSX_MIME) == "42"
 
+    def test_inline_string_cell_without_is_falls_back_to_v(self):
+        """Some writers put inlineStr text in <v>; keep reading it there."""
+        data = _xlsx(
+            **{
+                "xl/worksheets/sheet1.xml": _cells_sheet(
+                    '<c r="A1" t="inlineStr"><v>Coffee</v></c>'
+                )
+            }
+        )
+        assert extract_office_xml_text(data, XLSX_MIME) == "Coffee"
+
     def test_strict_workbook_with_shared_strings(self):
         data = _zip(
             **{
