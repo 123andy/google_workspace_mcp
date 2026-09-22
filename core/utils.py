@@ -11,6 +11,7 @@ import zipfile
 import ssl
 import asyncio
 import functools
+import inspect
 
 from pathlib import Path
 from typing import Annotated, Any, List, Optional
@@ -172,15 +173,31 @@ def local_file_access_enabled() -> bool:
     return os.environ.get(_DISABLE_LOCAL_FILES_ENV, "").lower() != "true"
 
 
-def local_file_args(*names: str) -> list[str] | None:
-    """Tool-registration helper: hide server-side path parameters when disabled.
+def hide_local_file_args(*names: str):
+    """Tool decorator: drop server-side path parameters when local files are off.
 
-    Pass the result as FastMCP's ``exclude_args`` so deployments without local
-    file access do not advertise a parameter that cannot work. Returns ``None``
-    (advertise normally) when local file access is enabled. Runtime guards stay
-    in place, since a client with a cached schema can still send the argument.
+    FastMCP builds a tool's input schema from ``inspect.signature``, which
+    honours ``__signature__``; ``require_google_service`` hides ``service`` (and
+    ``user_google_email`` under OAuth 2.1) the same way. Apply this directly
+    under ``@server.tool`` so the rewritten signature is what FastMCP sees.
+    A hidden parameter is then rejected by FastMCP's argument validation before
+    the tool runs, so a client with a cached schema cannot reach it. No-op when
+    local file access is enabled. The names are checked against the signature
+    either way, so a stale name fails at import rather than silently.
     """
-    return None if local_file_access_enabled() else list(names)
+
+    def decorator(func):
+        sig = inspect.signature(func)
+        missing = [name for name in names if name not in sig.parameters]
+        if missing:
+            raise ValueError(f"{func.__name__} has no parameter(s) {missing} to hide.")
+        if not local_file_access_enabled():
+            func.__signature__ = sig.replace(
+                parameters=[p for p in sig.parameters.values() if p.name not in names]
+            )
+        return func
+
+    return decorator
 
 
 def _get_allowed_file_dirs() -> list[Path]:

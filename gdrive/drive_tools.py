@@ -33,8 +33,8 @@ from core.utils import (
     GOOGLE_API_WRITE_RETRIES,
     IMAGE_MIME_TYPES,
     UserInputError,
+    hide_local_file_args,
     local_file_access_enabled,
-    local_file_args,
     encode_image_content,
     OfficeXmlExtractionError,
     OfficeXmlTooLargeError,
@@ -1329,8 +1329,11 @@ async def create_drive_file(
 def _file_path_disabled_error(inline_params: tuple[str, ...]) -> UserInputError:
     """Build the error for ``file_path`` sent while local file access is disabled.
 
-    ``inline_params`` are the inline-source parameters the calling tool really
-    has, so the message only ever names routes that exist on that tool.
+    Over MCP the parameter is hidden from the signature and FastMCP rejects it
+    before the tool runs, so this only reaches direct callers, or a setting
+    flipped after import. ``inline_params`` are the inline-source parameters
+    the calling tool really has, so the message only ever names routes that
+    exist on that tool.
     """
     inline = " or ".join(f"'{name}'" for name in inline_params)
     # 'content' carries text only. A tool without 'base64_content' has no inline
@@ -1387,7 +1390,8 @@ async def _import_with_conversion(
     )
     logger.debug(f"[{tool_name}] File Name: '{file_name}'")
 
-    # Answer with this tool's own alternatives rather than the generic
+    # Defense in depth for direct callers (see _file_path_disabled_error):
+    # answer with this tool's own alternatives rather than the generic
     # validate_file_path() refusal.
     if file_path is not None and not local_file_access_enabled():
         raise _file_path_disabled_error(inline_params)
@@ -1462,7 +1466,6 @@ async def _import_with_conversion(
 
 @server.tool(
     title="Import to Google Doc",
-    exclude_args=local_file_args("file_path"),
     annotations=ToolAnnotations(
         readOnlyHint=False,
         destructiveHint=False,
@@ -1470,6 +1473,7 @@ async def _import_with_conversion(
         openWorldHint=True,
     ),
 )
+@hide_local_file_args("file_path")
 @handle_http_errors("import_to_google_doc", service_type="drive")
 @require_google_service("drive", "drive_file")
 async def import_to_google_doc(
@@ -1542,7 +1546,6 @@ async def import_to_google_doc(
 
 @server.tool(
     title="Import to Google Slides",
-    exclude_args=local_file_args("file_path"),
     annotations=ToolAnnotations(
         readOnlyHint=False,
         destructiveHint=False,
@@ -1550,6 +1553,7 @@ async def import_to_google_doc(
         openWorldHint=True,
     ),
 )
+@hide_local_file_args("file_path")
 @handle_http_errors("import_to_google_slides", service_type="drive")
 @require_google_service("drive", "drive_file")
 async def import_to_google_slides(
@@ -1615,7 +1619,6 @@ async def import_to_google_slides(
 
 @server.tool(
     title="Import to Google Sheets",
-    exclude_args=local_file_args("file_path"),
     annotations=ToolAnnotations(
         readOnlyHint=False,
         destructiveHint=False,
@@ -1623,6 +1626,7 @@ async def import_to_google_slides(
         openWorldHint=True,
     ),
 )
+@hide_local_file_args("file_path")
 @handle_http_errors("import_to_google_sheets", service_type="drive")
 @require_google_service("drive", "drive_file")
 async def import_to_google_sheets(
@@ -1969,7 +1973,6 @@ async def check_drive_file_public_access(
 
 @server.tool(
     title="Update Drive File",
-    exclude_args=local_file_args("file_path"),
     annotations=ToolAnnotations(
         readOnlyHint=False,
         destructiveHint=True,
@@ -1977,6 +1980,7 @@ async def check_drive_file_public_access(
         openWorldHint=True,
     ),
 )
+@hide_local_file_args("file_path")
 @handle_http_errors("update_drive_file", is_read_only=False, service_type="drive")
 @require_google_service("drive", "drive_file")
 async def update_drive_file(
