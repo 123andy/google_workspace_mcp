@@ -300,7 +300,7 @@ async def test_update_still_applies_visibility_when_asked():
 
 
 @pytest.mark.asyncio
-async def test_update_keeps_a_visibility_the_parameter_cannot_express():
+async def test_update_without_visibility_keeps_stored_visibility():
     """Carrying the stored value over preserves a visibility the caller did
     not mention."""
     service = _build_mock_service(
