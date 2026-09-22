@@ -23,6 +23,7 @@ from mcp.types import ToolAnnotations
 
 from auth.service_decorator import require_google_service
 from auth.oauth_config import is_stateless_mode
+from core import signed_downloads
 from core.attachment_storage import get_attachment_storage, get_attachment_url
 from core.file_limits import (
     FileTooLargeError,
@@ -492,7 +493,9 @@ async def get_drive_file_download_url(
     Downloads a Google Drive file and saves it to local disk.
 
     In stdio mode, returns the local file path for direct access.
-    In HTTP mode, returns a temporary download URL (valid for 1 hour).
+    In HTTP mode, returns a download URL: with signed download URLs enabled on the
+    server, a link that streams from Drive on demand and expires within ~15 minutes
+    (fetch it promptly); otherwise a server-stored copy valid for 1 hour.
 
     For Google native files (Docs, Sheets, Slides), exports to a useful format:
     - Google Docs -> PDF (default) or DOCX if export_format='docx'
@@ -580,6 +583,32 @@ async def get_drive_file_download_url(
             if not output_filename.endswith(".pdf"):
                 output_filename = f"{Path(output_filename).stem}.pdf"
 
+    # Signed URL: the route streams the file from Drive at download time (exporting
+    # native files when "emt" is set), so nothing is downloaded or stored here.
+    ref = {"fid": file_id, **({"emt": export_mime_type} if export_mime_type else {})}
+    signed = signed_downloads.offer_url(
+        user_google_email,
+        source="drive",
+        ref=ref,
+        filename=output_filename,
+        mime_type=output_mime_type,
+    )
+    if signed:
+        url, ttl = signed
+        logger.info(
+            "[get_drive_file_download_url] Returning signed download URL (no download)"
+        )
+        return "\n".join(
+            [
+                "File ready — streamed on demand (no base64, nothing stored).",
+                f"File: {file_name}",
+                f"File ID: {file_id}",
+                f"MIME Type: {output_mime_type}",
+                *signed_downloads.url_lines(url, ttl, "file"),
+            ]
+        )
+    no_url = signed_downloads.enabled()
+
     # Stream the download straight to disk. The payload is never held in memory
     # as a whole, so file size no longer bounds how much RAM this tool needs.
     tmp_path = await _download_file_to_temp(service, file_id, export_mime_type)
@@ -594,12 +623,15 @@ async def get_drive_file_download_url(
         finally:
             tmp_path.unlink(missing_ok=True)
         result_lines = [
-            "File downloaded successfully!",
+            "File fetched, but NO download URL could be issued."
+            if no_url
+            else "File downloaded successfully!",
             f"File: {file_name}",
             f"File ID: {file_id}",
             f"Size: {size_kb:.1f} KB ({size_bytes} bytes)",
             f"MIME Type: {output_mime_type}",
             "\n⚠️ Stateless mode: File storage disabled.",
+            *([signed_downloads.UNAVAILABLE_NOTE] if no_url else []),
             "\nBase64-encoded content (first 100 characters shown):",
             f"{base64.b64encode(preview_bytes).decode('utf-8')}...",
         ]
@@ -638,6 +670,8 @@ async def get_drive_file_download_url(
             download_url = get_attachment_url(result.file_id)
             result_lines.append(f"\n📎 Download URL: {download_url}")
             result_lines.append("\nThe file will expire after 1 hour.")
+            if no_url:
+                result_lines.append(signed_downloads.UNAVAILABLE_NOTE)
 
         if export_mime_type:
             result_lines.append(
