@@ -5,15 +5,17 @@ an authenticated API call. Without this module a remote server must either write
 the file to local disk and serve it from ``/attachments/{id}`` (impossible in
 stateless mode, and not tied to a user) or hand base64 back through the model.
 
-With ``WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS=true`` the download tools instead
+With ``WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS=true`` the download tools instead
 return ``/attachments/signed/{token}``: an HS256 JWT naming the resource, its
 owner (``sub``) and an expiry. The route verifies the signature, recovers the
-owner's credentials from the in-process session store, fetches from Google and
-streams to the client. The signature is the authorization; nothing is stored.
+owner's credentials (the in-process session store first, then the persistent
+credential store), fetches from Google and returns the bytes. The signature is
+the authorization; the route never writes to either store.
 
-A URL is clamped to the owner's access-token life (the route cannot refresh a
-token the OAuth proxy holds) and is only minted when the route will be able to
-serve it. Single-process: the verifying process must hold the owner's session.
+Mint and serve share ONE notion of "usable credentials" (``usable_seconds``): a
+URL is only minted while the route would accept it, and its TTL is clamped so it
+dies before that acceptance ends. Credentials that carry a refresh token are
+refreshed in memory by the route, so their URLs get the full lifetime.
 """
 
 import asyncio
@@ -22,6 +24,7 @@ import binascii
 import functools
 import io
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -31,6 +34,8 @@ from urllib.parse import quote
 
 import jwt
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from google.auth._helpers import REFRESH_THRESHOLD
+from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -39,26 +44,43 @@ from core.config import get_transport_mode
 
 logger = logging.getLogger(__name__)
 
+FLAG_ENV = "WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS"
 _ALG = "HS256"
 _KEY_SALT = "workspace-mcp-signed-download"
 URL_TTL_SECONDS = 900
-# A URL must expire at least this long before the credential it depends on.
+# A URL must expire at least this long before the credential stops being usable.
 _EXPIRY_MARGIN_SECONDS = 30
 _RESERVED_CLAIMS = frozenset({"src", "sub", "iat", "exp", "fn", "mt"})
+# Sender-typed bytes on a public route: never sniff, never cache (success or error).
+_RESPONSE_HEADERS = {"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"}
+
+
+def _flag_set() -> bool:
+    return os.getenv(FLAG_ENV, "false").lower() == "true"
 
 
 def enabled() -> bool:
     """Opt-in, and only over streamable-http: the stdio callback server does not
     mount this route, and a local server can hand out file paths instead."""
-    return (
-        os.getenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", "false").lower() == "true"
-        and get_transport_mode() == "streamable-http"
-    )
+    return _flag_set() and get_transport_mode() == "streamable-http"
+
+
+def log_if_ignored(transport: str) -> None:
+    """Run once from ``main()``: a stdio operator who sets the flag gets one line
+    saying it is ignored, instead of URLs that are silently never offered."""
+    if _flag_set() and transport != "streamable-http":
+        logger.warning(
+            "%s is set but the transport is %s; signed download URLs are only "
+            "issued over streamable-http, so the setting is ignored.",
+            FLAG_ENV,
+            transport,
+        )
 
 
 @functools.lru_cache(maxsize=1)
 def _signing_key() -> bytes:
-    """Derive the HMAC key from the OAuth proxy's key material under a dedicated salt."""
+    """Derive the HMAC key from the OAuth proxy's key material under a dedicated
+    salt, so it is isolated from the server's other derived keys."""
     from auth.oauth_config import get_oauth_config
     from fastmcp.server.auth.jwt_issuer import derive_jwt_key
 
@@ -76,19 +98,49 @@ def _signing_key() -> bytes:
     )
 
 
-def clamp_ttl(expiry: Optional[datetime], *, now: Optional[datetime] = None) -> int:
-    """Lifetime for a URL that must die before its credential; <= 0 means do not mint.
+# --- Credential usability: the ONE predicate mint and serve share -------------------
 
-    ``expiry`` is google-auth's naive-UTC ``Credentials.expiry``. Deliberately not
-    floored: a minimum would let a URL outlive the token that serves it.
+
+def _refreshable(credentials: Credentials) -> bool:
+    """google-auth can only refresh with all four of these present."""
+    return bool(
+        credentials.refresh_token
+        and credentials.token_uri
+        and credentials.client_id
+        and credentials.client_secret
+    )
+
+
+def usable_seconds(
+    credentials: Credentials, *, now: Optional[datetime] = None
+) -> float:
+    """Seconds the route can still use these credentials; <= 0 means it cannot.
+
+    Refreshable credentials are usable indefinitely: the route refreshes them in
+    memory before fetching. Otherwise they are usable only while google-auth still
+    treats the access token as valid, which ends ``REFRESH_THRESHOLD`` (3m45s)
+    BEFORE ``expiry`` — past that point the API client would try to refresh and
+    fail. ``expiry`` is google-auth's naive-UTC ``Credentials.expiry``.
     """
-    if expiry is None:
-        return URL_TTL_SECONDS
+    if _refreshable(credentials):
+        return math.inf
+    if not credentials.token:
+        return 0.0
+    if credentials.expiry is None:
+        return math.inf
     ref = now or datetime.now(timezone.utc)
     if ref.tzinfo is None:
         ref = ref.replace(tzinfo=timezone.utc)
-    left = (expiry.replace(tzinfo=timezone.utc) - ref).total_seconds()
-    return int(min(URL_TTL_SECONDS, left - _EXPIRY_MARGIN_SECONDS))
+    expiry = credentials.expiry.replace(tzinfo=timezone.utc)
+    return (expiry - REFRESH_THRESHOLD - ref).total_seconds()
+
+
+def clamp_ttl(credentials: Credentials, *, now: Optional[datetime] = None) -> int:
+    """URL lifetime that ends before the credentials stop being usable; <= 0 means
+    do not mint. Deliberately not floored: a minimum would let a URL outlive the
+    credentials that serve it."""
+    left = usable_seconds(credentials, now=now) - _EXPIRY_MARGIN_SECONDS
+    return int(min(URL_TTL_SECONDS, left))
 
 
 def format_ttl(seconds: float) -> str:
@@ -151,11 +203,23 @@ def verify_token(token: str) -> Optional[dict]:
         return None
 
 
-def _session_credentials(user_email: str) -> Optional[Credentials]:
+def _recover_credentials(user_email: str) -> Optional[Credentials]:
+    """The owner's credentials: session store first, then the persistent
+    credential store (skipped in stateless mode, where nothing is persisted).
+
+    Read-only. Both stores hand back a fresh ``Credentials`` object, so refreshing
+    it later never reaches storage. The tool and the route both use this lookup,
+    so a URL is only offered where the route can recover the owner.
+    """
+    from auth.credential_store import get_credential_store
     from auth.oauth21_session_store import get_oauth21_session_store
+    from auth.oauth_config import is_stateless_mode
 
     try:
-        return get_oauth21_session_store().get_credentials(user_email)
+        credentials = get_oauth21_session_store().get_credentials(user_email)
+        if credentials is None and not is_stateless_mode():
+            credentials = get_credential_store().get_credential(user_email)
+        return credentials
     except Exception as exc:
         logger.debug("Could not recover credentials for %s: %s", user_email, exc)
         return None
@@ -172,17 +236,18 @@ def offer_url(
     """Tool-side entry point: ``(url, ttl_seconds)``, or None to use the normal path.
 
     None when the feature is off, or when the route could not serve the URL: the
-    owner's credentials are not in the session store the route consults, the
-    token is too near expiry, or no signing key can be derived.
+    owner's credentials are recoverable from neither store, they are unusable
+    (no refresh token and inside google-auth's expiry threshold), or no signing
+    key can be derived.
     """
     if not enabled():
         return None
-    credentials = _session_credentials(user_email)
-    ttl = clamp_ttl(credentials.expiry) if credentials else 0
+    credentials = _recover_credentials(user_email)
+    ttl = clamp_ttl(credentials) if credentials else 0
     if ttl <= 0:
         logger.info(
-            "Signed download URL unavailable (credentials not recoverable or token "
-            "near expiry); using the standard download path."
+            "Signed download URL unavailable (credentials not recoverable or not "
+            "usable long enough); using the standard download path."
         )
         return None
     try:
@@ -204,16 +269,16 @@ def url_lines(url: str, ttl: int, what: str) -> list[str]:
     """Result lines shared by the tools that hand out a signed URL."""
     return [
         f"\n📎 Download URL: {url}",
-        f"\nThe server streams the {what} directly from Google when this URL is "
-        f"fetched; the link is signed to you and expires in {format_ttl(ttl)}. "
+        f"\nThe server fetches the {what} directly from Google when this URL is "
+        f"requested; the link is signed to you and expires in {format_ttl(ttl)}. "
         "Fetch it promptly; do not queue it for later.",
     ]
 
 
 UNAVAILABLE_NOTE = (
-    "\n⚠️ No signed download URL could be issued: the stored credentials were not "
-    "recoverable or the OAuth token is too near expiry. Re-authenticate to restore "
-    "signed download URLs."
+    "\n⚠️ No signed download URL could be issued: this server could not recover "
+    "usable credentials for you (none stored here, or an access token about to "
+    "expire with no refresh token). Re-authenticate if this persists."
 )
 
 
@@ -246,6 +311,7 @@ def _decode_urlsafe(data: str, what: str) -> bytes:
 async def _fetch_gmail_attachment(
     claims: dict, credentials: Credentials
 ) -> DownloadResult:
+    """Gmail returns the attachment as one JSON response: buffered, not streamed."""
     message_id, attachment_id = claims.get("mid"), claims.get("aid")
     if not (message_id and attachment_id):
         raise SignedDownloadError("Gmail token missing mid/aid")
@@ -352,45 +418,60 @@ _FETCHERS: dict[str, Callable[[dict, Credentials], Awaitable[DownloadResult]]] =
 
 
 def _content_disposition(name: str) -> str:
-    """Names come from Gmail/Drive metadata: strip header-breaking characters."""
+    """Names come from Gmail/Drive metadata (sender-controlled): the ASCII
+    ``filename=`` keeps printable ASCII only — no quotes, backslashes, C0/DEL
+    controls (h11 refuses a header value containing NUL) or non-ASCII, which the
+    percent-encoded ``filename*`` carries intact."""
     ascii_name = (
-        name.encode("ascii", "ignore")
-        .decode()
-        .translate(str.maketrans("", "", '"\\\r\n'))
+        "".join(ch for ch in name if 0x20 <= ord(ch) < 0x7F and ch not in '"\\')
         or "download"
     )
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(name, safe='')}"
 
 
+def _error(status: int, message: str) -> Response:
+    return JSONResponse(
+        {"error": message}, status_code=status, headers=_RESPONSE_HEADERS
+    )
+
+
 async def serve(token: str) -> Response:
-    """Verify a signed token, then stream the resource with its owner's credentials."""
+    """Verify a signed token, then return the resource with its owner's credentials."""
     if not enabled():  # keep the public route inert unless the feature is on
-        return JSONResponse({"error": "Not found"}, status_code=404)
+        return _error(404, "Not found")
     claims = verify_token(token)
     fetcher = _FETCHERS.get(claims.get("src", "")) if claims else None
     if not (claims and fetcher and claims.get("sub")):
-        return JSONResponse(
-            {"error": "Invalid or expired download link"}, status_code=403
-        )
+        return _error(403, "Invalid or expired download link")
 
-    credentials = _session_credentials(claims["sub"])
-    if credentials is None or not credentials.valid:
-        # The OAuth proxy holds the refresh token, so an expired or missing access
-        # token cannot be renewed here; fail closed.
-        return JSONResponse(
-            {"error": "The download owner's session is not available; re-authenticate"},
-            status_code=401,
+    # Only a validly signed token naming this user reaches the lookup.
+    credentials = _recover_credentials(claims["sub"])
+    if credentials is None or usable_seconds(credentials) <= 0:
+        return _error(
+            401,
+            "The download owner's credentials are not recoverable on this server",
         )
+    if not credentials.valid:
+        # usable_seconds() > 0 with an invalid token means refreshable. Refresh the
+        # in-memory copy only; this public route never writes to any store.
+        try:
+            await asyncio.to_thread(credentials.refresh, Request())
+        except Exception as exc:
+            logger.warning("Signed download: credential refresh failed: %s", exc)
+            return _error(
+                401, "The download owner's credentials could not be refreshed"
+            )
 
     try:
         result = await fetcher(claims, credentials)
     except SignedDownloadError as exc:
         logger.error("Signed download fetch failed: %s", exc)
-        return JSONResponse(
-            {"error": "Failed to fetch the requested resource"}, status_code=502
-        )
+        return _error(502, "Failed to fetch the requested resource")
 
-    headers = {"Content-Disposition": _content_disposition(result.filename)}
+    headers = {
+        **_RESPONSE_HEADERS,
+        "Content-Disposition": _content_disposition(result.filename),
+    }
     if result.stream is not None:
         return StreamingResponse(
             result.stream, media_type=result.media_type, headers=headers

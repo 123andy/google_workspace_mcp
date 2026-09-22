@@ -40,8 +40,9 @@ def _gmail_service():
 
 
 @pytest.mark.asyncio
-async def test_tool_mints_url_and_route_streams_it(monkeypatch):
-    monkeypatch.setenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", "true")
+async def test_tool_mints_url_and_route_streams_it(monkeypatch, tmp_path):
+    monkeypatch.setattr("core.attachment_storage.STORAGE_DIR", tmp_path)  # never $HOME
+    monkeypatch.setenv("WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS", "true")
     monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "e2e-client-secret-material")
     monkeypatch.delenv("FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY", raising=False)
     monkeypatch.setenv("WORKSPACE_EXTERNAL_URL", "http://testserver")
@@ -97,6 +98,110 @@ async def test_tool_mints_url_and_route_streams_it(monkeypatch):
             assert ok.headers["content-type"].startswith("application/pdf")
             assert 'filename="invoice.pdf"' in ok.headers["content-disposition"]
             assert tampered.status_code == 403
+    finally:
+        set_transport_mode(saved_mode)
+        sd._signing_key.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_legacy_mode_credentials_only_in_the_credential_store_round_trip(
+    monkeypatch, tmp_path
+):
+    """Legacy / trusted-gateway shape: after a restart the in-process session store
+    is empty and the owner's credentials live only in the persistent credential
+    store. The tool must still mint, and the route must serve — reading the store
+    and writing nothing back to either store."""
+    import auth.credential_store as credential_store
+    from auth.credential_store import LocalDirectoryCredentialStore
+    from google.oauth2.credentials import Credentials
+
+    monkeypatch.setenv("WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS", "true")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "e2e-client-secret-material")
+    monkeypatch.delenv("FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY", raising=False)
+    monkeypatch.setenv("WORKSPACE_EXTERNAL_URL", "http://testserver")
+    monkeypatch.setattr("auth.oauth_config.is_stateless_mode", lambda: False)
+    # Should the tool ever fall back to disk, it must land in the temp dir, not the
+    # user's ~/.workspace-mcp/attachments.
+    (tmp_path / "attachments").mkdir()
+    monkeypatch.setattr("core.attachment_storage.STORAGE_DIR", tmp_path / "attachments")
+    sd._signing_key.cache_clear()
+    from core.config import get_transport_mode
+
+    saved_mode = get_transport_mode()
+    set_transport_mode("streamable-http")
+
+    # A real local credential store, pointed at a temp dir (never a user directory).
+    store = LocalDirectoryCredentialStore(base_dir=str(tmp_path))
+    store.store_credential(
+        "user@example.com",
+        Credentials(
+            token="ya29.from-store",
+            refresh_token=None,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id="cid",
+            client_secret="csecret",
+            scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+            expiry=datetime.utcnow() + timedelta(hours=1),
+        ),
+    )
+    monkeypatch.setattr(
+        store, "store_credential", Mock(side_effect=AssertionError("route wrote"))
+    )
+    monkeypatch.setattr(credential_store, "_credential_store", store)
+
+    empty_session_store = Mock()
+    empty_session_store.get_credentials = lambda email: None
+    empty_session_store.store_session = Mock(side_effect=AssertionError("route wrote"))
+
+    service = _gmail_service()
+    auth = AsyncMock(return_value=(service, "user@example.com"))
+    used = {}
+
+    def build(*args, **kwargs):
+        used["token"] = kwargs["credentials"].token
+        return service
+
+    try:
+        with (
+            patch.object(service_decorator, "_authenticate_service", auth),
+            patch(
+                "auth.oauth21_session_store.get_oauth21_session_store",
+                lambda: empty_session_store,
+            ),
+            patch.object(sd, "build", build),
+        ):
+            async with Client(server) as client:
+                result = await client.call_tool(
+                    "get_gmail_attachment_content",
+                    {
+                        "message_id": "msg-1",
+                        "attachment_id": "att-1",
+                        "user_google_email": "user@example.com",
+                    },
+                )
+            text = result.content[0].text
+            assert "streamed on demand" in text, text
+            url = next(
+                line.split("Download URL: ", 1)[1]
+                for line in text.splitlines()
+                if "Download URL:" in line
+            )
+
+            transport = httpx.ASGITransport(app=server.http_app())
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as http:
+                ok = await http.get(url)
+
+            assert ok.status_code == 200
+            assert ok.content == PAYLOAD
+            assert used["token"] == "ya29.from-store"
+            assert ok.headers["x-content-type-options"] == "nosniff"
+            assert ok.headers["cache-control"] == "no-store"
+            store.store_credential.assert_not_called()
+            empty_session_store.store_session.assert_not_called()
+            assert len(list(tmp_path.glob("*.json"))) == 1  # only the setup write
+            assert list((tmp_path / "attachments").iterdir()) == []  # no disk fallback
     finally:
         set_transport_mode(saved_mode)
         sd._signing_key.cache_clear()

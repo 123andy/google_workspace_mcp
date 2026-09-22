@@ -1,26 +1,35 @@
 """Signed download URLs: the token is the authorization, so these pin the security
-properties — required claims, rejection of anything not minted here, a TTL that
-never outlives the credential, the route touching Google only after verification
-and only with the token owner's credentials, and bounded-memory Drive streaming.
+properties — required claims, rejection of anything not minted here (including
+tokens from the server's other key families), a TTL that never outlives the
+credentials, mint and serve agreeing on "usable" with REAL google-auth
+credentials, the route touching Google only after verification and only with the
+token owner's credentials (recovered read-only, refreshed in memory), hardened
+response headers, and bounded-memory Drive streaming.
 """
 
+import json
+import logging
 import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
 
+import h11
 import jwt
 import pytest
+import requests
+from fastmcp.server.auth.jwt_issuer import derive_jwt_key
+from google.oauth2.credentials import Credentials
 
 import core.signed_downloads as sd
 
 USER = "user@example.com"
+SECRET = "client-secret-with-enough-entropy"
+TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 
 @pytest.fixture(autouse=True)
 def signing_material(monkeypatch):
-    monkeypatch.setenv(
-        "GOOGLE_OAUTH_CLIENT_SECRET", "client-secret-with-enough-entropy"
-    )
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", SECRET)
     monkeypatch.delenv("FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY", raising=False)
     monkeypatch.setenv("WORKSPACE_EXTERNAL_URL", "https://mcp.example.com/")
     monkeypatch.setattr(sd, "get_transport_mode", lambda: "streamable-http")
@@ -41,32 +50,145 @@ def _token(url: str) -> str:
     return url.rsplit("/", 1)[1]
 
 
+def _now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)  # naive UTC, as google-auth
+
+
+def _credentials(seconds_left=3600, refresh_token=None, token="ya29.access"):
+    """A real google-auth object, so ``.valid`` applies REFRESH_THRESHOLD for real."""
+    return Credentials(
+        token=token,
+        refresh_token=refresh_token,
+        token_uri=TOKEN_URI,
+        client_id="client-id",
+        client_secret="client-secret",
+        scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+        expiry=_now() + timedelta(seconds=seconds_left),
+    )
+
+
+class _ReadOnlyStores:
+    """Session-store and credential-store doubles that record and REFUSE writes."""
+
+    def __init__(self, session=None, persistent=None):
+        self.session, self.persistent, self.writes = session, persistent, []
+        self.session_lookups, self.persistent_lookups = [], []
+
+    # OAuth21SessionStore surface used by the module
+    def get_credentials(self, email):
+        self.session_lookups.append(email)
+        return self.session.get(email) if self.session else None
+
+    def store_session(self, **kwargs):
+        self.writes.append(("store_session", kwargs))
+        raise AssertionError("the signed route must not write to the session store")
+
+    # CredentialStore surface used by the module
+    def get_credential(self, email):
+        self.persistent_lookups.append(email)
+        return self.persistent.get(email) if self.persistent else None
+
+    def store_credential(self, email, credentials):
+        self.writes.append(("store_credential", email))
+        raise AssertionError("the signed route must not write to the credential store")
+
+
+@pytest.fixture
+def stores(monkeypatch):
+    """Install the doubles behind the real lookup helper (not patching the helper)."""
+    doubles = _ReadOnlyStores()
+    monkeypatch.setattr(
+        "auth.oauth21_session_store.get_oauth21_session_store", lambda: doubles
+    )
+    monkeypatch.setattr("auth.credential_store.get_credential_store", lambda: doubles)
+    monkeypatch.setattr("auth.oauth_config.is_stateless_mode", lambda: False)
+    return doubles
+
+
+@pytest.fixture
+def fetcher(monkeypatch):
+    """Records the credentials the route hands to Google."""
+    seen = {}
+
+    async def fake(claims, credentials):
+        seen["claims"], seen["token"] = claims, credentials.token
+        return sd.DownloadResult(
+            filename="f.bin", media_type="application/octet-stream", content=b"ok"
+        )
+
+    monkeypatch.setitem(sd._FETCHERS, "gmail", fake)
+    return seen
+
+
+@pytest.fixture
+def token_endpoint(monkeypatch):
+    """Google's token endpoint, faked at the HTTP transport (requests.Session)."""
+    calls = []
+    outcome = {
+        "status": 200,
+        "body": {"access_token": "ya29.refreshed", "expires_in": 3600},
+    }
+
+    def fake_request(self, method, url, **kwargs):
+        calls.append((method, url, kwargs.get("data")))
+        response = requests.Response()
+        response.status_code = outcome["status"]
+        response._content = json.dumps(outcome["body"]).encode()
+        response.headers["content-type"] = "application/json"
+        return response
+
+    monkeypatch.setattr(requests.Session, "request", fake_request)
+    return calls, outcome
+
+
 class TestEnabledFlag:
     def test_off_by_default(self, monkeypatch):
-        monkeypatch.delenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", raising=False)
+        monkeypatch.delenv(sd.FLAG_ENV, raising=False)
         assert sd.enabled() is False
         assert sd.offer_url(USER, source="gmail", ref={}) is None
 
     def test_on_when_true(self, monkeypatch):
-        monkeypatch.setenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", "true")
+        monkeypatch.setenv(sd.FLAG_ENV, "true")
         assert sd.enabled() is True
 
     def test_off_on_stdio_even_when_set(self, monkeypatch):
         """The stdio callback server does not mount the route; a local server hands
         out file paths instead."""
-        monkeypatch.setenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", "true")
+        monkeypatch.setenv(sd.FLAG_ENV, "true")
         monkeypatch.setattr(sd, "get_transport_mode", lambda: "stdio")
         assert sd.enabled() is False
 
     @pytest.mark.asyncio
     async def test_route_is_inert_when_disabled(self, monkeypatch):
-        monkeypatch.setenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", "true")
+        monkeypatch.setenv(sd.FLAG_ENV, "true")
         token = _token(_mint())
-        monkeypatch.delenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS")
-        monkeypatch.setattr(sd, "_session_credentials", Mock())
+        monkeypatch.delenv(sd.FLAG_ENV)
+        monkeypatch.setattr(sd, "_recover_credentials", Mock())
         response = await sd.serve(token)
         assert response.status_code == 404
-        sd._session_credentials.assert_not_called()
+        sd._recover_credentials.assert_not_called()
+
+
+class TestStartupLog:
+    def test_flag_on_stdio_logs_once_that_it_is_ignored(self, monkeypatch, caplog):
+        monkeypatch.setenv(sd.FLAG_ENV, "true")
+        with caplog.at_level(logging.WARNING, logger=sd.__name__):
+            sd.log_if_ignored("stdio")
+        notes = [r for r in caplog.records if "ignored" in r.getMessage()]
+        assert len(notes) == 1
+        assert sd.FLAG_ENV in notes[0].getMessage() and "stdio" in notes[0].getMessage()
+
+    @pytest.mark.parametrize(
+        "flag, transport", [(None, "stdio"), ("true", "streamable-http")]
+    )
+    def test_otherwise_silent(self, monkeypatch, caplog, flag, transport):
+        if flag is None:
+            monkeypatch.delenv(sd.FLAG_ENV, raising=False)
+        else:
+            monkeypatch.setenv(sd.FLAG_ENV, flag)
+        with caplog.at_level(logging.DEBUG, logger=sd.__name__):
+            sd.log_if_ignored(transport)
+        assert caplog.records == []
 
 
 class TestToken:
@@ -118,18 +240,6 @@ class TestToken:
         with pytest.raises(ValueError, match="reserved"):
             _mint(ref={"fid": "F", "sub": "attacker@example.com"})
 
-    def test_key_override_takes_precedence_over_client_secret(self, monkeypatch):
-        monkeypatch.setenv(
-            "FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY", "override-material"
-        )
-        sd._signing_key.cache_clear()
-        token = _token(_mint())
-        assert sd.verify_token(token) is not None
-        monkeypatch.delenv("FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY")
-        sd._signing_key.cache_clear()
-        # Key now derived from the client secret: the override-signed token must fail.
-        assert sd.verify_token(token) is None
-
     def test_no_key_material_fails_closed(self, monkeypatch):
         monkeypatch.delenv("GOOGLE_OAUTH_CLIENT_SECRET")
         sd._signing_key.cache_clear()
@@ -141,28 +251,118 @@ class TestToken:
         assert sd.verify_token("x.y.z") is None
 
 
-class TestTtl:
+class TestSigningKey:
+    """Which material signs (derived only — no key setting of its own), and that
+    this route's key family is isolated from the server's other derived keys (the
+    OAuth proxy's JWT key and storage key)."""
+
+    OTHER_SALTS = ["fastmcp-jwt-signing-key", "fastmcp-storage-encryption-key"]
+
+    def _claims(self):
+        now = int(time.time())
+        return {
+            "src": "gmail",
+            "sub": USER,
+            "iat": now,
+            "exp": now + 60,
+            "mid": "m",
+            "aid": "a",
+        }
+
+    def test_key_derives_from_the_client_secret_under_this_modules_salt(self):
+        assert sd._signing_key() == derive_jwt_key(
+            high_entropy_material=SECRET, salt=sd._KEY_SALT
+        )
+
+    def test_fastmcp_jwt_key_material_beats_the_client_secret(self, monkeypatch):
+        monkeypatch.setenv(
+            "FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY", "override-material"
+        )
+        sd._signing_key.cache_clear()
+        token = _token(_mint())
+        assert sd.verify_token(token) is not None
+        monkeypatch.delenv("FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY")
+        sd._signing_key.cache_clear()
+        # Key now derived from the client secret: the override-signed token must fail.
+        assert sd.verify_token(token) is None
+
+    @pytest.mark.parametrize("salt", OTHER_SALTS)
+    def test_tokens_from_the_servers_other_key_families_are_rejected(self, salt):
+        """Same client secret, the OAuth proxy's salts: a FastMCP access token or a
+        storage key must never verify as a download link."""
+        other_key = derive_jwt_key(high_entropy_material=SECRET, salt=salt)
+        assert other_key != sd._signing_key()
+        assert sd.verify_token(jwt.encode(self._claims(), other_key, "HS256")) is None
+
+    @pytest.mark.parametrize("salt", OTHER_SALTS)
+    def test_isolation_holds_with_the_fastmcp_jwt_material(self, monkeypatch, salt):
+        material = "operator-supplied-jwt-signing-material"
+        monkeypatch.setenv("FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY", material)
+        sd._signing_key.cache_clear()
+        other_key = derive_jwt_key(low_entropy_material=material, salt=salt)
+        assert other_key != sd._signing_key()
+        assert sd.verify_token(jwt.encode(self._claims(), other_key, "HS256")) is None
+        assert sd.verify_token(_token(_mint())) is not None
+
+
+class TestUsability:
+    """One predicate for mint and serve, evaluated on real google-auth credentials."""
+
     NOW = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    THRESHOLD = sd.REFRESH_THRESHOLD.total_seconds()  # 225 s in google-auth 2.x
 
-    def _expiry(self, seconds):
-        return (self.NOW + timedelta(seconds=seconds)).replace(tzinfo=None)  # naive UTC
+    def _creds(self, seconds_left, **kw):
+        creds = _credentials(**kw)
+        creds.expiry = (self.NOW + timedelta(seconds=seconds_left)).replace(tzinfo=None)
+        return creds
 
-    def test_unknown_expiry_uses_default(self):
-        assert sd.clamp_ttl(None) == sd.URL_TTL_SECONDS
+    def test_google_auth_threshold_is_what_this_module_assumes(self):
+        creds = _credentials()
+        creds.expiry = _now() + timedelta(seconds=self.THRESHOLD + 5)
+        assert creds.valid is True
+        creds.expiry = _now() + timedelta(seconds=self.THRESHOLD - 5)
+        assert creds.valid is False  # still 220 s on the clock, already "expired"
+
+    def test_non_refreshable_usable_until_threshold_not_expiry(self):
+        creds = self._creds(3600)
+        assert sd.usable_seconds(creds, now=self.NOW) == 3600 - self.THRESHOLD
+        assert sd.usable_seconds(self._creds(200), now=self.NOW) < 0
+
+    def test_refreshable_is_unbounded(self):
+        creds = self._creds(-3600, refresh_token="1//r")  # long expired, refreshable
+        assert sd.usable_seconds(creds, now=self.NOW) == float("inf")
+        assert sd.clamp_ttl(creds, now=self.NOW) == sd.URL_TTL_SECONDS
+
+    def test_refresh_token_alone_is_not_refreshable(self):
+        creds = self._creds(200, refresh_token="1//r")
+        creds._client_secret = None  # google-auth cannot refresh without it
+        assert sd.usable_seconds(creds, now=self.NOW) < 0
+
+    def test_no_access_token_and_no_refresh_is_unusable(self):
+        assert sd.usable_seconds(self._creds(3600, token=None), now=self.NOW) == 0
+
+    def test_unknown_expiry_uses_default_ttl(self):
+        creds = self._creds(0)
+        creds.expiry = None
+        assert sd.clamp_ttl(creds, now=self.NOW) == sd.URL_TTL_SECONDS
 
     def test_far_expiry_capped_at_default(self):
-        assert sd.clamp_ttl(self._expiry(3600), now=self.NOW) == sd.URL_TTL_SECONDS
+        assert sd.clamp_ttl(self._creds(3600), now=self.NOW) == sd.URL_TTL_SECONDS
 
-    def test_near_expiry_clamped_with_margin(self):
-        assert sd.clamp_ttl(self._expiry(300), now=self.NOW) == 270
+    def test_near_expiry_clamped_below_the_threshold_with_margin(self):
+        # 300 s on the clock: usable for 75 s, URL gets 45 s.
+        assert sd.clamp_ttl(self._creds(300), now=self.NOW) == 300 - 225 - 30
 
-    @pytest.mark.parametrize("seconds", [-120, 0, 20])
-    def test_expired_or_inside_margin_is_non_positive(self, seconds):
-        assert sd.clamp_ttl(self._expiry(seconds), now=self.NOW) <= 0
+    @pytest.mark.parametrize("seconds", [-120, 0, 200, 255])
+    def test_inside_threshold_or_margin_is_non_positive(self, seconds):
+        assert sd.clamp_ttl(self._creds(seconds), now=self.NOW) <= 0
 
-    def test_url_never_outlives_credential(self):
-        for secs in (60, 120, 600, 3600):
-            assert sd.clamp_ttl(self._expiry(secs), now=self.NOW) <= secs
+    def test_url_never_outlives_usability(self):
+        for secs in (256, 300, 600, 3600):
+            creds = self._creds(secs)
+            assert sd.clamp_ttl(creds, now=self.NOW) < sd.usable_seconds(
+                creds, now=self.NOW
+            )
 
     def test_format_ttl(self):
         assert sd.format_ttl(45) == "45 seconds"
@@ -170,49 +370,158 @@ class TestTtl:
         assert sd.format_ttl(900) == "~15 minutes"
 
 
+class TestCredentialRecovery:
+    """Session store first, then the persistent store — the same order for the
+    tool-side gate and the route, so what gets offered can be served."""
+
+    def test_session_hit_skips_the_persistent_store(self, stores):
+        stores.session = {USER: _credentials(token="ya29.session")}
+        stores.persistent = {USER: _credentials(token="ya29.store")}
+        assert sd._recover_credentials(USER).token == "ya29.session"
+        assert stores.persistent_lookups == []
+
+    def test_session_miss_falls_back_to_the_persistent_store(self, stores):
+        stores.persistent = {USER: _credentials(token="ya29.store")}
+        assert sd._recover_credentials(USER).token == "ya29.store"
+        assert stores.session_lookups == [USER] and stores.persistent_lookups == [USER]
+
+    def test_stateless_mode_never_consults_the_persistent_store(
+        self, stores, monkeypatch
+    ):
+        monkeypatch.setattr("auth.oauth_config.is_stateless_mode", lambda: True)
+        stores.persistent = {USER: _credentials(token="ya29.store")}
+        assert sd._recover_credentials(USER) is None
+        assert stores.persistent_lookups == []
+
+    def test_store_errors_mean_not_recoverable(self, stores, monkeypatch):
+        monkeypatch.setattr(stores, "get_credential", Mock(side_effect=OSError("disk")))
+        assert sd._recover_credentials(USER) is None
+
+    def test_offer_url_uses_the_persistent_store_too(self, stores, monkeypatch):
+        """Legacy / trusted-gateway mode: the session store is empty after a restart
+        and credentials live only in the credential store — the tool must still mint."""
+        monkeypatch.setenv(sd.FLAG_ENV, "true")
+        stores.persistent = {USER: _credentials()}
+        url, ttl = sd.offer_url(USER, source="gmail", ref={"mid": "m", "aid": "a"})
+        assert ttl == sd.URL_TTL_SECONDS and sd.verify_token(_token(url))["sub"] == USER
+        assert stores.writes == []
+
+
 class TestOfferUrl:
     """The tool-side gate: a URL is only issued when the route can serve it, and the
     TTL the caller shows is the real (clamped) one."""
 
-    def _creds(self, expiry):
-        return Mock(expiry=expiry)
+    @pytest.fixture(autouse=True)
+    def _on(self, monkeypatch):
+        monkeypatch.setenv(sd.FLAG_ENV, "true")
 
     def test_mints_with_clamped_ttl(self, monkeypatch):
-        monkeypatch.setenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", "true")
-        expiry = datetime.utcnow() + timedelta(seconds=300)
-        monkeypatch.setattr(
-            sd, "_session_credentials", lambda email: self._creds(expiry)
-        )
-
+        creds = _credentials(seconds_left=600)  # no refresh token: clamp applies
+        monkeypatch.setattr(sd, "_recover_credentials", lambda email: creds)
         url, ttl = sd.offer_url(USER, source="gmail", ref={"mid": "m", "aid": "a"})
-
-        assert 265 <= ttl <= 270  # 300 s left minus the 30 s margin
+        assert 600 - 225 - 30 - 2 <= ttl <= 600 - 225 - 30
         assert sd.verify_token(_token(url))["sub"] == USER
 
     def test_none_without_recoverable_credentials(self, monkeypatch):
-        monkeypatch.setenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", "true")
-        monkeypatch.setattr(sd, "_session_credentials", lambda email: None)
+        monkeypatch.setattr(sd, "_recover_credentials", lambda email: None)
         assert sd.offer_url(USER, source="gmail", ref={}) is None
 
-    def test_none_when_token_too_near_expiry(self, monkeypatch):
-        monkeypatch.setenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", "true")
-        soon = datetime.utcnow() + timedelta(seconds=10)
-        monkeypatch.setattr(sd, "_session_credentials", lambda email: self._creds(soon))
+    def test_none_when_token_inside_googles_refresh_threshold(self, monkeypatch):
+        creds = _credentials(seconds_left=200)
+        monkeypatch.setattr(sd, "_recover_credentials", lambda email: creds)
         assert sd.offer_url(USER, source="gmail", ref={}) is None
 
     def test_none_when_no_key_can_be_derived(self, monkeypatch):
-        monkeypatch.setenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", "true")
-        monkeypatch.setattr(sd, "_session_credentials", lambda email: self._creds(None))
+        monkeypatch.setattr(sd, "_recover_credentials", lambda email: _credentials())
         monkeypatch.setattr(
             sd, "_signing_key", Mock(side_effect=RuntimeError("no key"))
         )
         assert sd.offer_url(USER, source="gmail", ref={}) is None
 
 
+class TestMintAndServeAgree:
+    """The reviewer's probe as a test: real credentials 200 s from expiry — inside
+    google-auth's 225 s REFRESH_THRESHOLD, so ``.valid`` is already False."""
+
+    @pytest.fixture(autouse=True)
+    def _on(self, monkeypatch):
+        monkeypatch.setenv(sd.FLAG_ENV, "true")
+
+    def _offer(self):
+        return sd.offer_url(USER, source="gmail", ref={"mid": "m1", "aid": "a1"})
+
+    @pytest.mark.asyncio
+    async def test_no_refresh_token_neither_mints_nor_serves(self, stores, fetcher):
+        stores.session = {USER: _credentials(seconds_left=200)}
+        assert stores.session[USER].valid is False
+        assert self._offer() is None
+        response = await sd.serve(_token(_mint()))  # a link minted by force
+        assert response.status_code == 401 and "token" not in fetcher
+
+    @pytest.mark.asyncio
+    async def test_refresh_token_mints_full_ttl_and_route_refreshes_in_memory(
+        self, stores, fetcher, token_endpoint
+    ):
+        calls, _ = token_endpoint
+        creds = _credentials(seconds_left=200, refresh_token="1//refresh")
+        stores.session = {USER: creds}
+        url, ttl = self._offer()
+        assert ttl == sd.URL_TTL_SECONDS
+
+        response = await sd.serve(_token(url))
+
+        assert response.status_code == 200 and response.body == b"ok"
+        assert fetcher["token"] == "ya29.refreshed"
+        assert [(m, u) for m, u, _ in calls] == [("POST", TOKEN_URI)]
+        assert b"grant_type=refresh_token" in calls[0][2]
+        assert stores.writes == []  # refreshed credentials never reach storage
+
+    @pytest.mark.asyncio
+    async def test_refresh_failure_is_401_and_nothing_is_fetched(
+        self, stores, fetcher, token_endpoint
+    ):
+        _, outcome = token_endpoint
+        outcome.update(status=400, body={"error": "invalid_grant"})
+        stores.session = {USER: _credentials(seconds_left=200, refresh_token="1//r")}
+        url, _ = self._offer()
+        response = await sd.serve(_token(url))
+        assert response.status_code == 401 and "token" not in fetcher
+        assert stores.writes == []
+
+    @pytest.mark.asyncio
+    async def test_still_valid_token_is_used_without_a_refresh(
+        self, stores, fetcher, token_endpoint
+    ):
+        calls, _ = token_endpoint
+        stores.session = {USER: _credentials(seconds_left=300, refresh_token="1//r")}
+        url, ttl = self._offer()
+        assert (await sd.serve(_token(url))).status_code == 200
+        assert fetcher["token"] == "ya29.access" and calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "seconds_left", [3600, 300, 256, 254, 240, 224, 200, 60, 0]
+    )
+    async def test_offer_and_route_agree_at_every_point_of_the_token_life(
+        self, stores, fetcher, seconds_left
+    ):
+        """Never mint what the route would refuse. Only inside the 30 s safety
+        margin above google-auth's threshold may the tool decline a URL the route
+        would still have served — that gap is the margin's job."""
+        stores.session = {USER: _credentials(seconds_left=seconds_left)}
+        offered = self._offer()
+        status = (await sd.serve(_token(_mint()))).status_code
+        if offered is not None:
+            assert status == 200, (seconds_left, status)
+        threshold = sd.REFRESH_THRESHOLD.total_seconds()
+        if not threshold < seconds_left <= threshold + sd._EXPIRY_MARGIN_SECONDS + 1:
+            assert (offered is not None) == (status == 200), (seconds_left, status)
+
+
 class TestServe:
     @pytest.fixture
     def collaborators(self, monkeypatch):
-        monkeypatch.setenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", "true")
+        monkeypatch.setenv(sd.FLAG_ENV, "true")
         seen = {}
 
         async def fetcher(claims, credentials):
@@ -223,14 +532,14 @@ class TestServe:
                 content=b"%PDF-1.3",
             )
 
-        creds = Mock(valid=True)
+        creds = _credentials()
 
-        def session_credentials(email):
+        def recover(email):
             seen.setdefault("emails", []).append(email)
             return creds if email == USER else None
 
         monkeypatch.setitem(sd._FETCHERS, "gmail", fetcher)
-        monkeypatch.setattr(sd, "_session_credentials", session_credentials)
+        monkeypatch.setattr(sd, "_recover_credentials", recover)
         seen["creds"] = creds
         return seen
 
@@ -249,6 +558,41 @@ class TestServe:
         assert "filename*=UTF-8''rep%22ort%0D%0A.pdf" in disposition
 
     @pytest.mark.asyncio
+    async def test_control_characters_never_reach_the_ascii_filename(
+        self, collaborators, monkeypatch
+    ):
+        """Sender-chosen names: h11 (uvicorn's HTTP/1.1 layer) refuses a header
+        value containing NUL, which would turn one download into a dropped
+        connection instead of a 200."""
+
+        async def fetcher(claims, credentials):
+            return sd.DownloadResult(
+                filename="bad\x00name\x7f\ttab\x01.txt",
+                media_type="text/plain",
+                content=b"x",
+            )
+
+        monkeypatch.setitem(sd._FETCHERS, "gmail", fetcher)
+        response = await sd.serve(_token(_mint()))
+        disposition = response.headers["content-disposition"]
+        assert 'filename="badnametab.txt"' in disposition
+        assert "filename*=UTF-8''bad%00name%7F%09tab%01.txt" in disposition
+        # h11 accepts exactly what the route emits; the raw name it would not.
+        h11.Response(
+            status_code=200,
+            headers=[
+                (k.encode(), v.encode("latin-1")) for k, v in response.headers.items()
+            ],
+        )
+        with pytest.raises(h11.LocalProtocolError):
+            h11.Response(
+                status_code=200,
+                headers=[
+                    (b"content-disposition", b'attachment; filename="bad\x00name.txt"')
+                ],
+            )
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("bad", ["garbage", "a.b.c", ""])
     async def test_invalid_token_is_403_before_any_lookup(self, collaborators, bad):
         response = await sd.serve(bad)
@@ -265,7 +609,7 @@ class TestServe:
         assert (await sd.serve(_token(_mint(source="ftp")))).status_code == 403
 
     @pytest.mark.asyncio
-    async def test_owner_without_session_is_401_and_nothing_is_fetched(
+    async def test_owner_without_credentials_is_401_and_nothing_is_fetched(
         self, collaborators
     ):
         response = await sd.serve(_token(_mint(user_email="other@example.com")))
@@ -274,8 +618,10 @@ class TestServe:
         assert "claims" not in collaborators
 
     @pytest.mark.asyncio
-    async def test_expired_credentials_are_401(self, collaborators):
-        collaborators["creds"].valid = False
+    async def test_unusable_credentials_are_401(self, collaborators):
+        creds = collaborators["creds"]  # no refresh token
+        creds.expiry = _now() + timedelta(seconds=100)
+        assert creds.valid is False
         assert (await sd.serve(_token(_mint()))).status_code == 401
         assert "claims" not in collaborators
 
@@ -286,6 +632,47 @@ class TestServe:
 
         monkeypatch.setitem(sd._FETCHERS, "gmail", failing)
         assert (await sd.serve(_token(_mint()))).status_code == 502
+
+    @pytest.mark.asyncio
+    async def test_every_response_is_nosniff_and_uncacheable(
+        self, collaborators, monkeypatch
+    ):
+        """Sender-typed bytes on a public capability URL: success and every error."""
+        responses = {
+            "ok": await sd.serve(_token(_mint())),
+            "403": await sd.serve("garbage"),
+            "401": await sd.serve(_token(_mint(user_email="other@example.com"))),
+        }
+
+        async def failing(claims, credentials):
+            raise sd.SignedDownloadError("boom")
+
+        monkeypatch.setitem(sd._FETCHERS, "gmail", failing)
+        responses["502"] = await sd.serve(_token(_mint()))
+        monkeypatch.delenv(sd.FLAG_ENV)
+        responses["404"] = await sd.serve(_token(_mint()))
+
+        for name, response in responses.items():
+            assert response.headers["x-content-type-options"] == "nosniff", name
+            assert response.headers["cache-control"] == "no-store", name
+
+    @pytest.mark.asyncio
+    async def test_streamed_responses_carry_the_same_headers(
+        self, collaborators, monkeypatch
+    ):
+        async def body():
+            yield b"part"
+
+        async def streaming(claims, credentials):
+            return sd.DownloadResult(
+                filename="v.mov", media_type="video/quicktime", stream=body()
+            )
+
+        monkeypatch.setitem(sd._FETCHERS, "gmail", streaming)
+        response = await sd.serve(_token(_mint()))
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert response.headers["cache-control"] == "no-store"
+        assert 'filename="v.mov"' in response.headers["content-disposition"]
 
 
 class _FakeDownloader:
