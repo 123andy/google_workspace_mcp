@@ -9,6 +9,7 @@ Transport alone never disables it.
 """
 
 import inspect
+import json
 import os
 import re
 import subprocess
@@ -399,3 +400,65 @@ asyncio.run(main())
         out = _run_subprocess(self.CODE, {})
         for name in self.TOOLS:
             assert f"ADVERTISED:{name}=True" in out
+
+
+class TestShippedTextNeverNamesAHiddenParameter:
+    """FastMCP ships the docstring body above ``Args:`` as the tool description
+    and each ``Args:`` line as its property's description. Hiding ``file_path``
+    from the signature drops its own line, but prose elsewhere that names it
+    would send a model after a parameter the schema does not have. One static
+    text serves both settings, so it must not enumerate the local-only route."""
+
+    CODE = """
+import asyncio, json
+from core.server import server, set_transport_mode
+set_transport_mode('streamable-http')
+import gdrive.drive_tools
+from fastmcp import Client
+
+async def main():
+    async with Client(server) as client:
+        shipped = {
+            t.name: {
+                "description": t.description or "",
+                "properties": {
+                    name: prop.get("description", "")
+                    for name, prop in t.inputSchema["properties"].items()
+                },
+            }
+            for t in await client.list_tools()
+            if t.name in %r
+        }
+        print("SHIPPED:" + json.dumps(shipped, sort_keys=True))
+
+asyncio.run(main())
+""" % (TestSchemaThroughFastMCP.TOOLS,)
+
+    def _shipped(self, env):
+        out = _run_subprocess(self.CODE, env)
+        return json.loads(out.split("SHIPPED:", 1)[1])
+
+    def test_disabled_ships_no_text_naming_file_path(self):
+        shipped = self._shipped({"WORKSPACE_MCP_DISABLE_LOCAL_FILES": "true"})
+        assert set(shipped) == set(TestSchemaThroughFastMCP.TOOLS)
+        offenders = [
+            (name, where)
+            for name, tool in shipped.items()
+            for where, text in [("description", tool["description"])]
+            + list(tool["properties"].items())
+            if "file_path" in text
+        ]
+        assert offenders == []
+
+    def test_enabled_ships_the_same_text_plus_the_parameter(self):
+        """The wording is not switched per setting: hidden or shown, the
+        description and every other property read the same."""
+        on = self._shipped({"WORKSPACE_MCP_DISABLE_LOCAL_FILES": "true"})
+        off = self._shipped({})
+        for name in TestSchemaThroughFastMCP.TOOLS:
+            assert off[name]["description"] == on[name]["description"]
+            assert "file_path" in off[name]["properties"]
+            shown = {
+                k: v for k, v in off[name]["properties"].items() if k != "file_path"
+            }
+            assert shown == on[name]["properties"]
