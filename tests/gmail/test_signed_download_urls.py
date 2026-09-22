@@ -305,3 +305,89 @@ async def test_signed_url_says_when_gmail_gave_no_name(enabled):
     assert "unknown" not in result
     assert "Filename: attachment (Gmail gave this part no name" in result
     assert offer.call_args.kwargs["filename"] is None
+    # No fallback can identify an unnamed part, so there is no current ID to
+    # carry: the caller's is minted, as before.
+    assert offer.call_args.kwargs["ref"] == {"mid": "msg-1", "aid": "old-1"}
+
+
+@pytest.mark.asyncio
+async def test_signed_url_mints_against_the_id_the_index_selected(enabled):
+    """The link must name the part Gmail has now, not the one the caller asked
+    for. The route hands the token's ``aid`` straight to Gmail; minting the
+    caller's rotated ID produces a link that resolves a name correctly and then
+    502s on fetch, minutes after the tool reported success."""
+    with patch.object(sd, "offer_url", return_value=(URL, 540)) as offer:
+        await _unwrap(get_gmail_attachment_content)(
+            service=_scanner_mail_service(),
+            message_id="msg-1",
+            attachment_id="old-pdf",
+            user_google_email=USER,
+            attachment_index=3,
+        )
+
+    assert offer.call_args.kwargs["ref"] == {"mid": "msg-1", "aid": "new-pdf"}
+
+
+@pytest.mark.asyncio
+async def test_signed_url_mints_against_the_only_attachment_after_rotation(enabled):
+    """Same for the only-attachment fallback: one attachment is unambiguous, so
+    its current ID is known even with no index and no size."""
+    service = Mock()
+    service.users().messages().get().execute.return_value = {
+        "payload": {
+            "parts": [
+                {
+                    "filename": "report.pdf",
+                    "mimeType": "application/pdf",
+                    "body": {"attachmentId": "new-only", "size": 4096},
+                }
+            ]
+        }
+    }
+    with patch.object(sd, "offer_url", return_value=(URL, 540)) as offer:
+        result = await _unwrap(get_gmail_attachment_content)(
+            service=service,
+            message_id="msg-1",
+            attachment_id="old-only",
+            user_google_email=USER,
+        )
+
+    assert "Filename: report.pdf" in result
+    assert offer.call_args.kwargs["ref"] == {"mid": "msg-1", "aid": "new-only"}
+
+
+@pytest.mark.asyncio
+async def test_signed_url_keeps_the_id_the_size_cap_pass_already_confirmed(
+    enabled, monkeypatch
+):
+    """An ID the pre-download pass resolved is not second-guessed. With the cap
+    on, that pass finds the part by ID; it just has no name, so the resolver
+    runs for the name alone and may fall back to a same-sized *different* part.
+    Taking its ID there would serve the wrong bytes under the wrong name."""
+    monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", "10485760")
+    service = Mock()
+    service.users().messages().get().execute.return_value = {
+        "payload": {
+            "parts": [
+                {
+                    "filename": "",
+                    "mimeType": "application/octet-stream",
+                    "body": {"attachmentId": "asked-for", "size": 4096},
+                },
+                {
+                    "filename": "decoy.pdf",
+                    "mimeType": "application/pdf",
+                    "body": {"attachmentId": "same-size", "size": 4096},
+                },
+            ]
+        }
+    }
+    with patch.object(sd, "offer_url", return_value=(URL, 540)) as offer:
+        await _unwrap(get_gmail_attachment_content)(
+            service=service,
+            message_id="msg-1",
+            attachment_id="asked-for",
+            user_google_email=USER,
+        )
+
+    assert offer.call_args.kwargs["ref"] == {"mid": "msg-1", "aid": "asked-for"}
