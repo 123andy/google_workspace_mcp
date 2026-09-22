@@ -28,6 +28,7 @@ def _service(mime="application/vnd.google-apps.document", name="Plan"):
 @pytest.fixture
 def enabled(monkeypatch):
     monkeypatch.setenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", "true")
+    monkeypatch.setattr(sd, "get_transport_mode", lambda: "streamable-http")
 
 
 @pytest.mark.asyncio
