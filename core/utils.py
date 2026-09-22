@@ -22,7 +22,11 @@ from fastmcp.exceptions import ToolError
 from googleapiclient.errors import HttpError
 from .api_enablement import get_api_enablement_message
 from auth.google_auth import GoogleAuthenticationError
-from auth.oauth_config import is_oauth21_enabled, is_external_oauth21_provider
+from auth.oauth_config import (
+    get_transport_mode,
+    is_external_oauth21_provider,
+    is_oauth21_enabled,
+)
 from .file_limits import get_max_office_xml_bytes
 
 logger = logging.getLogger(__name__)
@@ -70,6 +74,29 @@ _SUPPORTED_TEXT_CHOICE_NAMESPACES = {
     "http://schemas.microsoft.com/office/word/2012/wordml",
     "http://schemas.microsoft.com/office/drawing/2010/main",
 }
+
+
+def stdio_only_args(*names: str) -> list[str] | None:
+    """Tool-registration helper: hide these parameters on remote transports.
+
+    Server-side file paths (``file_path`` and friends) resolve on the machine the
+    SERVER runs on, so on a remote (streamable-http) deployment they can never
+    work for the caller. Rather than advertising a dead parameter plus warning
+    text — schema the client pays context for on every session — the parameter is
+    excluded from the tool schema entirely via FastMCP's ``exclude_args``. Local
+    (stdio) servers keep it. Same deployment-adaptive-schema idiom as the managed
+    identity handling of ``user_google_email``.
+
+    Runtime guards on these parameters stay in place as defense-in-depth: a
+    client holding a cached schema can still send the argument.
+
+    Returns the names as a list when the transport is remote (hide them), or
+    ``None`` for local transports (advertise normally). Transport must be set
+    before tool modules are imported — main() and fastmcp_server both do.
+    """
+    if get_transport_mode() == "streamable-http":
+        return list(names)
+    return None
 
 
 class TransientNetworkError(Exception):
@@ -195,6 +222,17 @@ def validate_file_path(file_path: str) -> Path:
     resolved = Path(file_path).resolve()
 
     if not resolved.exists():
+        # Name the boundary: paths resolve on the SERVER. On a remote transport
+        # a caller-side path can never exist here, and a bare "does not exist"
+        # sends the caller off checking typos instead of the topology. (Guarded
+        # call sites reject remote paths before reaching this; this phrasing is
+        # defense-in-depth for any unguarded path.)
+        if get_transport_mode() == "streamable-http":
+            raise FileNotFoundError(
+                f"Path does not exist on the MCP server: {resolved}. This server "
+                "runs remotely (streamable-http) and cannot see the caller's "
+                "local filesystem — a client-side path will never resolve here."
+            )
         raise FileNotFoundError(f"Path does not exist: {resolved}")
 
     # Block sensitive file patterns regardless of allowlist
@@ -286,8 +324,9 @@ def validate_file_path(file_path: str) -> Path:
 
     raise ValueError(
         f"Access to '{resolved_str}' is not allowed: "
-        f"path is outside permitted directories ({', '.join(str(d) for d in allowed_dirs)}). "
-        "Set ALLOWED_FILE_DIRS to adjust."
+        f"path is outside the SERVER's permitted directories ({', '.join(str(d) for d in allowed_dirs)}). "
+        "The server operator can broaden this via the ALLOWED_FILE_DIRS environment "
+        "variable; callers of a remote server cannot."
     )
 
 
