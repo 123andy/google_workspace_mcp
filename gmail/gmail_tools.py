@@ -359,6 +359,72 @@ def _format_message_header_lines(
     return content_lines
 
 
+async def _render_message_export(
+    service, message_id: str, body_format: Literal["text", "html", "raw"]
+) -> tuple[bytes, str, str, List[str]]:
+    """Fetch a message and render it as ``(bytes, mime_type, extension, notes)``.
+
+    Raises ``ValueError`` with the user-facing reason when there is nothing to export.
+    """
+    notes: List[str] = []
+    if body_format == "raw":
+        message_raw = await asyncio.to_thread(
+            service.users()
+            .messages()
+            .get(userId="me", id=message_id, format="raw")
+            .execute
+        )
+        raw_data = message_raw.get("raw", "")
+        if not raw_data:
+            raise ValueError("message has no raw content to export.")
+        padded_raw = raw_data + "=" * (-len(raw_data) % 4)
+        try:
+            return base64.urlsafe_b64decode(padded_raw), "message/rfc822", ".eml", notes
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError(f"failed to decode raw MIME content: {exc}") from exc
+
+    message_full = await asyncio.to_thread(
+        service.users()
+        .messages()
+        .get(userId="me", id=message_id, format="full")
+        .execute
+    )
+    bodies = _extract_message_bodies(message_full.get("payload", {}))
+    # Preserve the body exactly — the export must be complete — so use .strip()
+    # only to test for emptiness, never to trim the content that gets saved.
+    text_body = bodies.get("text", "")
+    html_body = bodies.get("html", "")
+
+    if body_format == "html":
+        if html_body.strip():
+            content_str = html_body
+            mime_type = "text/html"
+            extension = ".html"
+        elif text_body.strip():
+            # No HTML part; fall back to plaintext and label it honestly.
+            content_str = text_body
+            mime_type = "text/plain"
+            extension = ".txt"
+            notes.append("No HTML body present; exported the plaintext body instead.")
+        else:
+            content_str = ""
+            mime_type = "text/html"
+            extension = ".html"
+    else:  # text
+        if text_body.strip():
+            content_str = text_body
+        elif html_body.strip():
+            content_str = _html_to_text(html_body)
+        else:
+            content_str = ""
+        mime_type = "text/plain"
+        extension = ".txt"
+
+    if not content_str.strip():
+        raise ValueError("message has no readable body content to export.")
+    return content_str.encode("utf-8"), mime_type, extension, notes
+
+
 async def _export_full_message(
     service,
     message_id: str,
@@ -387,7 +453,6 @@ async def _export_full_message(
             stateless mode), or an "Error:" string.
     """
     subject = headers.get("Subject", "message") or "message"
-    notes: List[str] = []
 
     # Gmail's full/raw endpoints return their payload as one JSON response, so
     # use the metadata response's sizeEstimate to fail closed before asking the
@@ -402,66 +467,12 @@ async def _export_full_message(
     except FileTooLargeError as exc:
         return str(exc)
 
-    if body_format == "raw":
-        message_raw = await asyncio.to_thread(
-            service.users()
-            .messages()
-            .get(userId="me", id=message_id, format="raw")
-            .execute
+    try:
+        content_bytes, mime_type, extension, notes = await _render_message_export(
+            service, message_id, body_format
         )
-        raw_data = message_raw.get("raw", "")
-        if not raw_data:
-            return "Error: message has no raw content to export."
-        padded_raw = raw_data + "=" * (-len(raw_data) % 4)
-        try:
-            content_bytes = base64.urlsafe_b64decode(padded_raw)
-        except (binascii.Error, ValueError) as exc:
-            return f"Error: failed to decode raw MIME content: {exc}"
-        mime_type = "message/rfc822"
-        extension = ".eml"
-    else:
-        message_full = await asyncio.to_thread(
-            service.users()
-            .messages()
-            .get(userId="me", id=message_id, format="full")
-            .execute
-        )
-        bodies = _extract_message_bodies(message_full.get("payload", {}))
-        # Preserve the body exactly — the export must be complete — so use .strip()
-        # only to test for emptiness, never to trim the content that gets saved.
-        text_body = bodies.get("text", "")
-        html_body = bodies.get("html", "")
-
-        if body_format == "html":
-            if html_body.strip():
-                content_str = html_body
-                mime_type = "text/html"
-                extension = ".html"
-            elif text_body.strip():
-                # No HTML part; fall back to plaintext and label it honestly.
-                content_str = text_body
-                mime_type = "text/plain"
-                extension = ".txt"
-                notes.append(
-                    "No HTML body present; exported the plaintext body instead."
-                )
-            else:
-                content_str = ""
-                mime_type = "text/html"
-                extension = ".html"
-        else:  # text
-            if text_body.strip():
-                content_str = text_body
-            elif html_body.strip():
-                content_str = _html_to_text(html_body)
-            else:
-                content_str = ""
-            mime_type = "text/plain"
-            extension = ".txt"
-
-        if not content_str.strip():
-            return "Error: message has no readable body content to export."
-        content_bytes = content_str.encode("utf-8")
+    except ValueError as exc:
+        return f"Error: {exc}"
 
     # sizeEstimate is intentionally approximate. Enforce the exact decoded
     # size too before producing another representation or saving the export.
@@ -914,6 +925,56 @@ def _render_attached_messages(
             f"{ATTACHED_MESSAGE_MAX_DEPTH} deep not shown ---"
         )
     return "".join(f"\n\n{block}" for block in blocks)
+
+
+async def _resolve_attachment_name(
+    service, message_id: str, attachment_id: str, size_bytes: Optional[int] = None
+) -> tuple[Optional[str], Optional[str]]:
+    """Best-effort ``(filename, mimeType)`` for an attachment from the MIME tree.
+
+    Exact ID match first; then, when ``size_bytes`` is known, the single attachment
+    of that size (IDs rotate between fetches, sizes do not); then the only attachment.
+    """
+    filename = mime_type = None
+    try:
+        message_full = await asyncio.to_thread(
+            service.users()
+            .messages()
+            .get(
+                userId="me",
+                id=message_id,
+                format="full",
+                fields=_ATTACHMENT_METADATA_FIELDS,
+            )
+            .execute
+        )
+        attachments = _extract_attachments(message_full.get("payload", {}))
+        for att in attachments:
+            if att.get("attachmentId") == attachment_id:
+                filename, mime_type = att.get("filename"), att.get("mimeType")
+                break
+        if not filename and attachments and size_bytes is not None:
+            size_matches = [
+                att
+                for att in attachments
+                if att.get("size") and abs(att["size"] - size_bytes) < 100
+            ]
+            if len(size_matches) == 1:
+                filename = size_matches[0].get("filename")
+                mime_type = size_matches[0].get("mimeType")
+                logger.warning(
+                    f"Attachment {attachment_id} matched by size fallback as '{filename}'"
+                )
+        if not filename and len(attachments) == 1:
+            filename, mime_type = (
+                attachments[0].get("filename"),
+                attachments[0].get("mimeType"),
+            )
+    except Exception:
+        logger.debug(
+            f"Could not fetch attachment metadata for {attachment_id}, using defaults"
+        )
+    return filename, mime_type
 
 
 def _find_attachment_metadata(payload: dict, attachment_id: str) -> Optional[dict]:
@@ -2404,47 +2465,11 @@ async def get_gmail_attachment_content(
         # If the pre-download metadata fetch missed the filename, try again
         # with the full nested MIME tree and size-based fallback heuristics.
         if not filename:
-            try:
-                message_full = await asyncio.to_thread(
-                    service.users()
-                    .messages()
-                    .get(
-                        userId="me",
-                        id=message_id,
-                        format="full",
-                        fields=_ATTACHMENT_METADATA_FIELDS,
-                    )
-                    .execute
-                )
-                payload = message_full.get("payload", {})
-                attachments = _extract_attachments(payload)
-
-                for att in attachments:
-                    if att.get("attachmentId") == attachment_id:
-                        filename = att.get("filename")
-                        mime_type = att.get("mimeType")
-                        break
-
-                if not filename and attachments:
-                    size_matches = [
-                        att
-                        for att in attachments
-                        if att.get("size") and abs(att["size"] - size_bytes) < 100
-                    ]
-                    if len(size_matches) == 1:
-                        filename = size_matches[0].get("filename")
-                        mime_type = size_matches[0].get("mimeType")
-                        logger.warning(
-                            f"Attachment {attachment_id} matched by size fallback as '{filename}'"
-                        )
-
-                if not filename and len(attachments) == 1:
-                    filename = attachments[0].get("filename")
-                    mime_type = attachments[0].get("mimeType")
-            except Exception:
-                logger.debug(
-                    f"Could not fetch attachment metadata for {attachment_id}, using defaults"
-                )
+            resolved_name, resolved_mime = await _resolve_attachment_name(
+                service, message_id, attachment_id, size_bytes
+            )
+            if resolved_name or resolved_mime:
+                filename, mime_type = resolved_name, resolved_mime
 
         # Save attachment to local disk
         result = storage.save_attachment(
