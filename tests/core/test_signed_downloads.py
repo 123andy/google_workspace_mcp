@@ -1,12 +1,13 @@
 """Signed download URLs: the token is the authorization, so these pin the security
 properties — required claims, rejection of anything not minted here (including
-tokens from the server's other key families), a TTL that never outlives the
-credentials, mint and serve agreeing on "usable" with REAL google-auth
+tokens from the server's other key families), nothing readable in the link, a
+hard ceiling on token age, a TTL that never outlives the credentials, mint and serve agreeing on "usable" with REAL google-auth
 credentials, the route touching Google only after verification and only with the
 token owner's credentials (recovered read-only, refreshed in memory), hardened
 response headers, and bounded-memory Drive streaming.
 """
 
+import base64
 import json
 import logging
 import time
@@ -14,9 +15,9 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
 
 import h11
-import jwt
 import pytest
 import requests
+from cryptography.fernet import Fernet
 from fastmcp.server.auth.jwt_issuer import derive_jwt_key
 from google.oauth2.credentials import Credentials
 
@@ -48,6 +49,31 @@ def _mint(**overrides):
 
 def _token(url: str) -> str:
     return url.rsplit("/", 1)[1]
+
+
+def _claims(**overrides) -> dict:
+    now = int(time.time())
+    claims = {
+        "src": "gmail",
+        "sub": USER,
+        "iat": now,
+        "exp": now + 60,
+        "mid": "m",
+        "aid": "a",
+    }
+    claims.update(overrides)
+    return claims
+
+
+def _craft(claims: dict, key: bytes | None = None, at: int | None = None) -> str:
+    """A token the route did not mint: real (or given) key, arbitrary claims, and
+    optionally a Fernet timestamp of ``at`` instead of now."""
+    fernet = Fernet(key or sd._signing_key())
+    payload = json.dumps(claims).encode()
+    token = (
+        fernet.encrypt(payload) if at is None else fernet.encrypt_at_time(payload, at)
+    )
+    return token.decode()
 
 
 def _now() -> datetime:
@@ -333,12 +359,86 @@ class TestToken:
         assert claims["fn"] == "Report.pdf" and claims["mt"] == "application/pdf"
         assert claims["exp"] - claims["iat"] == 60
 
-    def test_tampered_token_rejected(self):
+    def test_non_ascii_filename_round_trips(self):
+        claims = sd.verify_token(_token(_mint(filename="Résumé — 履歴書.pdf")))
+        assert claims["fn"] == "Résumé — 履歴書.pdf"
+
+    def test_nothing_in_the_link_is_readable(self):
+        """Authenticated encryption, not a signature: the owner, the file name and
+        the resource IDs must not appear in the token or in any decoding of it."""
+        secrets = [
+            "owner-zq7@example.com",
+            "Payroll-Q3-x9k.pdf",
+            "MSGID-8h2q",
+            "ATTID-p4w7",
+        ]
+        url = _mint(
+            user_email=secrets[0],
+            ref={"mid": secrets[2], "aid": secrets[3]},
+            filename=secrets[1],
+        )
+        token = _token(url)
+        candidates = [token.encode()]
+        segments = [token, *token.split(".")]
+        for segment in segments:
+            padded = segment + "=" * (-len(segment) % 4)
+            for decoder in (base64.urlsafe_b64decode, base64.b64decode):
+                try:
+                    candidates.append(decoder(padded))
+                except Exception:
+                    pass
+        assert len(candidates) >= 2  # the token itself decodes as urlsafe base64
+        for blob in candidates:
+            for secret in secrets:
+                assert secret.encode() not in blob
+                assert secret.encode("utf-16-le") not in blob
+        assert sd.verify_token(token)["sub"] == secrets[0]  # still fully recoverable
+
+    def test_every_byte_tampered_is_rejected(self):
         token = _token(_mint())
-        header, payload, sig = token.split(".")
-        assert sd.verify_token(f"{header}.{payload}x.{sig}") is None
+        for i in range(len(token)):
+            flipped = "B" if token[i] != "B" else "C"
+            assert sd.verify_token(token[:i] + flipped + token[i + 1 :]) is None, i
+
+    @pytest.mark.parametrize("cut", [1, 2, 10, 32, 57])
+    def test_truncated_token_rejected(self, cut):
+        token = _token(_mint())
+        assert sd.verify_token(token[:-cut]) is None
+        assert sd.verify_token(token[cut:]) is None
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "",
+            "garbage",
+            "not.a.jwt",
+            "a.b.c",
+            "gAAAAA",
+            "ééééééééééééé",
+        ],
+    )
+    def test_garbage_and_non_ascii_rejected(self, bad):
+        assert sd.verify_token(bad) is None
+
+    def test_oversized_token_rejected_before_decrypting(self, monkeypatch):
+        monkeypatch.setattr(sd, "Fernet", Mock(side_effect=AssertionError("touched")))
+        assert sd.verify_token("A" * (sd._MAX_TOKEN_CHARS + 1)) is None
+
+    def test_non_string_token_rejected(self):
+        assert sd.verify_token(None) is None
+        assert sd.verify_token(_token(_mint()).encode()) is None
+
+    def test_appending_to_a_valid_token_rejected(self):
+        token = _token(_mint())
         assert sd.verify_token(token + "x") is None
-        assert sd.verify_token("not.a.jwt") is None
+        assert sd.verify_token(token + "AAAA") is None
+
+    @pytest.mark.parametrize(
+        "payload", [b"\xff\xfe\x00", b"[1, 2]", b"null", b'"sub"', b"", b"{"]
+    )
+    def test_real_key_but_not_a_claims_object_rejected(self, payload):
+        token = Fernet(sd._signing_key()).encrypt(payload).decode()
+        assert sd.verify_token(token) is None
 
     def test_wrong_key_rejected(self, monkeypatch):
         token = _token(_mint())
@@ -350,22 +450,79 @@ class TestToken:
 
     def test_expired_token_rejected(self):
         assert sd.verify_token(_token(_mint(ttl_seconds=-1))) is None
+        assert sd.verify_token(_token(_mint(ttl_seconds=0))) is None  # exp == now
 
     @pytest.mark.parametrize("missing", ["exp", "sub", "iat"])
-    def test_correctly_signed_token_missing_a_required_claim_rejected(self, missing):
-        claims = {
-            "src": "gmail",
-            "sub": USER,
-            "iat": int(time.time()),
-            "exp": int(time.time()) + 60,
-        }
+    def test_correctly_encrypted_token_missing_a_required_claim_rejected(self, missing):
+        claims = _claims()
         del claims[missing]
-        token = jwt.encode(claims, sd._signing_key(), algorithm="HS256")
+        assert sd.verify_token(_craft(claims)) is None
+
+    @pytest.mark.parametrize(
+        "field, value",
+        [
+            ("sub", ""),
+            ("sub", None),
+            ("sub", 7),
+            ("sub", ["u@example.com"]),
+            ("iat", "1700000000"),
+            ("iat", 1700000000.5),
+            ("iat", None),
+            ("exp", "9999999999"),
+            ("exp", True),
+            ("exp", None),
+        ],
+    )
+    def test_required_claim_of_the_wrong_type_rejected(self, field, value):
+        assert sd.verify_token(_craft(_claims(**{field: value}))) is None
+        assert sd.verify_token(_craft(_claims())) is not None  # the control passes
+
+    def test_future_iat_beyond_skew_rejected(self):
+        now = int(time.time())
+        far = _claims(iat=now + sd._CLOCK_SKEW_SECONDS + 5, exp=now + 900)
+        assert sd.verify_token(_craft(far)) is None
+        near = _claims(iat=now + sd._CLOCK_SKEW_SECONDS - 5, exp=now + 900)
+        assert sd.verify_token(_craft(near)) is not None
+
+    def test_age_ceiling_beats_a_far_future_exp(self):
+        """Fernet's timestamp is the hard ceiling: a token minted longer ago than
+        the maximum link lifetime (plus skew) is refused even if ``exp`` says
+        otherwise, so a wrong ``exp`` can never extend a link."""
+        now = int(time.time())
+        claims = _claims(iat=now - 3600, exp=now + 10**6)
+        too_old = _craft(claims, at=now - sd._MAX_TOKEN_AGE_SECONDS - 5)
+        assert sd.verify_token(too_old) is None
+        just_inside = _craft(claims, at=now - sd.URL_TTL_SECONDS)
+        assert sd.verify_token(just_inside) is not None
+        assert sd._MAX_TOKEN_AGE_SECONDS == sd.URL_TTL_SECONDS + sd._CLOCK_SKEW_SECONDS
+
+    def test_ttl_ceiling_is_evaluated_at_verify_time(self, monkeypatch):
+        """The same token: accepted now, refused once the clock passes the ceiling
+        (``exp`` is far future, so only the Fernet timestamp can refuse it)."""
+        now = int(time.time())
+        token = _craft(_claims(exp=now + 10**6))
+        assert sd.verify_token(token) is not None
+        monkeypatch.setattr(
+            sd.time, "time", lambda: now + sd._MAX_TOKEN_AGE_SECONDS + 1
+        )
         assert sd.verify_token(token) is None
+
+    def test_fernet_timestamp_is_iat(self):
+        token = _token(_mint())
+        claims = sd.verify_token(token)
+        assert (
+            Fernet(sd._signing_key()).extract_timestamp(token.encode()) == claims["iat"]
+        )
 
     def test_ref_cannot_override_reserved_claims(self):
         with pytest.raises(ValueError, match="reserved"):
             _mint(ref={"fid": "F", "sub": "attacker@example.com"})
+
+    def test_oversized_claims_refuse_to_mint(self):
+        """Never a dead link: a token the route would refuse is not minted; the
+        tool-side gate turns the ValueError into the standard download path."""
+        with pytest.raises(ValueError, match="too large"):
+            _mint(ref={"mid": "m", "aid": "a" * sd._MAX_TOKEN_CHARS})
 
     def test_no_key_material_fails_closed(self, monkeypatch):
         monkeypatch.delenv("GOOGLE_OAUTH_CLIENT_SECRET")
@@ -379,47 +536,46 @@ class TestToken:
 
 
 class TestSigningKey:
-    """Which material signs (derived only — no key setting of its own), and that
-    this route's key family is isolated from the server's other derived keys (the
-    OAuth proxy's JWT key and storage key)."""
+    """Which material derives the key (derived only — no key setting of its own),
+    that it is a well-formed Fernet key, and that this route's key family is
+    isolated from the server's other derived keys (the OAuth proxy's JWT key and
+    storage key)."""
 
     OTHER_SALTS = ["fastmcp-jwt-signing-key", "fastmcp-storage-encryption-key"]
-
-    def _claims(self):
-        now = int(time.time())
-        return {
-            "src": "gmail",
-            "sub": USER,
-            "iat": now,
-            "exp": now + 60,
-            "mid": "m",
-            "aid": "a",
-        }
 
     def test_key_derives_from_the_client_secret_under_this_modules_salt(self):
         assert sd._signing_key() == derive_jwt_key(
             high_entropy_material=SECRET, salt=sd._KEY_SALT
         )
 
+    def test_key_is_exactly_32_bytes_in_fernet_encoding(self):
+        key = sd._signing_key()
+        assert len(base64.urlsafe_b64decode(key)) == 32
+        Fernet(key)  # would raise on anything but 32 urlsafe-base64 bytes
+
     def test_fastmcp_jwt_key_material_beats_the_client_secret(self, monkeypatch):
         monkeypatch.setenv(
             "FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY", "override-material"
         )
         sd._signing_key.cache_clear()
+        assert sd._signing_key() == derive_jwt_key(
+            low_entropy_material="override-material", salt=sd._KEY_SALT
+        )
         token = _token(_mint())
         assert sd.verify_token(token) is not None
         monkeypatch.delenv("FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY")
         sd._signing_key.cache_clear()
-        # Key now derived from the client secret: the override-signed token must fail.
+        # Key now derived from the client secret: the override-minted token must fail.
         assert sd.verify_token(token) is None
 
     @pytest.mark.parametrize("salt", OTHER_SALTS)
     def test_tokens_from_the_servers_other_key_families_are_rejected(self, salt):
-        """Same client secret, the OAuth proxy's salts: a FastMCP access token or a
-        storage key must never verify as a download link."""
+        """Same client secret, the OAuth proxy's salts: a token under a FastMCP
+        access-token key or the storage key must never verify as a download link."""
         other_key = derive_jwt_key(high_entropy_material=SECRET, salt=salt)
         assert other_key != sd._signing_key()
-        assert sd.verify_token(jwt.encode(self._claims(), other_key, "HS256")) is None
+        assert sd.verify_token(_craft(_claims(), key=other_key)) is None
+        assert sd.verify_token(_craft(_claims())) is not None  # the control passes
 
     @pytest.mark.parametrize("salt", OTHER_SALTS)
     def test_isolation_holds_with_the_fastmcp_jwt_material(self, monkeypatch, salt):
@@ -428,7 +584,7 @@ class TestSigningKey:
         sd._signing_key.cache_clear()
         other_key = derive_jwt_key(low_entropy_material=material, salt=salt)
         assert other_key != sd._signing_key()
-        assert sd.verify_token(jwt.encode(self._claims(), other_key, "HS256")) is None
+        assert sd.verify_token(_craft(_claims(), key=other_key)) is None
         assert sd.verify_token(_token(_mint())) is not None
 
 
