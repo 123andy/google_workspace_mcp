@@ -24,7 +24,7 @@ from mcp.types import ToolAnnotations
 
 from auth.service_decorator import require_google_service
 from auth.oauth_config import is_stateless_mode
-from core import signed_downloads
+from core import download_handles, signed_downloads
 from core.attachment_storage import get_attachment_storage, get_attachment_url
 from core.file_limits import (
     FileTooLargeError,
@@ -630,12 +630,14 @@ async def get_drive_file_download_url(
     # Signed URL: the route streams the file from Drive at download time (exporting
     # native files when "emt" is set), so nothing is downloaded or stored here.
     ref = {"fid": file_id, **({"emt": export_mime_type} if export_mime_type else {})}
-    signed = signed_downloads.offer_url(
-        user_google_email,
-        source="drive",
-        ref=ref,
-        filename=output_filename,
-        mime_type=output_mime_type,
+    signed = await download_handles.shorten_signed_url(
+        signed_downloads.offer_url(
+            user_google_email,
+            source="drive",
+            ref=ref,
+            filename=output_filename,
+            mime_type=output_mime_type,
+        )
     )
     if signed:
         url, ttl = signed

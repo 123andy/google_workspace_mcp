@@ -680,6 +680,24 @@ async def serve_signed_attachment(request: Request):
     return await serve(request.path_params["token"])
 
 
+@server.custom_route("/dl/{handle}", methods=["GET"])
+async def serve_short_download(request: Request):
+    """Short claim-check form of ``/attachments/signed/{token}`` (this fork).
+
+    The handle is a random 128-bit capability referencing a full signed token
+    held in the shared KV store (see ``core.download_handles``). The token is
+    handed to the same ``serve`` as the long form — identical checks, headers
+    and status codes — never redirected to, which would expose it. An unknown,
+    expired or malformed handle is served as an empty token, so it answers
+    exactly as a bad long-form token does.
+    """
+    from core.download_handles import load_download_ref
+    from core.signed_downloads import serve
+
+    token = await load_download_ref(request.path_params["handle"])
+    return await serve(token or "")
+
+
 @server.custom_route("/auth/{handle}", methods=["GET"])
 async def serve_short_auth_url(request: Request):
     """Short claim-check redirect for a Google authorization URL.

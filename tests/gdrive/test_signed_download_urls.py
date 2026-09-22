@@ -8,6 +8,15 @@ import pytest
 import core.signed_downloads as sd
 from gdrive.drive_tools import get_drive_file_download_url
 
+
+@pytest.fixture(autouse=True)
+def _long_form_links(monkeypatch):
+    """This fork shortens minted links to /dl/{handle} by default
+    (core.download_handles); these tests pin the long form the tools were
+    written against. The short form is covered in tests/core/test_download_handles.py."""
+    monkeypatch.setenv("WORKSPACE_MCP_SHORT_SIGNED_URLS", "false")
+
+
 USER = "user@example.com"
 URL = "https://mcp.example.com/attachments/signed/TOKEN"
 

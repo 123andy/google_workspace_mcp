@@ -43,6 +43,10 @@ def _gmail_service():
 async def test_tool_mints_url_and_route_streams_it(monkeypatch, tmp_path):
     monkeypatch.setattr("core.attachment_storage.STORAGE_DIR", tmp_path)  # never $HOME
     monkeypatch.setenv("WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS", "true")
+    # This fork shortens links to /dl/{handle} by default (core.download_handles);
+    # these tests pin the long form. The short form has its own round trip in
+    # tests/core/test_download_handles.py.
+    monkeypatch.setenv("WORKSPACE_MCP_SHORT_SIGNED_URLS", "false")
     monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "e2e-client-secret-material")
     monkeypatch.delenv("FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY", raising=False)
     monkeypatch.setenv("WORKSPACE_EXTERNAL_URL", "http://testserver")
@@ -116,6 +120,10 @@ async def test_legacy_mode_credentials_only_in_the_credential_store_round_trip(
     from google.oauth2.credentials import Credentials
 
     monkeypatch.setenv("WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS", "true")
+    # This fork shortens links to /dl/{handle} by default (core.download_handles);
+    # these tests pin the long form. The short form has its own round trip in
+    # tests/core/test_download_handles.py.
+    monkeypatch.setenv("WORKSPACE_MCP_SHORT_SIGNED_URLS", "false")
     monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "e2e-client-secret-material")
     monkeypatch.delenv("FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY", raising=False)
     monkeypatch.setenv("WORKSPACE_EXTERNAL_URL", "http://testserver")
