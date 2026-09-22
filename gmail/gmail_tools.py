@@ -12,6 +12,7 @@ import json
 import re
 import mimetypes
 import html
+from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Annotated, Optional, List, Dict, Literal, Any, Union
@@ -956,21 +957,39 @@ def _render_attached_messages(
     return "".join(f"\n\n{block}" for block in blocks)
 
 
-async def _resolve_attachment_name(
+@dataclass(frozen=True)
+class _ResolvedAttachment:
+    """What a metadata pass could establish about the part being downloaded.
+
+    ``attachment_id`` is the ID carried by the part that was actually selected,
+    read out of the same fetch as the name — so a caller that matched on
+    anything but the ID (index, size, only-attachment) can download, or mint a
+    link for, the part Gmail currently has rather than the ID it was handed.
+    It is None when no part was identified.
+    """
+
+    filename: Optional[str] = None
+    mime_type: Optional[str] = None
+    attachment_id: Optional[str] = None
+
+
+async def _resolve_attachment(
     service,
     message_id: str,
     attachment_id: str,
     size_bytes: Optional[int] = None,
     attachment_index: Optional[int] = None,
-) -> tuple[Optional[str], Optional[str]]:
-    """Best-effort ``(filename, mimeType)`` for an attachment from the MIME tree.
+) -> _ResolvedAttachment:
+    """Best-effort name, MIME type and *current* ID for an attachment.
 
     Exact ID match first; then the attachment at ``attachment_index`` (the ordinal
     the listing emitted next to the ID, stable across the ID rotation Gmail does
     between fetches); then, when ``size_bytes`` is known, the single attachment of
-    that size; then the only attachment.
+    that size; then the only attachment. Every one of those selects a specific
+    part of the message as Gmail returns it now, so each reports that part's ID
+    alongside its name.
     """
-    filename = mime_type = None
+    filename = mime_type = resolved_id = None
     try:
         message_full = await asyncio.to_thread(
             service.users()
@@ -987,6 +1006,7 @@ async def _resolve_attachment_name(
         for att in attachments:
             if att.get("attachmentId") == attachment_id:
                 filename, mime_type = att.get("filename"), att.get("mimeType")
+                resolved_id = att.get("attachmentId")
                 break
         if (
             not filename
@@ -995,9 +1015,11 @@ async def _resolve_attachment_name(
         ):
             matched = attachments[attachment_index]
             filename, mime_type = matched.get("filename"), matched.get("mimeType")
+            resolved_id = matched.get("attachmentId")
             logger.info(
                 f"Attachment {attachment_id} not in current metadata (IDs rotate); "
-                f"named by attachment_index={attachment_index} as '{filename}'"
+                f"named by attachment_index={attachment_index} as '{filename}' "
+                f"(current ID {resolved_id})"
             )
         if not filename and attachments and size_bytes is not None:
             size_matches = [
@@ -1008,19 +1030,25 @@ async def _resolve_attachment_name(
             if len(size_matches) == 1:
                 filename = size_matches[0].get("filename")
                 mime_type = size_matches[0].get("mimeType")
+                resolved_id = size_matches[0].get("attachmentId")
                 logger.warning(
                     f"Attachment {attachment_id} matched by size fallback as '{filename}'"
                 )
         if not filename and len(attachments) == 1:
-            filename, mime_type = (
+            filename, mime_type, resolved_id = (
                 attachments[0].get("filename"),
                 attachments[0].get("mimeType"),
+                attachments[0].get("attachmentId"),
             )
     except Exception:
         logger.debug(
             f"Could not fetch attachment metadata for {attachment_id}, using defaults"
         )
-    return filename, mime_type
+    # attachment_id stays None when no fallback fired: no part was identified,
+    # so no current ID is known and the caller keeps the one it was given.
+    # _extract_attachments lists only parts Gmail named, so a nameless part
+    # always ends there.
+    return _ResolvedAttachment(filename, mime_type, resolved_id)
 
 
 def _find_attachment_metadata(payload: dict, attachment_id: str) -> Optional[dict]:
@@ -2380,6 +2408,9 @@ async def get_gmail_attachment_content(
     mime_type = None
     declared_size = None
     download_attachment_id = attachment_id
+    # Set once a metadata pass has picked out a part of the message as Gmail
+    # returns it now, so download_attachment_id is that part's current ID.
+    attachment_id_is_current = False
     max_file_bytes = get_max_file_bytes()
     if max_file_bytes is not None:
         try:
@@ -2417,7 +2448,10 @@ async def get_gmail_attachment_content(
                 filename = matched.get("filename")
                 mime_type = matched.get("mimeType")
                 declared_size = matched.get("size")
+                # _find_attachment_metadata matched on the ID itself, so its
+                # result carries none: there the caller's ID is the current one.
                 download_attachment_id = matched.get("attachmentId", attachment_id)
+                attachment_id_is_current = True
         except Exception:
             logger.debug(
                 f"Could not fetch attachment metadata for {attachment_id} before download"
@@ -2453,13 +2487,22 @@ async def get_gmail_attachment_content(
         if not filename:
             # Without a size cap there was no metadata pass above, and the
             # caller's ID may already be stale: the index selects the same part.
-            filename, mime_type = await _resolve_attachment_name(
+            resolved = await _resolve_attachment(
                 service,
                 message_id,
                 attachment_id,
                 size_bytes=declared_size,
                 attachment_index=attachment_index,
             )
+            filename, mime_type = resolved.filename, resolved.mime_type
+            if resolved.attachment_id and not attachment_id_is_current:
+                # Whichever fallback identified the part read its ID out of that
+                # same fetch. Mint the link against that ID: the route hands the
+                # token's "aid" straight to Gmail, and the caller's copy may have
+                # rotated, which would fail the download minutes later. An ID the
+                # pass above already resolved wins — it selected the part by ID,
+                # while this call may have fallen back to a same-sized one.
+                download_attachment_id = resolved.attachment_id
         signed = signed_downloads.offer_url(
             user_google_email,
             source="gmail",
@@ -2560,15 +2603,17 @@ async def get_gmail_attachment_content(
         # If the pre-download metadata fetch missed the filename, try again
         # with the full nested MIME tree and size-based fallback heuristics.
         if not filename:
-            resolved_name, resolved_mime = await _resolve_attachment_name(
+            # Naming only: the bytes are already in hand from the download above,
+            # so the current ID this may report has nothing left to select.
+            resolved = await _resolve_attachment(
                 service,
                 message_id,
                 attachment_id,
                 size_bytes,
                 attachment_index=attachment_index,
             )
-            if resolved_name or resolved_mime:
-                filename, mime_type = resolved_name, resolved_mime
+            if resolved.filename or resolved.mime_type:
+                filename, mime_type = resolved.filename, resolved.mime_type
 
         # Save attachment to local disk
         result = storage.save_attachment(

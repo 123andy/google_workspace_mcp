@@ -19,12 +19,36 @@ import gmail.gmail_tools  # noqa: F401  (registers the tool under test)
 PAYLOAD = b"%PDF-1.4 signed round trip"
 
 
-def _gmail_service():
+def _gmail_service(valid_attachment_ids=None):
+    """A Gmail mock that records every attachment ID asked for, in
+    ``service.requested_attachment_ids``.
+
+    ``valid_attachment_ids`` makes it behave like Gmail after an ID rotation:
+    any other ID raises, as the live API does for a stale one. Left None it
+    serves the payload for whatever it is asked, which is what the tests that
+    are not about rotation want.
+    """
     service = Mock()
-    service.users().messages().attachments().get().execute.return_value = {
-        "size": len(PAYLOAD),
-        "data": base64.urlsafe_b64encode(PAYLOAD).decode(),
-    }
+    service.requested_attachment_ids = []
+
+    def attachment_get(userId, messageId, id):
+        service.requested_attachment_ids.append(id)
+        if valid_attachment_ids is not None and id not in valid_attachment_ids:
+            return Mock(
+                execute=Mock(
+                    side_effect=RuntimeError(f"Gmail: attachment {id} not found")
+                )
+            )
+        return Mock(
+            execute=Mock(
+                return_value={
+                    "size": len(PAYLOAD),
+                    "data": base64.urlsafe_b64encode(PAYLOAD).decode(),
+                }
+            )
+        )
+
+    service.users().messages().attachments().get.side_effect = attachment_get
     service.users().messages().get().execute.return_value = {
         "payload": {
             "parts": [
@@ -243,23 +267,27 @@ NAMELESS_PART = {
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "metadata, args, served_as",
+    "metadata, args, served_as, fetched_id",
     [
         (
             SCANNER_MAIL,
             {"attachment_id": "old-pdf", "attachment_index": 3},
             "BRN94DDF87494B4_006201.pdf",
+            "new-pdf",
         ),
-        (NAMELESS_PART, {"attachment_id": "old-1"}, "attachment"),
+        (NAMELESS_PART, {"attachment_id": "old-1"}, "attachment", "old-1"),
     ],
     ids=["rotated-ids-named-by-index", "nameless-part"],
 )
 async def test_content_disposition_carries_the_resolved_name(
-    monkeypatch, tmp_path, metadata, args, served_as
+    monkeypatch, tmp_path, metadata, args, served_as, fetched_id
 ):
-    """The name the tool prints is the name the route serves: resolved by the
-    listing's index once Gmail has rotated the IDs, and the documented
-    'attachment' fallback when the part has no name at all."""
+    """The name the tool prints is the name the route serves, and the link is
+    minted against the ID of the part that name came from: the index picks the
+    PDF out of the rotated listing, and the route fetches ``new-pdf`` — Gmail
+    refuses the ``old-pdf`` the caller was holding. An unnamed part is not in
+    the listing at all, so nothing better than the caller's ID is known for it;
+    it keeps that ID and is served under the documented 'attachment' name."""
     monkeypatch.setattr("core.attachment_storage.STORAGE_DIR", tmp_path)  # never $HOME
     monkeypatch.setenv("WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS", "true")
     monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "e2e-client-secret-material")
@@ -272,7 +300,7 @@ async def test_content_disposition_carries_the_resolved_name(
     saved_mode = get_transport_mode()
     set_transport_mode("streamable-http")
 
-    service = _gmail_service()
+    service = _gmail_service(valid_attachment_ids={fetched_id})
     service.users().messages().get().execute.return_value = metadata
     creds = Mock(valid=True, expiry=datetime.utcnow() + timedelta(hours=1))
     store = Mock()
@@ -313,6 +341,7 @@ async def test_content_disposition_carries_the_resolved_name(
             assert ok.status_code == 200
             assert ok.content == PAYLOAD
             assert f'filename="{served_as}"' in ok.headers["content-disposition"]
+            assert service.requested_attachment_ids == [fetched_id]
     finally:
         set_transport_mode(saved_mode)
         sd._signing_key.cache_clear()
