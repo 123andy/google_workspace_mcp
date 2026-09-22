@@ -432,6 +432,19 @@ class TestToken:
         token = _token(_mint())
         assert sd.verify_token(token + "x") is None
         assert sd.verify_token(token + "AAAA") is None
+        # Re-padded and then extended is still rejected.
+        padded = token + "=" * (-len(token) % 4)
+        assert sd.verify_token(padded + "AAAA") is None
+
+    def test_minted_links_carry_no_padding_and_verify_either_way(self):
+        # A trailing '=' is easily lost when a link is copied or auto-linked, so
+        # none is emitted; a client that restores the padding still works.
+        for _ in range(200):
+            token = _token(_mint())
+            assert "=" not in token
+            assert sd.verify_token(token) is not None
+            padded = token + "=" * (-len(token) % 4)
+            assert sd.verify_token(padded) is not None
 
     @pytest.mark.parametrize(
         "payload", [b"\xff\xfe\x00", b"[1, 2]", b"null", b'"sub"', b"", b"{"]
@@ -510,8 +523,11 @@ class TestToken:
     def test_fernet_timestamp_is_iat(self):
         token = _token(_mint())
         claims = sd.verify_token(token)
+        # The link drops Fernet's padding; restore it to read the raw token.
+        padded = token + "=" * (-len(token) % 4)
         assert (
-            Fernet(sd._signing_key()).extract_timestamp(token.encode()) == claims["iat"]
+            Fernet(sd._signing_key()).extract_timestamp(padded.encode())
+            == claims["iat"]
         )
 
     def test_ref_cannot_override_reserved_claims(self):
