@@ -28,7 +28,7 @@ from core.file_limits import (
 from gdrive.drive_helpers import (
     folder_move_failed_note,
     folder_note,
-    place_file_in_folder,
+    place_created_file_in_folder,
 )
 from core.utils import (
     GOOGLE_API_WRITE_RETRIES,
@@ -449,19 +449,9 @@ async def list_docs_in_folder(
     ),
 )
 @handle_http_errors("create_doc", service_type="docs")
-@require_multiple_services(
-    [
-        {"service_type": "docs", "scopes": "docs_write", "param_name": "docs_service"},
-        {
-            "service_type": "drive",
-            "scopes": "drive_file",
-            "param_name": "drive_service",
-        },
-    ]
-)
+@require_google_service("docs", "docs_write")
 async def create_doc(
-    docs_service: Any,
-    drive_service: Any,
+    service: Any,
     user_google_email: str,
     title: str,
     content: str = "",
@@ -494,15 +484,20 @@ async def create_doc(
     )
 
     doc = await asyncio.to_thread(
-        docs_service.documents().create(body={"title": title}).execute
+        service.documents().create(body={"title": title}).execute
     )
     doc_id = doc.get("documentId")
 
     placement_note = folder_note(folder_id)
     if folder_id and folder_id != "root":
         try:
-            await place_file_in_folder(
-                drive_service, doc_id, folder_id, tool_name="create_doc"
+            # Drive is authenticated here rather than on the tool decorator so
+            # the "root" default needs no Drive scope at all.
+            await place_created_file_in_folder(
+                user_google_email=user_google_email,
+                file_id=doc_id,
+                folder_id=folder_id,
+                tool_name="create_doc",
             )
         except Exception as e:
             # The doc exists either way; report it with its ID rather than
@@ -516,7 +511,7 @@ async def create_doc(
     if content:
         requests = [{"insertText": {"location": {"index": 1}, "text": content}}]
         await asyncio.to_thread(
-            docs_service.documents()
+            service.documents()
             .batchUpdate(documentId=doc_id, body={"requests": requests})
             .execute
         )

@@ -12,11 +12,11 @@ from typing import List, Optional, Union
 
 from mcp.types import ToolAnnotations
 
-from auth.service_decorator import require_google_service, require_multiple_services
+from auth.service_decorator import require_google_service
 from gdrive.drive_helpers import (
     folder_move_failed_note,
     folder_note,
-    place_file_in_folder,
+    place_created_file_in_folder,
 )
 from core.server import server
 from core.utils import handle_http_errors, UserInputError, StringList
@@ -1212,23 +1212,9 @@ async def manage_conditional_formatting(
     ),
 )
 @handle_http_errors("create_spreadsheet", service_type="sheets")
-@require_multiple_services(
-    [
-        {
-            "service_type": "sheets",
-            "scopes": "sheets_write",
-            "param_name": "sheets_service",
-        },
-        {
-            "service_type": "drive",
-            "scopes": "drive_file",
-            "param_name": "drive_service",
-        },
-    ]
-)
+@require_google_service("sheets", "sheets_write")
 async def create_spreadsheet(
-    sheets_service,
-    drive_service,
+    service,
     user_google_email: str,
     title: str,
     sheet_names: Optional[StringList] = None,
@@ -1260,7 +1246,7 @@ async def create_spreadsheet(
         ]
 
     spreadsheet = await asyncio.to_thread(
-        sheets_service.spreadsheets()
+        service.spreadsheets()
         .create(
             body=spreadsheet_body,
             fields="spreadsheetId,spreadsheetUrl,properties(title,locale)",
@@ -1276,8 +1262,13 @@ async def create_spreadsheet(
     placement_note = folder_note(folder_id)
     if folder_id and folder_id != "root":
         try:
-            await place_file_in_folder(
-                drive_service, spreadsheet_id, folder_id, tool_name="create_spreadsheet"
+            # Drive is authenticated here rather than on the tool decorator so
+            # the "root" default needs no Drive scope at all.
+            await place_created_file_in_folder(
+                user_google_email=user_google_email,
+                file_id=spreadsheet_id,
+                folder_id=folder_id,
+                tool_name="create_spreadsheet",
             )
         except Exception as e:
             # The spreadsheet exists either way; report it with its ID rather

@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+from auth.scopes import DRIVE_FILE_SCOPE, DRIVE_SCOPE, SHEETS_WRITE_SCOPE
 from core.server import server
 from core.tool_registry import get_tool_components
 from gsheets.sheets_tools import create_spreadsheet
@@ -22,26 +23,19 @@ def _sheets_mock(spreadsheet_id="sheet-123"):
     return service
 
 
-def _drive_mock(parents=("root",)):
-    service = Mock()
-    service.files().get().execute = Mock(return_value={"parents": list(parents)})
-    service.files().update().execute = Mock(return_value={"id": "sheet-123"})
-    return service
-
-
-def _patch_resolve(return_value="resolved-folder"):
+def _patch_placement(**mock_kwargs):
+    """Stand in for the on-demand Drive move; its mechanics are tested separately."""
     return patch(
-        "gdrive.drive_helpers.resolve_folder_id",
-        new=AsyncMock(return_value=return_value),
+        "gsheets.sheets_tools.place_created_file_in_folder",
+        new=AsyncMock(**mock_kwargs),
     )
 
 
-async def _call_create_spreadsheet(sheets_service, drive_service, **overrides):
+async def _call_create_spreadsheet(sheets_service, **overrides):
     """Call the undecorated implementation to keep auth out of unit tests."""
     impl = create_spreadsheet.__wrapped__.__wrapped__
     defaults = {
-        "sheets_service": sheets_service,
-        "drive_service": drive_service,
+        "service": sheets_service,
         "user_google_email": "user@example.com",
         "title": "My Sheet",
     }
@@ -57,16 +51,29 @@ def test_create_spreadsheet_schema_exposes_optional_folder_id():
     assert parameters["properties"]["folder_id"]["default"] == "root"
 
 
+def test_create_spreadsheet_requires_no_drive_scope():
+    """
+    Drive is acquired on demand inside the tool, never by its decorator.
+
+    Declaring it on the decorator would authenticate Drive before the function
+    runs, so the folder_id="root" default would fail for a Sheets-only grant,
+    and the permission filter would drop the tool from registries lacking it.
+    """
+    required = create_spreadsheet._required_google_scopes
+
+    assert required == [SHEETS_WRITE_SCOPE]
+    assert DRIVE_FILE_SCOPE not in required
+    assert DRIVE_SCOPE not in required
+
+
 @pytest.mark.asyncio
 async def test_create_spreadsheet_defaults_to_root_and_skips_drive():
     sheets_service = _sheets_mock()
-    drive_service = Mock()
 
-    with _patch_resolve() as resolve:
-        result = await _call_create_spreadsheet(sheets_service, drive_service)
+    with _patch_placement() as place:
+        result = await _call_create_spreadsheet(sheets_service)
 
-    resolve.assert_not_awaited()
-    drive_service.files.assert_not_called()
+    place.assert_not_awaited()
     assert "Placed in folder" not in result
     assert "Successfully created spreadsheet 'My Sheet' for user@example.com." in result
     assert "ID: sheet-123" in result
@@ -76,49 +83,39 @@ async def test_create_spreadsheet_defaults_to_root_and_skips_drive():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("folder_id", ["root", "", None])
 async def test_create_spreadsheet_skips_the_move_for_root_folder_ids(folder_id):
-    """No Drive round-trip when the caller is not asking for a real folder."""
+    """No Drive authentication or round-trip when no real folder is requested."""
     sheets_service = _sheets_mock()
-    drive_service = Mock()
 
-    with _patch_resolve() as resolve:
-        result = await _call_create_spreadsheet(
-            sheets_service, drive_service, folder_id=folder_id
-        )
+    with _patch_placement() as place:
+        result = await _call_create_spreadsheet(sheets_service, folder_id=folder_id)
 
-    resolve.assert_not_awaited()
-    drive_service.files.assert_not_called()
+    place.assert_not_awaited()
     assert "Placed in folder" not in result
 
 
 @pytest.mark.asyncio
 async def test_create_spreadsheet_moves_new_file_into_requested_folder():
     sheets_service = _sheets_mock()
-    drive_service = _drive_mock(parents=["root"])
 
-    with _patch_resolve("resolved-folder") as resolve:
-        result = await _call_create_spreadsheet(
-            sheets_service, drive_service, folder_id="folder-abc"
-        )
+    with _patch_placement(return_value="resolved-folder") as place:
+        result = await _call_create_spreadsheet(sheets_service, folder_id="folder-abc")
 
-    resolve.assert_awaited_once_with(drive_service, "folder-abc")
-    assert drive_service.files().get.call_args.kwargs["fileId"] == "sheet-123"
-    update_kwargs = drive_service.files().update.call_args.kwargs
-    assert update_kwargs["fileId"] == "sheet-123"
-    assert update_kwargs["addParents"] == "resolved-folder"
-    assert update_kwargs["removeParents"] == "root"
-    assert update_kwargs["supportsAllDrives"] is True
+    place.assert_awaited_once_with(
+        user_google_email="user@example.com",
+        file_id="sheet-123",
+        folder_id="folder-abc",
+        tool_name="create_spreadsheet",
+    )
     assert "Placed in folder 'folder-abc'." in result
 
 
 @pytest.mark.asyncio
 async def test_create_spreadsheet_keeps_sheet_names_in_create_body():
     sheets_service = _sheets_mock()
-    drive_service = _drive_mock()
 
-    with _patch_resolve():
+    with _patch_placement():
         await _call_create_spreadsheet(
             sheets_service,
-            drive_service,
             sheet_names=["Q1", "Q2"],
             folder_id="folder-abc",
         )
@@ -134,10 +131,9 @@ async def test_create_spreadsheet_keeps_sheet_names_in_create_body():
 @pytest.mark.asyncio
 async def test_create_spreadsheet_omits_sheets_key_without_sheet_names():
     sheets_service = _sheets_mock()
-    drive_service = Mock()
 
-    with _patch_resolve():
-        await _call_create_spreadsheet(sheets_service, drive_service)
+    with _patch_placement():
+        await _call_create_spreadsheet(sheets_service)
 
     assert "sheets" not in sheets_service.spreadsheets().create.call_args.kwargs["body"]
 
@@ -146,18 +142,31 @@ async def test_create_spreadsheet_omits_sheets_key_without_sheet_names():
 async def test_create_spreadsheet_reports_invalid_folder_without_orphaning_the_file():
     """A failed move must still surface the spreadsheet ID and URL."""
     sheets_service = _sheets_mock()
-    drive_service = _drive_mock()
-    drive_service.files().update.reset_mock()
 
-    with patch(
-        "gdrive.drive_helpers.resolve_folder_id",
-        new=AsyncMock(side_effect=Exception("is not a folder")),
-    ):
+    with _patch_placement(side_effect=Exception("is not a folder")):
         result = await _call_create_spreadsheet(
-            sheets_service, drive_service, folder_id="not-a-folder"
+            sheets_service, folder_id="not-a-folder"
         )
 
-    drive_service.files().update.assert_not_called()
+    assert "sheet-123" in result
     assert "is not a folder" in result
     assert "My Drive root" in result
     assert "Placed in folder" not in result
+
+
+@pytest.mark.asyncio
+async def test_create_spreadsheet_survives_missing_drive_authorization():
+    """
+    A Sheets-only grant still creates the file; only the move is reported failed.
+
+    The on-demand Drive service raises at authentication time for a caller
+    without drive.file, which must not cost the caller the spreadsheet.
+    """
+    sheets_service = _sheets_mock()
+
+    with _patch_placement(side_effect=Exception("credentials lack required scopes")):
+        result = await _call_create_spreadsheet(sheets_service, folder_id="folder-abc")
+
+    assert "sheet-123" in result
+    assert "credentials lack required scopes" in result
+    assert "Placed in folder 'folder-abc'." not in result

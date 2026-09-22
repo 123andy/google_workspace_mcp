@@ -23,6 +23,7 @@ from urllib.request import url2pathname
 import httpx
 from googleapiclient.http import MediaIoBaseUpload
 
+from auth.service_decorator import require_google_service
 from core.http_utils import (
     redact_url as _redact_url,
     ssrf_safe_stream as _ssrf_safe_stream,
@@ -560,6 +561,43 @@ async def place_file_in_folder(
         f"(removed parents: '{remove_parents}')"
     )
     return resolved_folder_id
+
+
+@require_google_service("drive", "drive_file")
+async def place_created_file_in_folder(
+    service,
+    user_google_email: str,
+    file_id: str,
+    folder_id: str,
+    tool_name: str = "place_created_file_in_folder",
+) -> str:
+    """
+    Authenticate Drive on demand, then re-parent ``file_id`` into ``folder_id``.
+
+    ``create_doc`` and ``create_spreadsheet`` need Drive only when the caller
+    names a real folder. Declaring Drive on the tool's own decorator instead
+    would make every call demand ``drive.file`` up front, including the
+    ``folder_id="root"`` default that touches Drive not at all, and would drop
+    the tool from the registry under any permission set omitting that scope.
+    Service-account mode is worse still: ``_widen_drive_scope_for_dwd``
+    substitutes the full Drive scope for ``drive.file``, so the default path
+    would ask for read/write access to the user's entire Drive.
+
+    Call it only when a move is actually wanted::
+
+        if folder_id and folder_id != "root":
+            await place_created_file_in_folder(...)
+
+    Args:
+        user_google_email: User whose Drive credentials to use.
+        file_id: ID of the file to move.
+        folder_id: Destination folder. Must name a real folder, not ``"root"``.
+        tool_name: Calling tool, for log prefixes.
+
+    Returns:
+        The resolved destination folder ID.
+    """
+    return await place_file_in_folder(service, file_id, folder_id, tool_name=tool_name)
 
 
 def folder_note(folder_id: Optional[str]) -> str:
