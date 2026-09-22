@@ -7,8 +7,8 @@ stateless mode, and not tied to a user) or hand base64 back through the model.
 
 With ``WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS=true`` the download tools instead
 return ``/attachments/signed/{token}``: a Fernet token (authenticated
-encryption) naming the resource, its owner (``sub``) and an expiry. Nothing in
-the link is readable without the key. The route decrypts and authenticates the
+encryption) naming the resource, its owner (``sub``) and an expiry. Without
+the key the link reveals only when it was minted, not its owner or file. The route decrypts and authenticates the
 token, recovers the owner's credentials (the in-process session store first,
 then the persistent credential store), fetches from Google and returns the
 bytes. The token is the authorization; the route never writes to either store.
@@ -254,10 +254,17 @@ def mint_url(
     if mime_type:
         claims["mt"] = mime_type
     payload = json.dumps(claims, separators=(",", ":"), ensure_ascii=False)
-    token = Fernet(_signing_key()).encrypt_at_time(payload.encode("utf-8"), now)
+    # Padding is dropped from the URL: a trailing '=' is easily lost when a link
+    # is copied or auto-linked, and verify_token restores it.
+    token = (
+        Fernet(_signing_key())
+        .encrypt_at_time(payload.encode("utf-8"), now)
+        .decode("ascii")
+        .rstrip("=")
+    )
     if len(token) > _MAX_TOKEN_CHARS:
         raise ValueError("download token too large for the route to accept")
-    return f"{_base_url()}/attachments/signed/{token.decode('ascii')}"
+    return f"{_base_url()}/attachments/signed/{token}"
 
 
 def _is_timestamp(value) -> bool:
@@ -268,8 +275,9 @@ def verify_token(token: str) -> Optional[dict]:
     """Claims for a valid token, else None (tampered, wrong key, expired,
     malformed, no key). Every check happens before any credential lookup.
 
-    The token must be the canonical URL-safe base64 Fernet emitted (the decoder
-    would otherwise ignore bytes appended after the padding). Fernet then
+    The token must be the canonical URL-safe base64 Fernet emitted, with or
+    without its padding (the decoder would otherwise ignore bytes appended after
+    the padding). Fernet then
     authenticates it and refuses one older than ``_MAX_TOKEN_AGE_SECONDS`` by its
     own timestamp (the hard ceiling); then the decrypted claims must carry a
     non-empty ``sub`` and integer ``iat``/``exp``, ``exp`` must still be in the
@@ -279,7 +287,8 @@ def verify_token(token: str) -> Optional[dict]:
         return None
     now = int(time.time())
     try:
-        raw = token.encode("ascii")
+        raw = token.encode("ascii").rstrip(b"=")
+        raw += b"=" * (-len(raw) % 4)
         if base64.urlsafe_b64encode(base64.urlsafe_b64decode(raw)) != raw:
             return None
         payload = Fernet(_signing_key()).decrypt_at_time(
@@ -367,7 +376,7 @@ def url_lines(url: str, ttl: int, what: str) -> list[str]:
     return [
         f"\n📎 Download URL: {url}",
         f"\nThe server fetches the {what} directly from Google when this URL is "
-        f"requested; the link is signed to you and expires in {format_ttl(ttl)}. "
+        f"requested; the link is tied to your account and expires in {format_ttl(ttl)}. "
         "Fetch it promptly; do not queue it for later.",
     ]
 
