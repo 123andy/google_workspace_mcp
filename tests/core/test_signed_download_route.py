@@ -205,3 +205,114 @@ async def test_legacy_mode_credentials_only_in_the_credential_store_round_trip(
     finally:
         set_transport_mode(saved_mode)
         sd._signing_key.cache_clear()
+
+
+def _part(mime, name, aid, size):
+    return {
+        "mimeType": mime,
+        "filename": name,
+        "body": {"attachmentId": aid, "size": size},
+    }
+
+
+# Metadata as Gmail returns it on a later fetch: the IDs the caller holds
+# (``old-*``) have rotated, so only the listing's ordinal still identifies the PDF.
+SCANNER_MAIL = {
+    "payload": {
+        "mimeType": "multipart/mixed",
+        "parts": [
+            {
+                "mimeType": "multipart/related",
+                "parts": [
+                    _part("image/png", "image001.png", "new-img1", 4210),
+                    _part("image/png", "image002.png", "new-img2", 3890),
+                    _part("image/jpeg", "image003.jpg", "new-img3", 9012),
+                ],
+            },
+            _part("application/pdf", "BRN94DDF87494B4_006201.pdf", "new-pdf", 26),
+        ],
+    }
+}
+NAMELESS_PART = {
+    "payload": {
+        "mimeType": "application/octet-stream",
+        "body": {"attachmentId": "new-1", "size": 26},
+    }
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metadata, args, served_as",
+    [
+        (
+            SCANNER_MAIL,
+            {"attachment_id": "old-pdf", "attachment_index": 3},
+            "BRN94DDF87494B4_006201.pdf",
+        ),
+        (NAMELESS_PART, {"attachment_id": "old-1"}, "attachment"),
+    ],
+    ids=["rotated-ids-named-by-index", "nameless-part"],
+)
+async def test_content_disposition_carries_the_resolved_name(
+    monkeypatch, tmp_path, metadata, args, served_as
+):
+    """The name the tool prints is the name the route serves: resolved by the
+    listing's index once Gmail has rotated the IDs, and the documented
+    'attachment' fallback when the part has no name at all."""
+    monkeypatch.setattr("core.attachment_storage.STORAGE_DIR", tmp_path)  # never $HOME
+    monkeypatch.setenv("WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS", "true")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "e2e-client-secret-material")
+    monkeypatch.delenv("FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY", raising=False)
+    monkeypatch.delenv("WORKSPACE_MCP_MAX_FILE_BYTES", raising=False)
+    monkeypatch.setenv("WORKSPACE_EXTERNAL_URL", "http://testserver")
+    sd._signing_key.cache_clear()
+    from core.config import get_transport_mode
+
+    saved_mode = get_transport_mode()
+    set_transport_mode("streamable-http")
+
+    service = _gmail_service()
+    service.users().messages().get().execute.return_value = metadata
+    creds = Mock(valid=True, expiry=datetime.utcnow() + timedelta(hours=1))
+    store = Mock()
+    store.get_credentials = lambda email: creds if email == "user@example.com" else None
+    auth = AsyncMock(return_value=(service, "user@example.com"))
+
+    try:
+        with (
+            patch.object(service_decorator, "_authenticate_service", auth),
+            patch(
+                "auth.oauth21_session_store.get_oauth21_session_store", lambda: store
+            ),
+            patch.object(sd, "build", lambda *a, **k: service),
+        ):
+            async with Client(server) as client:
+                result = await client.call_tool(
+                    "get_gmail_attachment_content",
+                    {
+                        "message_id": "msg-1",
+                        "user_google_email": "user@example.com",
+                        **args,
+                    },
+                )
+            text = result.content[0].text
+            assert f"Filename: {served_as}" in text, text
+            assert "unknown" not in text
+            url = next(
+                line.split("Download URL: ", 1)[1]
+                for line in text.splitlines()
+                if "Download URL:" in line
+            )
+            transport = httpx.ASGITransport(app=server.http_app())
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as http:
+                ok = await http.get(url)
+
+            assert ok.status_code == 200
+            assert ok.content == PAYLOAD
+            assert f'filename="{served_as}"' in ok.headers["content-disposition"]
+    finally:
+        set_transport_mode(saved_mode)
+        sd._signing_key.cache_clear()

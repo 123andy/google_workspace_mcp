@@ -205,3 +205,94 @@ async def test_full_export_fallback_has_no_note_when_feature_off(monkeypatch):
 
     assert "Hello world" in result
     assert sd.UNAVAILABLE_NOTE not in result
+
+
+PDF_NAME = "BRN94DDF87494B4_006201.pdf"
+
+
+def _scanner_mail_service(payload=b"%PDF-1.4 scan", *, pdf_name=PDF_NAME):
+    """A scanned PDF behind a signature block: three inline images first, the
+    PDF last. The metadata fetch returns attachment IDs Gmail has rotated since
+    the listing the caller is holding (``old-*``), so nothing matches by ID."""
+
+    def part(mime, name, aid, size):
+        return {
+            "mimeType": mime,
+            "filename": name,
+            "body": {"attachmentId": aid, "size": size},
+        }
+
+    service = Mock()
+    service.users().messages().attachments().get().execute.return_value = {
+        "size": len(payload),
+        "data": base64.urlsafe_b64encode(payload).decode(),
+    }
+    service.users().messages().get().execute.return_value = {
+        "payload": {
+            "mimeType": "multipart/mixed",
+            "parts": [
+                {
+                    "mimeType": "multipart/related",
+                    "parts": [
+                        {
+                            "mimeType": "multipart/alternative",
+                            "parts": [
+                                {"mimeType": "text/plain", "body": {"size": 120}},
+                                {"mimeType": "text/html", "body": {"size": 2400}},
+                            ],
+                        },
+                        part("image/png", "image001.png", "new-img1", 4210),
+                        part("image/png", "image002.png", "new-img2", 3890),
+                        part("image/jpeg", "image003.jpg", "new-img3", 9012),
+                    ],
+                },
+                part("application/pdf", pdf_name, "new-pdf", len(payload)),
+            ],
+        }
+    }
+    return service
+
+
+@pytest.mark.asyncio
+async def test_signed_url_names_the_attachment_after_gmail_rotated_ids(enabled):
+    """Live case: the listing named the PDF, but the link came back as
+    'unknown'. With no size cap there is no pre-download metadata pass, and the
+    name resolver was handed neither the index nor a size, so a rotated ID left
+    it with nothing to match on among the four named parts."""
+    with patch.object(sd, "offer_url", return_value=(URL, 540)) as offer:
+        result = await _unwrap(get_gmail_attachment_content)(
+            service=_scanner_mail_service(),
+            message_id="msg-1",
+            attachment_id="old-pdf",
+            user_google_email=USER,
+            attachment_index=3,
+        )
+
+    assert f"Filename: {PDF_NAME}" in result
+    assert "unknown" not in result
+    assert offer.call_args.kwargs["filename"] == PDF_NAME
+    assert offer.call_args.kwargs["mime_type"] == "application/pdf"
+
+
+@pytest.mark.asyncio
+async def test_signed_url_says_when_gmail_gave_no_name(enabled):
+    """A part with no filename is not 'unknown': the link is served as
+    'attachment', and the result says so instead of printing a placeholder."""
+    service = Mock()
+    service.users().messages().get().execute.return_value = {
+        "payload": {
+            "mimeType": "application/octet-stream",
+            "body": {"attachmentId": "new-1", "size": 10},
+        }
+    }
+    with patch.object(sd, "offer_url", return_value=(URL, 540)) as offer:
+        result = await _unwrap(get_gmail_attachment_content)(
+            service=service,
+            message_id="msg-1",
+            attachment_id="old-1",
+            user_google_email=USER,
+        )
+
+    assert "unknown" not in result
+    assert "Filename: attachment (Gmail gave this part no name" in result
+    assert offer.call_args.kwargs["filename"] is None
