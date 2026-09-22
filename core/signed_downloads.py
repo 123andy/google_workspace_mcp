@@ -35,6 +35,8 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
+from core.config import get_transport_mode
+
 logger = logging.getLogger(__name__)
 
 _ALG = "HS256"
@@ -46,7 +48,12 @@ _RESERVED_CLAIMS = frozenset({"src", "sub", "iat", "exp", "fn", "mt"})
 
 
 def enabled() -> bool:
-    return os.getenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", "false").lower() == "true"
+    """Opt-in, and only over streamable-http: the stdio callback server does not
+    mount this route, and a local server can hand out file paths instead."""
+    return (
+        os.getenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", "false").lower() == "true"
+        and get_transport_mode() == "streamable-http"
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -357,6 +364,8 @@ def _content_disposition(name: str) -> str:
 
 async def serve(token: str) -> Response:
     """Verify a signed token, then stream the resource with its owner's credentials."""
+    if not enabled():  # keep the public route inert unless the feature is on
+        return JSONResponse({"error": "Not found"}, status_code=404)
     claims = verify_token(token)
     fetcher = _FETCHERS.get(claims.get("src", "")) if claims else None
     if not (claims and fetcher and claims.get("sub")):

@@ -23,6 +23,7 @@ def signing_material(monkeypatch):
     )
     monkeypatch.delenv("FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY", raising=False)
     monkeypatch.setenv("WORKSPACE_EXTERNAL_URL", "https://mcp.example.com/")
+    monkeypatch.setattr(sd, "get_transport_mode", lambda: "streamable-http")
     sd._signing_key.cache_clear()
     yield
     sd._signing_key.cache_clear()
@@ -49,6 +50,23 @@ class TestEnabledFlag:
     def test_on_when_true(self, monkeypatch):
         monkeypatch.setenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", "true")
         assert sd.enabled() is True
+
+    def test_off_on_stdio_even_when_set(self, monkeypatch):
+        """The stdio callback server does not mount the route; a local server hands
+        out file paths instead."""
+        monkeypatch.setenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", "true")
+        monkeypatch.setattr(sd, "get_transport_mode", lambda: "stdio")
+        assert sd.enabled() is False
+
+    @pytest.mark.asyncio
+    async def test_route_is_inert_when_disabled(self, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", "true")
+        token = _token(_mint())
+        monkeypatch.delenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS")
+        monkeypatch.setattr(sd, "_session_credentials", Mock())
+        response = await sd.serve(token)
+        assert response.status_code == 404
+        sd._session_credentials.assert_not_called()
 
 
 class TestToken:
@@ -194,6 +212,7 @@ class TestOfferUrl:
 class TestServe:
     @pytest.fixture
     def collaborators(self, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", "true")
         seen = {}
 
         async def fetcher(claims, credentials):
