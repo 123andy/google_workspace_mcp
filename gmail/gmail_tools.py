@@ -31,6 +31,7 @@ from pydantic.json_schema import SkipJsonSchema
 
 from auth.oauth_config import is_stateless_mode
 from auth.service_decorator import require_google_service
+from core import signed_downloads
 from core.attachment_storage import (
     get_attachment_storage,
     get_attachment_url,
@@ -470,6 +471,7 @@ async def _export_full_message(
     declared_size: Optional[int] = None,
     include_headers: bool = True,
     include_links: bool = False,
+    user_google_email: Optional[str] = None,
 ) -> str:
     """
     Return a message's complete, untruncated content: saved to storage and
@@ -509,6 +511,27 @@ async def _export_full_message(
         )
     except FileTooLargeError as exc:
         return str(exc)
+
+    # Signed URL: the route re-fetches the message from Gmail at download time, so
+    # nothing is fetched, written or inlined here. Works in stateless mode too.
+    extension = {"raw": ".eml", "html": ".html", "text": ".txt"}[body_format]
+    signed = user_google_email and signed_downloads.offer_url(
+        user_google_email,
+        source="gmail_message",
+        ref={"mid": message_id, "fmt": body_format},
+        filename=f"{file_stem[:80]}{extension}",
+    )
+    if signed:
+        url, ttl = signed
+        result_lines = _format_message_header_lines(headers) if include_headers else []
+        result_lines.append("\n--- FULL MESSAGE EXPORT (signed URL) ---")
+        result_lines.append(f"Format: {extension.lstrip('.')}")
+        result_lines.extend(signed_downloads.url_lines(url, ttl, "complete message"))
+        result_lines.append("Content is NOT included in this response.")
+        logger.info(
+            "[get_gmail_message_content] Returning signed download URL (no export)"
+        )
+        return "\n".join(result_lines)
 
     try:
         content_bytes, mime_type, extension, notes = await _render_message_export(
@@ -1921,12 +1944,13 @@ async def get_gmail_message_content(
         bool,
         Field(
             description=(
-                "When True, return the COMPLETE untruncated message: saved to "
-                "storage and referenced by download URL/file path instead of the body "
-                "text. In stateless mode without GCS staging, the body is returned "
-                "inline; with GCS staging, a signed download URL is returned. Use for "
-                "messages large enough to hit the truncation limit, or when byte-exact "
-                "fidelity is needed (pair with body_format='raw' for a .eml export)."
+                "When True, return the COMPLETE untruncated message: referenced by a "
+                "download URL (a short-lived signed link when the server enables signed "
+                "URLs, else a stored file) or file path instead of the body text. In "
+                "stateless mode without GCS staging, the body is returned inline; with "
+                "GCS staging, a signed download URL is returned. Use for messages large "
+                "enough to hit the truncation limit, or when byte-exact fidelity is "
+                "needed (pair with body_format='raw' for a .eml export)."
             ),
         ),
     ] = False,
@@ -2070,6 +2094,7 @@ async def get_gmail_message_content(
             declared_size=message_metadata.get("sizeEstimate"),
             include_headers=include_headers,
             include_links=include_links,
+            user_google_email=user_google_email,
         )
 
     # Handle raw format separately - fetch with format="raw" and return decoded MIME
@@ -2388,7 +2413,9 @@ async def get_gmail_attachment_content(
     Downloads an email attachment and saves it to local disk.
 
     In stdio mode, returns the local file path for direct access.
-    In HTTP mode, returns a temporary download URL (valid for 1 hour).
+    In HTTP mode, returns a download URL: with signed download URLs enabled on the
+    server, a link that streams from Gmail on demand and expires within ~15 minutes
+    (fetch it promptly); otherwise a server-stored copy valid for 1 hour.
     May re-fetch message metadata to resolve filename and MIME type.
 
     Args:
@@ -2491,6 +2518,37 @@ async def get_gmail_attachment_content(
     except FileTooLargeError as e:
         return str(e)
 
+    # Signed URL: the route fetches the bytes from Gmail at download time, so the
+    # attachment is not downloaded here. return_base64 asks for the bytes inline.
+    no_url = not return_base64 and signed_downloads.enabled()
+    if no_url:
+        if not filename:
+            filename, mime_type = await _resolve_attachment_name(
+                service, message_id, attachment_id
+            )
+        signed = signed_downloads.offer_url(
+            user_google_email,
+            source="gmail",
+            ref={"mid": message_id, "aid": download_attachment_id},
+            filename=filename,
+            mime_type=mime_type,
+        )
+        if signed:
+            url, ttl = signed
+            logger.info(
+                "[get_gmail_attachment_content] Returning signed download URL (no download)"
+            )
+            return "\n".join(
+                [
+                    "Attachment ready — streamed on demand (no base64, nothing stored).",
+                    f"Message ID: {message_id}",
+                    f"Filename: {filename or 'unknown'}",
+                    *signed_downloads.url_lines(url, ttl, "attachment"),
+                    "\nNote: Attachment IDs are ephemeral. Always use IDs from the most "
+                    "recent message fetch.",
+                ]
+            )
+
     try:
         attachment = await asyncio.to_thread(
             service.users()
@@ -2535,10 +2593,13 @@ async def get_gmail_attachment_content(
 
     if is_stateless_mode() and not gcs_files_enabled():
         result_lines = [
-            "Attachment downloaded successfully!",
+            "Attachment fetched, but NO download URL could be issued."
+            if no_url
+            else "Attachment downloaded successfully!",
             f"Message ID: {message_id}",
             f"Size: {size_kb:.1f} KB ({size_bytes} bytes)",
             "\n⚠️ Stateless mode: File storage disabled.",
+            *([signed_downloads.UNAVAILABLE_NOTE] if no_url else []),
             "\nBase64-encoded content (first 100 characters shown):",
             f"{base64_data[:100]}...",
             "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch.",
@@ -2592,6 +2653,8 @@ async def get_gmail_attachment_content(
             download_url = await asyncio.to_thread(get_attachment_url, result.file_id)
             result_lines.append(f"\n📎 Download URL: {download_url}")
             result_lines.append("\nThe file will expire after 1 hour.")
+            if no_url:
+                result_lines.append(signed_downloads.UNAVAILABLE_NOTE)
 
         result_lines.append(
             "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch."
