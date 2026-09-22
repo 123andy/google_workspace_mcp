@@ -131,7 +131,7 @@ async def test_full_export_offers_signed_url_and_skips_fetch(
             service, "msg-1", HEADERS, body_format, user_google_email=USER
         )
 
-    assert "FULL MESSAGE EXPORT (signed URL)" in result and URL in result
+    assert "FULL MESSAGE EXPORT (download link)" in result and URL in result
     assert "Content is NOT included" in result
     service.users.assert_not_called()  # the route fetches at download time
     kwargs = offer.call_args.kwargs
