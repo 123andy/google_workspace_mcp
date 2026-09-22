@@ -5,14 +5,16 @@ This module provides MCP tools for interacting with Google Apps Script API.
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import weakref
+from functools import wraps
 from typing import Any, Dict, List, Optional
 
 from mcp.types import ToolAnnotations
 
-from auth.service_decorator import require_google_service, require_multiple_services
+from auth.service_decorator import require_google_service
 from core.server import server
 from core.utils import ObjectList, UserInputError, handle_http_errors
 
@@ -151,6 +153,62 @@ async def _list_script_projects_impl(
     return "\n".join(output)
 
 
+def _require_project_action_service(action_services):
+    """Select authentication by action while retaining the named service slots."""
+
+    def decorator(func):
+        original_sig = inspect.signature(func)
+        public_params = list(original_sig.parameters.values())[2:]
+        dispatch_sig = original_sig.replace(parameters=public_params)
+
+        @wraps(func)
+        async def invoke(service, *args, **kwargs):
+            action = (
+                dispatch_sig.bind(*args, **kwargs).arguments["action"].lower().strip()
+            )
+            service_type, _ = action_services[action]
+            return await func(
+                service if service_type == "drive" else None,
+                service if service_type == "script" else None,
+                *args,
+                **kwargs,
+            )
+
+        invoke.__signature__ = original_sig.replace(
+            parameters=[
+                inspect.Parameter("service", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+                *public_params,
+            ]
+        )
+        handlers = {
+            action: require_google_service(service_type, scopes)(invoke)
+            for action, (service_type, scopes) in action_services.items()
+        }
+        # Let the existing auth decorator handle the managed-email signature.
+        public_sig = inspect.signature(next(iter(handlers.values())))
+
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            arguments = public_sig.bind(*args, **kwargs).arguments
+            action = arguments["action"].lower().strip()
+            if action not in handlers:
+                choices = " or ".join(repr(value) for value in handlers)
+                raise UserInputError(f"Invalid action '{action}'. Must be {choices}.")
+            return await handlers[action](**arguments)
+
+        wrapper.__signature__ = public_sig
+        wrapper._required_google_scopes = list(
+            dict.fromkeys(
+                scope
+                for handler in handlers.values()
+                for scope in handler._required_google_scopes
+            )
+        )
+        return wrapper
+
+    return decorator
+
+
 @server.tool(
     title="Get Script Project",
     annotations=ToolAnnotations(
@@ -160,19 +218,8 @@ async def _list_script_projects_impl(
         openWorldHint=True,
     ),
 )
-@require_multiple_services(
-    [
-        {
-            "service_type": "drive",
-            "scopes": "drive_read",
-            "param_name": "drive_service",
-        },
-        {
-            "service_type": "script",
-            "scopes": "script_readonly",
-            "param_name": "script_service",
-        },
-    ]
+@_require_project_action_service(
+    {"list": ("drive", "drive_read"), "get": ("script", "script_readonly")}
 )
 @handle_http_errors("get_script_project", is_read_only=True, service_type="script")
 async def get_script_project(
@@ -934,19 +981,8 @@ async def _delete_script_project_impl(
         openWorldHint=True,
     ),
 )
-@require_multiple_services(
-    [
-        {
-            "service_type": "drive",
-            "scopes": "drive_full",
-            "param_name": "drive_service",
-        },
-        {
-            "service_type": "script",
-            "scopes": "script_projects",
-            "param_name": "script_service",
-        },
-    ]
+@_require_project_action_service(
+    {"create": ("script", "script_projects"), "delete": ("drive", "drive_full")}
 )
 @handle_http_errors("manage_script_project", service_type="script")
 async def manage_script_project(
@@ -1678,7 +1714,7 @@ async def _run_trigger_admin(
     dev_mode: bool,
     deployment_id: Optional[str],
 ) -> List[Dict[str, Any]]:
-    """Provision the helper, run one of its functions, and parse its JSON result."""
+    """Ensure the executed code has the helper, run it, and parse its JSON result."""
     if not deployment_id:
         deployment_id = await _resolve_execution_deployment_id(service, script_id)
     if not deployment_id:
@@ -1687,7 +1723,37 @@ async def _run_trigger_admin(
             "editor, use Deploy > New deployment > API Executable."
         )
 
-    await _ensure_trigger_admin_file(service, script_id)
+    if dev_mode:
+        await _ensure_trigger_admin_file(service, script_id)
+    else:
+        deployment = await asyncio.to_thread(
+            service.projects()
+            .deployments()
+            .get(scriptId=script_id, deploymentId=deployment_id)
+            .execute
+        )
+        version_number = deployment.get("deploymentConfig", {}).get("versionNumber")
+        if version_number is None:
+            raise UserInputError(
+                "The selected deployment must reference a script version."
+            )
+        content = await asyncio.to_thread(
+            service.projects()
+            .getContent(scriptId=script_id, versionNumber=version_number)
+            .execute
+        )
+        if not any(
+            function.get("name") == function_name
+            for file in content.get("files", [])
+            if file.get("type") == "SERVER_JS"
+            for function in file.get("functionSet", {}).get("values", [])
+        ):
+            raise UserInputError(
+                f"Deployment '{deployment_id}' (version {version_number}) does not "
+                f"contain {function_name}. Run with dev_mode=True as the project "
+                "owner to provision the helper, then create a new version and "
+                "update the deployment before using dev_mode=False."
+            )
 
     body: Dict[str, Any] = {"function": function_name, "devMode": dev_mode}
     if parameters:
@@ -1760,8 +1826,8 @@ async def manage_script_trigger(
     """
     List or delete the current user's installable triggers on a script project.
 
-    The Apps Script REST API has no triggers resource, so both actions provision
-    (or refresh) a small helper file in the project and run it via the Execution
+    The Apps Script REST API has no triggers resource, so in dev_mode both actions
+    provision (or refresh) a small helper file and run it via the Execution
     API - the only way to inspect or change trigger state without opening the
     editor. Neither action is read-only: the helper file may be written into the
     project on first use. To create a trigger, use `generate_trigger_code` to

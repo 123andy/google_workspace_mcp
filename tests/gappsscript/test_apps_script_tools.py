@@ -5,6 +5,7 @@ Tests all Apps Script tools with mocked API responses
 """
 
 import asyncio
+import inspect
 import json
 import os
 import shutil
@@ -23,6 +24,7 @@ from pydantic import TypeAdapter
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 from core.utils import UserInputError
+import auth.service_decorator as service_decorator
 
 # Import the internal implementation functions (not the decorated ones)
 from gappsscript.apps_script_tools import (
@@ -47,6 +49,7 @@ from gappsscript.apps_script_tools import (
     _list_script_triggers_impl,
     _delete_script_trigger_impl,
     _ensure_trigger_admin_file,
+    _require_project_action_service,
     _TRIGGER_ADMIN_FILE_NAME,
     _TRIGGER_ADMIN_MARKER,
     _TRIGGER_ADMIN_SOURCE,
@@ -1248,6 +1251,80 @@ async def test_list_script_triggers_none_found():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("automatic", [False, True])
+@pytest.mark.parametrize("helper_present", [False, True])
+async def test_list_triggers_checks_deployed_version(automatic, helper_present):
+    service = Mock()
+    deployment = {
+        "deploymentId": "deployment123",
+        "deploymentConfig": {"versionNumber": 7},
+        "entryPoints": [{"entryPointType": "EXECUTION_API"}],
+    }
+    service.projects().deployments().list().execute.return_value = {
+        "deployments": [deployment]
+    }
+    service.projects().deployments().get().execute.return_value = deployment
+    # Even source mentioning the helper must not count as an executable function.
+    service.projects().getContent().execute.return_value = {
+        "files": [
+            {
+                "type": "SERVER_JS",
+                "source": "// function __mcpListTriggers() {}",
+                "functionSet": {
+                    "values": (
+                        [{"name": "__mcpListTriggers"}] if helper_present else []
+                    )
+                },
+            }
+        ]
+    }
+    service.scripts().run().execute.return_value = {"response": {"result": "[]"}}
+    service.reset_mock()
+
+    kwargs = dict(
+        service=service,
+        user_google_email="u@e.com",
+        script_id="script123",
+        dev_mode=False,
+        deployment_id=None if automatic else "deployment123",
+    )
+    if helper_present:
+        assert "No triggers found" in await _list_script_triggers_impl(**kwargs)
+        service.scripts().run.assert_called_once_with(
+            scriptId="deployment123",
+            body={"function": "__mcpListTriggers", "devMode": False},
+        )
+    else:
+        with pytest.raises(UserInputError, match="does not contain __mcpListTriggers"):
+            await _list_script_triggers_impl(**kwargs)
+        service.scripts().run.assert_not_called()
+
+    service.projects().deployments().get.assert_called_once_with(
+        scriptId="script123", deploymentId="deployment123"
+    )
+    service.projects().getContent.assert_called_once_with(
+        scriptId="script123", versionNumber=7
+    )
+    service.projects().updateContent.assert_not_called()
+    service.projects().deployments().update.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_triggers_rejects_unversioned_deployment():
+    service = Mock()
+    service.projects().deployments().get().execute.return_value = {
+        "deploymentConfig": {}
+    }
+    with pytest.raises(UserInputError, match="must reference a script version"):
+        await _list_script_triggers_impl(
+            service, "u@e.com", "script123", False, "deployment123"
+        )
+    service.projects().getContent.assert_not_called()
+    service.projects().updateContent.assert_not_called()
+    service.scripts.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_list_script_triggers_requires_deployment_before_writing_helper():
     """A missing API Executable deployment must not mutate the project."""
     mock_service = Mock()
@@ -1411,6 +1488,115 @@ async def test_delete_script_trigger_by_id_and_handler():
 def _undecorated(tool):
     """Strip the two auth/error decorators to reach the raw dispatcher."""
     return tool.__wrapped__.__wrapped__
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("managed_email", [False, True])
+@pytest.mark.parametrize(
+    "tool, action, service_type, scopes, impl_name, kwargs",
+    [
+        (
+            get_script_project,
+            " LIST ",
+            "drive",
+            "drive_read",
+            "_list_script_projects_impl",
+            {"page_size": 12, "page_token": "next"},
+        ),
+        (
+            get_script_project,
+            "get",
+            "script",
+            "script_readonly",
+            "_get_script_project_impl",
+            {"script_id": "s1"},
+        ),
+        (
+            get_script_project,
+            "get",
+            "script",
+            "script_readonly",
+            "_get_script_content_impl",
+            {"script_id": "s1", "file_name": "Code"},
+        ),
+        (
+            manage_script_project,
+            "create",
+            "script",
+            "script_projects",
+            "_create_script_project_impl",
+            {"title": "T", "parent_id": "p1"},
+        ),
+        (
+            manage_script_project,
+            " DELETE ",
+            "drive",
+            "drive_full",
+            "_delete_script_project_impl",
+            {"script_id": "s1"},
+        ),
+    ],
+)
+async def test_project_actions_authenticate_only_required_service(
+    monkeypatch, managed_email, tool, action, service_type, scopes, impl_name, kwargs
+):
+    monkeypatch.setattr(
+        service_decorator, "_user_email_is_managed", lambda: managed_email
+    )
+    monkeypatch.setattr(
+        service_decorator,
+        "_get_auth_context",
+        AsyncMock(
+            return_value=("u@e.com", "oauth21", "session")
+            if managed_email
+            else (None, None, None)
+        ),
+    )
+    monkeypatch.setattr(
+        service_decorator, "_detect_oauth_version", lambda *a: managed_email
+    )
+    service = Mock()
+    authenticate = AsyncMock(return_value=(service, "u@e.com"))
+    monkeypatch.setattr(service_decorator, "_authenticate_service", authenticate)
+    mapping = (
+        {"list": ("drive", "drive_read"), "get": ("script", "script_readonly")}
+        if tool is get_script_project
+        else {
+            "create": ("script", "script_projects"),
+            "delete": ("drive", "drive_full"),
+        }
+    )
+    # Rebuild to exercise both signatures, which are fixed at decoration time.
+    fn = _require_project_action_service(mapping)(tool.__wrapped__)
+    signature = inspect.signature(fn)
+    assert "drive_service" not in signature.parameters
+    assert "script_service" not in signature.parameters
+    assert ("user_google_email" not in signature.parameters) == managed_email
+    with patch(
+        f"gappsscript.apps_script_tools.{impl_name}", new=AsyncMock(return_value="ok")
+    ) as impl:
+        if managed_email:
+            result = await fn(action=action, **kwargs)
+        else:
+            result = await fn("u@e.com", action, **kwargs)
+    assert result == "ok"
+    authenticate.assert_awaited_once()
+    assert authenticate.call_args.args[1] == service_type
+    assert authenticate.call_args.args[5] == service_decorator._resolve_scopes(scopes)
+    assert impl.call_args.args[:2] == (service, "u@e.com")
+    service.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", [get_script_project, manage_script_project])
+async def test_invalid_project_action_precedes_authentication(tool):
+    with patch.object(service_decorator, "_get_auth_context", new=AsyncMock()) as auth:
+        kwargs = {"action": "bogus"}
+        if "user_google_email" in inspect.signature(tool).parameters:
+            kwargs["user_google_email"] = "u@e.com"
+        with pytest.raises(UserInputError, match="Invalid action"):
+            await tool(**kwargs)
+    auth.assert_not_awaited()
 
 
 @pytest.mark.asyncio
