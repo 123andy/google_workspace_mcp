@@ -10,6 +10,7 @@ from importlib import metadata, import_module
 from typing import NoReturn
 from urllib.parse import urlparse
 from dotenv import load_dotenv
+from core import signed_downloads
 from core.startup_ui import StartupDisplay, collapse_home, wordmark_lines
 
 # Prevent any stray startup output on macOS (e.g. platform identifiers) from
@@ -717,6 +718,7 @@ def main():
         sys.exit(1)
 
     validate_streamable_http_auth(args.transport)
+    signed_downloads.log_if_ignored(args.transport)
     resolve_callback_port_for_transport(args.transport)
 
     # Set port and base URI once for reuse throughout the function
