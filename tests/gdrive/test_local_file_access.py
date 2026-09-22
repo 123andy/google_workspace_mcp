@@ -14,16 +14,18 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from fastmcp import Client, FastMCP
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 from core.utils import (  # noqa: E402
     UserInputError,
+    hide_local_file_args,
     local_file_access_enabled,
-    local_file_args,
     validate_file_path,
 )
 from gdrive.drive_tools import (  # noqa: E402
@@ -82,13 +84,25 @@ class TestLocalFileAccessSetting:
         monkeypatch.delenv("WORKSPACE_MCP_DISABLE_LOCAL_FILES", raising=False)
         with patch("core.utils.is_stateless_mode", return_value=False):
             assert local_file_access_enabled()
-            assert local_file_args("file_path") is None
 
     def test_disabled_by_env(self, monkeypatch):
         monkeypatch.setenv("WORKSPACE_MCP_DISABLE_LOCAL_FILES", "true")
         with patch("core.utils.is_stateless_mode", return_value=False):
             assert not local_file_access_enabled()
-            assert local_file_args("a", "b") == ["a", "b"]
+
+    @pytest.mark.parametrize("value", [" true ", "TRUE", "true\n"])
+    def test_disabled_by_untidy_true(self, value, monkeypatch):
+        """A stray space or newline (YAML, .env) must not silently re-enable
+        local files: the setting fails closed."""
+        monkeypatch.setenv("WORKSPACE_MCP_DISABLE_LOCAL_FILES", value)
+        with patch("core.utils.is_stateless_mode", return_value=False):
+            assert not local_file_access_enabled()
+
+    @pytest.mark.parametrize("value", ["false", ""])
+    def test_enabled_by_non_true(self, value, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_MCP_DISABLE_LOCAL_FILES", value)
+        with patch("core.utils.is_stateless_mode", return_value=False):
+            assert local_file_access_enabled()
 
     def test_disabled_by_stateless_mode(self, monkeypatch):
         monkeypatch.delenv("WORKSPACE_MCP_DISABLE_LOCAL_FILES", raising=False)
@@ -100,6 +114,78 @@ class TestLocalFileAccessSetting:
         monkeypatch.delenv("WORKSPACE_MCP_DISABLE_LOCAL_FILES", raising=False)
         with patch("core.utils.is_stateless_mode", return_value=False):
             assert local_file_access_enabled()
+
+
+ENABLED_IN_UTILS = patch("core.utils.local_file_access_enabled", return_value=True)
+DISABLED_IN_UTILS = patch("core.utils.local_file_access_enabled", return_value=False)
+
+
+async def _sample(file_name: str, file_path: str | None = None) -> str:
+    return f"{file_name}:{file_path}"
+
+
+class TestHideLocalFileArgs:
+    """FastMCP 4 removed ``exclude_args``, so hiding goes through
+    ``__signature__``, which ``inspect.signature`` (and so FastMCP's schema
+    builder) honours on every FastMCP version this project supports."""
+
+    def test_no_op_when_enabled(self):
+        async def fn(file_name: str, file_path: str | None = None) -> str:
+            return ""
+
+        with ENABLED_IN_UTILS:
+            assert hide_local_file_args("file_path")(fn) is fn
+        assert list(inspect.signature(fn).parameters) == ["file_name", "file_path"]
+
+    def test_hides_only_the_named_parameters_when_disabled(self):
+        async def fn(file_name: str, file_path: str | None = None) -> str:
+            return ""
+
+        with DISABLED_IN_UTILS:
+            assert hide_local_file_args("file_path")(fn) is fn
+        assert list(inspect.signature(fn).parameters) == ["file_name"]
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_unknown_name_fails_at_decoration_time(self, enabled):
+        """A stale name must not pass silently under either setting."""
+        with patch("core.utils.local_file_access_enabled", return_value=enabled):
+            with pytest.raises(ValueError, match="no_such_param"):
+                hide_local_file_args("no_such_param")(_sample)
+
+    def test_no_tool_still_uses_exclude_args(self):
+        """``exclude_args`` raises TypeError at import on FastMCP 4."""
+        offenders = [
+            path
+            for path in Path(REPO_ROOT).rglob("*.py")
+            if not any(part.startswith(".") or part == "tests" for part in path.parts)
+            and re.search(r"\bexclude_args\s*=", path.read_text())
+        ]
+        assert offenders == []
+
+    @pytest.mark.asyncio
+    async def test_hidden_argument_is_rejected_by_fastmcp(self):
+        """A client holding a cached schema cannot reach the tool body."""
+        mcp = FastMCP("hide-test")
+
+        async def fn(file_name: str, file_path: str | None = None) -> str:
+            return f"{file_name}:{file_path}"
+
+        with DISABLED_IN_UTILS:
+            mcp.tool(hide_local_file_args("file_path")(fn))
+
+        async with Client(mcp) as client:
+            (tool,) = await client.list_tools()
+            assert "file_path" not in tool.inputSchema["properties"]
+
+            ok = await client.call_tool("fn", {"file_name": "n"})
+            assert ok.content[0].text == "n:None"
+
+            stale = await client.call_tool(
+                "fn", {"file_name": "n", "file_path": "/x"}, raise_on_error=False
+            )
+            assert stale.is_error
+            assert "file_path" in stale.content[0].text
+            assert "Unexpected keyword argument" in stale.content[0].text
 
 
 class TestFilePathRejectedWhenDisabled:
@@ -258,11 +344,11 @@ class TestValidateFilePath:
 
 
 class TestSchemaThroughFastMCP:
-    """exclude_args is fixed at decoration time and FastMCP only validates it
-    when non-None, so an in-process suite under the default can never catch a
-    stale exclusion. It also hides file_path from the ADVERTISED schema only:
-    a client with a cached schema can still send it, and the guard is what
-    answers. Go through a real client in a subprocess to cover both."""
+    """The signature is rewritten at decoration time, from the setting in force
+    at import, so an in-process suite under the default can never see the
+    hidden shape of the real tools. Go through a real client in a subprocess
+    to cover both settings, and confirm a stale client's file_path is rejected
+    by FastMCP's argument validation rather than reaching the tool body."""
 
     CODE = """
 import asyncio
@@ -278,8 +364,10 @@ async def main():
     with patch.object(sd, '_authenticate_service', auth):
         async with Client(server) as client:
             tools = {t.name: t for t in await client.list_tools()}
-            schema = tools['import_to_google_slides'].inputSchema
-            print('ADVERTISED:' + str('file_path' in schema['properties']))
+            for name in ('import_to_google_doc', 'import_to_google_slides',
+                         'import_to_google_sheets', 'update_drive_file'):
+                advertised = 'file_path' in tools[name].inputSchema['properties']
+                print(f'ADVERTISED:{name}={advertised}')
             result = await client.call_tool(
                 'import_to_google_slides',
                 {'file_name': 'Deck', 'file_path': '/Users/someone/deck.pptx',
@@ -291,16 +379,27 @@ async def main():
 asyncio.run(main())
 """
 
-    def test_disabled_hides_file_path_and_guards_stale_clients(self):
+    TOOLS = (
+        "import_to_google_doc",
+        "import_to_google_slides",
+        "import_to_google_sheets",
+        "update_drive_file",
+    )
+
+    def test_disabled_hides_file_path_and_rejects_stale_clients(self):
         out = _run_subprocess(self.CODE, {"WORKSPACE_MCP_DISABLE_LOCAL_FILES": "true"})
-        assert "ADVERTISED:False" in out
+        for name in self.TOOLS:
+            assert f"ADVERTISED:{name}=False" in out
         text = out.split("RESULT:", 1)[1]
-        assert "local file access is disabled" in text
-        assert "'base64_content'" in text
+        assert "file_path" in text
+        assert "Unexpected keyword argument" in text
+        # Rejected before the guard: the tool-specific advice never ran.
+        assert "local file access is disabled" not in text
 
     def test_http_without_opt_in_still_advertises_file_path(self):
         out = _run_subprocess(self.CODE, {})
-        assert "ADVERTISED:True" in out
+        for name in self.TOOLS:
+            assert f"ADVERTISED:{name}=True" in out
 
 
 class TestShippedTextNeverNamesAHiddenParameter:
@@ -309,16 +408,6 @@ class TestShippedTextNeverNamesAHiddenParameter:
     from the signature drops its own line, but prose elsewhere that names it
     would send a model after a parameter the schema does not have. One static
     text serves both settings, so it must not enumerate the local-only route."""
-
-    # The four tools whose signature hides file_path when local file access is
-    # off. Named here rather than borrowed from TestSchemaThroughFastMCP, whose
-    # subprocess on this line still probes a single tool.
-    TOOLS = (
-        "import_to_google_doc",
-        "import_to_google_slides",
-        "import_to_google_sheets",
-        "update_drive_file",
-    )
 
     CODE = """
 import asyncio, json
@@ -343,7 +432,7 @@ async def main():
         print("SHIPPED:" + json.dumps(shipped, sort_keys=True))
 
 asyncio.run(main())
-""" % (TOOLS,)
+""" % (TestSchemaThroughFastMCP.TOOLS,)
 
     def _shipped(self, env):
         out = _run_subprocess(self.CODE, env)
@@ -351,7 +440,7 @@ asyncio.run(main())
 
     def test_disabled_ships_no_text_naming_file_path(self):
         shipped = self._shipped({"WORKSPACE_MCP_DISABLE_LOCAL_FILES": "true"})
-        assert set(shipped) == set(self.TOOLS)
+        assert set(shipped) == set(TestSchemaThroughFastMCP.TOOLS)
         offenders = [
             (name, where)
             for name, tool in shipped.items()
@@ -366,13 +455,14 @@ asyncio.run(main())
         description and every commonly-advertised property read the same.
 
         On this line the setting swaps a pair rather than just dropping one:
-        ``remote_only_args`` hides ``return_upload_url`` wherever local files
-        work, so exactly one of the two is advertised under either setting
-        (see core.utils.remote_only_args). That swap is pinned below so it
-        cannot widen unnoticed; everything else must be identical text."""
+        ``hide_remote_only_args`` hides ``return_upload_url`` wherever local
+        files work, so exactly one of the two is advertised under either
+        setting (see core.utils.hide_remote_only_args). That swap is pinned
+        below so it cannot widen unnoticed; everything else must be identical
+        text."""
         on = self._shipped({"WORKSPACE_MCP_DISABLE_LOCAL_FILES": "true"})
         off = self._shipped({})
-        for name in self.TOOLS:
+        for name in TestSchemaThroughFastMCP.TOOLS:
             assert off[name]["description"] == on[name]["description"]
             assert "file_path" in off[name]["properties"]
             assert "file_path" not in on[name]["properties"]

@@ -16,7 +16,14 @@ import httplib2
 import pytest
 from googleapiclient.errors import HttpError
 
-from core.utils import UserInputError, handle_http_errors, remote_only_args
+from fastmcp import Client, FastMCP
+
+from core.utils import (
+    UserInputError,
+    handle_http_errors,
+    hide_local_file_args,
+    hide_remote_only_args,
+)
 from gdrive.drive_tools import (
     _initiate_resumable_upload_session,
     create_drive_file,
@@ -541,8 +548,9 @@ async def test_session_initiation_errors_are_reported():
 
 class TestOfferedOnlyWithoutLocalFiles:
     """return_upload_url is the inverse of file_path: advertised only where local
-    file access is disabled, and refused at runtime elsewhere (a client with a
-    cached schema can still send it), before any Drive I/O."""
+    file access is disabled. Over MCP a hidden parameter is rejected by FastMCP
+    before the tool runs; the in-tool refusal is defense in depth for direct
+    callers, and fires before any Drive I/O."""
 
     ENABLED = patch("gdrive.drive_tools.local_file_access_enabled", return_value=True)
     TOOLS = [
@@ -560,17 +568,79 @@ class TestOfferedOnlyWithoutLocalFiles:
         "update_drive_file": {"file_id": "abc123"},
     }
 
-    def test_helper_is_the_exact_inverse_of_local_file_args(self, monkeypatch):
-        from core.utils import local_file_args
+    @staticmethod
+    def _both_kinds():
+        async def fn(
+            file_name: str,
+            file_path: str | None = None,
+            return_upload_url: bool = False,
+        ) -> str:
+            return f"{file_name}:{file_path}:{return_upload_url}"
 
-        monkeypatch.setenv("WORKSPACE_MCP_DISABLE_LOCAL_FILES", "true")
-        with patch("core.utils.is_stateless_mode", return_value=False):
-            assert remote_only_args("return_upload_url") is None
-            assert local_file_args("file_path") == ["file_path"]
-        monkeypatch.delenv("WORKSPACE_MCP_DISABLE_LOCAL_FILES")
-        with patch("core.utils.is_stateless_mode", return_value=False):
-            assert remote_only_args("return_upload_url") == ["return_upload_url"]
-            assert local_file_args("file_path") is None
+        return fn
+
+    @pytest.mark.parametrize(
+        "enabled, hidden",
+        [(True, "return_upload_url"), (False, "file_path")],
+        ids=["local-files-enabled", "local-files-disabled"],
+    )
+    def test_decorators_compose_to_hide_exactly_one(self, enabled, hidden):
+        """The decorator is the exact inverse of hide_local_file_args: stacked
+        as on the four tools that carry both parameters, either setting hides
+        exactly one of the two, and the second decorator validates against the
+        signature the first one left."""
+        fn = self._both_kinds()
+        with patch("core.utils.local_file_access_enabled", return_value=enabled):
+            decorated = hide_local_file_args("file_path")(
+                hide_remote_only_args("return_upload_url")(fn)
+            )
+        assert decorated is fn
+        params = set(inspect.signature(fn).parameters)
+        assert params == {"file_name", "file_path", "return_upload_url"} - {hidden}
+
+    def test_order_of_the_two_decorators_does_not_matter(self):
+        fn = self._both_kinds()
+        with patch("core.utils.local_file_access_enabled", return_value=True):
+            hide_remote_only_args("return_upload_url")(
+                hide_local_file_args("file_path")(fn)
+            )
+        assert list(inspect.signature(fn).parameters) == ["file_name", "file_path"]
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_unknown_name_fails_at_decoration_time(self, enabled):
+        with patch("core.utils.local_file_access_enabled", return_value=enabled):
+            with pytest.raises(ValueError, match="no_such_param"):
+                hide_remote_only_args("no_such_param")(self._both_kinds())
+
+    @pytest.mark.asyncio
+    async def test_stale_return_upload_url_is_rejected_by_fastmcp(self):
+        """With local files enabled the parameter is not in the schema, and a
+        client that still sends it is refused by FastMCP's argument validation:
+        the tool body never runs."""
+        mcp = FastMCP("compose-test")
+        fn = self._both_kinds()
+        with patch("core.utils.local_file_access_enabled", return_value=True):
+            mcp.tool(
+                hide_local_file_args("file_path")(
+                    hide_remote_only_args("return_upload_url")(fn)
+                )
+            )
+
+        async with Client(mcp) as client:
+            (tool,) = await client.list_tools()
+            assert set(tool.inputSchema["properties"]) == {"file_name", "file_path"}
+
+            ok = await client.call_tool("fn", {"file_name": "n", "file_path": "/x"})
+            assert ok.content[0].text == "n:/x:False"
+
+            stale = await client.call_tool(
+                "fn",
+                {"file_name": "n", "return_upload_url": True},
+                raise_on_error=False,
+            )
+            assert stale.is_error
+            assert "return_upload_url" in stale.content[0].text
+            assert "Unexpected keyword argument" in stale.content[0].text
 
     @pytest.mark.asyncio
     @ENABLED
@@ -615,9 +685,11 @@ class TestOfferedOnlyWithoutLocalFiles:
 
 
 class TestSchemaThroughFastMCP:
-    """exclude_args is fixed at decoration time, so the advertised schema is
-    checked through a real client in a subprocess with the setting controlled
-    (the pattern and env hygiene come from test_local_file_access)."""
+    """The signature is rewritten at decoration time, from the setting in force
+    at import, so the advertised schema of the real tools is checked through a
+    real client in a subprocess with the setting controlled (the pattern and
+    env hygiene come from test_local_file_access). A stale return_upload_url is
+    rejected by FastMCP's validation, not by the in-tool guard."""
 
     CODE = """
 import asyncio, json
@@ -674,14 +746,18 @@ asyncio.run(main())
             else:
                 assert "file_path" not in fields, name
 
-    def test_default_advertises_file_path_not_upload_url_and_refuses_it(self):
+    def test_default_advertises_file_path_not_upload_url_and_rejects_it(self):
         props, out = self._props({}, call=True)
         self._assert_advertised(props, upload_url=False)
         text = out.split("RESULT:", 1)[1]
-        assert "Upload URLs are offered only when local file access" in text
+        assert "return_upload_url" in text
+        assert "Unexpected keyword argument" in text
+        # Rejected before the guard: the tool-specific advice never ran.
+        assert "Upload URLs are offered only when local file access" not in text
 
-    def test_disabled_local_files_advertises_upload_url_not_file_path(self):
-        props, _ = self._props({"WORKSPACE_MCP_DISABLE_LOCAL_FILES": "true"})
+    @pytest.mark.parametrize("value", ["true", " true "], ids=["true", "untidy"])
+    def test_disabled_local_files_advertises_upload_url_not_file_path(self, value):
+        props, _ = self._props({"WORKSPACE_MCP_DISABLE_LOCAL_FILES": value})
         self._assert_advertised(props, upload_url=True)
 
     def test_stateless_mode_implies_it(self):

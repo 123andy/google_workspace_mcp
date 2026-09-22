@@ -35,9 +35,9 @@ from core.utils import (
     GOOGLE_API_WRITE_RETRIES,
     IMAGE_MIME_TYPES,
     UserInputError,
+    hide_local_file_args,
+    hide_remote_only_args,
     local_file_access_enabled,
-    local_file_args,
-    remote_only_args,
     encode_image_content,
     OfficeXmlExtractionError,
     OfficeXmlTooLargeError,
@@ -1150,7 +1150,6 @@ def _resumable_upload_result(summary: str, upload_url: str, mime_type: str) -> s
 
 @server.tool(
     title="Create Drive File",
-    exclude_args=remote_only_args("return_upload_url"),
     annotations=ToolAnnotations(
         readOnlyHint=False,
         destructiveHint=False,
@@ -1158,6 +1157,7 @@ def _resumable_upload_result(summary: str, upload_url: str, mime_type: str) -> s
         openWorldHint=True,
     ),
 )
+@hide_remote_only_args("return_upload_url")
 @handle_http_errors("create_drive_file", service_type="drive")
 @require_google_service("drive", "drive_file")
 async def create_drive_file(
@@ -1540,9 +1540,11 @@ def _file_path_disabled_error(inline_params: tuple[str, ...]) -> UserInputError:
 def _upload_url_not_offered_error(routes: tuple[str, ...]) -> UserInputError:
     """Build the error for ``return_upload_url`` sent while local file access is enabled.
 
-    The parameter is hidden from the schema then (``remote_only_args``), but a
-    client with a cached schema can still send it. ``routes`` are the local-disk
-    and inline parameters the calling tool really has.
+    Over MCP the parameter is hidden from the signature then
+    (``hide_remote_only_args``) and FastMCP rejects it before the tool runs, so
+    this only reaches direct callers, or a setting flipped after import.
+    ``routes`` are the local-disk and inline parameters the calling tool really
+    has.
     """
     named = ", ".join(f"'{name}'" for name in routes[:-1]) + f" or '{routes[-1]}'"
     return UserInputError(
@@ -1714,7 +1716,6 @@ async def _import_with_conversion(
 
 @server.tool(
     title="Import to Google Doc",
-    exclude_args=local_file_args("file_path") or remote_only_args("return_upload_url"),
     annotations=ToolAnnotations(
         readOnlyHint=False,
         destructiveHint=False,
@@ -1722,6 +1723,8 @@ async def _import_with_conversion(
         openWorldHint=True,
     ),
 )
+@hide_local_file_args("file_path")
+@hide_remote_only_args("return_upload_url")
 @handle_http_errors("import_to_google_doc", service_type="drive")
 @require_google_service("drive", "drive_file")
 async def import_to_google_doc(
@@ -1800,7 +1803,6 @@ async def import_to_google_doc(
 
 @server.tool(
     title="Import to Google Slides",
-    exclude_args=local_file_args("file_path") or remote_only_args("return_upload_url"),
     annotations=ToolAnnotations(
         readOnlyHint=False,
         destructiveHint=False,
@@ -1808,6 +1810,8 @@ async def import_to_google_doc(
         openWorldHint=True,
     ),
 )
+@hide_local_file_args("file_path")
+@hide_remote_only_args("return_upload_url")
 @handle_http_errors("import_to_google_slides", service_type="drive")
 @require_google_service("drive", "drive_file")
 async def import_to_google_slides(
@@ -1879,7 +1883,6 @@ async def import_to_google_slides(
 
 @server.tool(
     title="Import to Google Sheets",
-    exclude_args=local_file_args("file_path") or remote_only_args("return_upload_url"),
     annotations=ToolAnnotations(
         readOnlyHint=False,
         destructiveHint=False,
@@ -1887,6 +1890,8 @@ async def import_to_google_slides(
         openWorldHint=True,
     ),
 )
+@hide_local_file_args("file_path")
+@hide_remote_only_args("return_upload_url")
 @handle_http_errors("import_to_google_sheets", service_type="drive")
 @require_google_service("drive", "drive_file")
 async def import_to_google_sheets(
@@ -2239,7 +2244,6 @@ async def check_drive_file_public_access(
 
 @server.tool(
     title="Update Drive File",
-    exclude_args=local_file_args("file_path") or remote_only_args("return_upload_url"),
     annotations=ToolAnnotations(
         readOnlyHint=False,
         destructiveHint=True,
@@ -2247,6 +2251,8 @@ async def check_drive_file_public_access(
         openWorldHint=True,
     ),
 )
+@hide_local_file_args("file_path")
+@hide_remote_only_args("return_upload_url")
 @handle_http_errors("update_drive_file", is_read_only=False, service_type="drive")
 @require_google_service("drive", "drive_file")
 async def update_drive_file(
