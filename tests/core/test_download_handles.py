@@ -340,3 +340,53 @@ async def test_unrecognised_offers_pass_through():
         "http://testserver/attachments/signed/tok/extra",
     ):
         assert await dh.shorten_signed_url((url, 600)) == (url, 600)
+
+
+@pytest.mark.asyncio
+async def test_dl_route_does_not_touch_the_store_when_the_feature_is_off(monkeypatch):
+    import core.download_handles as dh
+    import core.server as srv
+
+    monkeypatch.delenv("WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS", raising=False)
+    calls = []
+
+    async def spy(handle):
+        calls.append(handle)
+        return None
+
+    monkeypatch.setattr(dh, "load_download_ref", spy)
+
+    class _Req:
+        path_params = {"handle": "x" * 22}
+
+    response = await srv.serve_short_download(_Req())
+    assert response.status_code == 404
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "name, needle",
+    [
+        ("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", "WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS"),
+        ("WORKSPACE_MCP_ATTACHMENT_SIGNING_KEY", "Remove it"),
+    ],
+)
+def test_retired_settings_are_named_at_startup(monkeypatch, caplog, name, needle):
+    import core.download_handles as dh
+
+    for retired in dh._RETIRED_SETTINGS:
+        monkeypatch.delenv(retired, raising=False)
+    monkeypatch.setenv(name, "true")
+    with caplog.at_level("WARNING", logger=dh.logger.name):
+        dh.warn_retired_settings()
+    assert name in caplog.text and needle in caplog.text
+
+
+def test_no_warning_when_no_retired_setting_is_set(monkeypatch, caplog):
+    import core.download_handles as dh
+
+    for retired in dh._RETIRED_SETTINGS:
+        monkeypatch.delenv(retired, raising=False)
+    with caplog.at_level("WARNING", logger=dh.logger.name):
+        dh.warn_retired_settings()
+    assert caplog.text == ""
