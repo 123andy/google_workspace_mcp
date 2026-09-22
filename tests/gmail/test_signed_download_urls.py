@@ -156,3 +156,52 @@ async def test_full_export_falls_back_to_upstream_path(enabled, monkeypatch):
 
     assert "Hello world" in result
     assert "signed URL" not in result
+
+
+class _Saved:
+    path, file_id = "/nonexistent/Quarterly numbers.eml", "file-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stateless", [True, False])
+async def test_full_export_fallback_is_loud_when_url_cannot_be_minted(
+    enabled, monkeypatch, stateless
+):
+    """Same contract as the attachment and Drive tools: signed links on, offer
+    refused, so the fallback (inline or stored) says no signed URL was issued."""
+    import gmail.gmail_tools as gmail_tools
+
+    monkeypatch.setattr(gmail_tools, "is_stateless_mode", lambda: stateless)
+    monkeypatch.setattr(gmail_tools, "get_transport_mode", lambda: "streamable-http")
+    storage = Mock()
+    storage.save_attachment_bytes.return_value = _Saved()
+    monkeypatch.setattr(gmail_tools, "get_attachment_storage", lambda: storage)
+    monkeypatch.setattr(gmail_tools, "get_attachment_url", lambda fid: f"/a/{fid}")
+    service = Mock()
+    service.users().messages().get().execute.return_value = {"raw": "SGVsbG8gd29ybGQ="}
+
+    with patch.object(sd, "offer_url", return_value=None):
+        result = await _export_full_message(
+            service, "msg-4", HEADERS, "raw", user_google_email=USER
+        )
+
+    assert "Error" not in result
+    assert sd.UNAVAILABLE_NOTE in result
+
+
+@pytest.mark.asyncio
+async def test_full_export_fallback_has_no_note_when_feature_off(monkeypatch):
+    import gmail.gmail_tools as gmail_tools
+
+    monkeypatch.delenv("WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS", raising=False)
+    monkeypatch.delenv("WORKSPACE_MCP_MAX_FILE_BYTES", raising=False)
+    monkeypatch.setattr(gmail_tools, "is_stateless_mode", lambda: True)
+    service = Mock()
+    service.users().messages().get().execute.return_value = {"raw": "SGVsbG8gd29ybGQ="}
+
+    result = await _export_full_message(
+        service, "msg-5", HEADERS, "raw", user_google_email=USER
+    )
+
+    assert "Hello world" in result
+    assert sd.UNAVAILABLE_NOTE not in result
