@@ -49,7 +49,21 @@ manage_contacts_batch = _unwrap(_manage_contacts_batch_wrapped)
 
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    """Run ``coro`` on a loop this helper owns.
+
+    ``asyncio.get_event_loop()`` does not create a loop in a sync context — it
+    returns one someone else installed, and raises "no current event loop" when
+    nobody has. That this module passed at all depended on an earlier test in the
+    run leaving a loop behind, which is luck rather than a contract: under
+    fastmcp 4 / mcp 2 nothing installs one and all 20 tests here fail, while the
+    module still passes in isolation. Own the loop instead, and close it so the
+    next caller cannot inherit a spent one.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 # =============================================================================
