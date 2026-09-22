@@ -481,7 +481,7 @@ async def _export_full_message(
     if signed:
         url, ttl = signed
         result_lines = _format_message_header_lines(headers)
-        result_lines.append("\n--- FULL MESSAGE EXPORT (signed URL) ---")
+        result_lines.append("\n--- FULL MESSAGE EXPORT (download link) ---")
         result_lines.append(f"Format: {extension.lstrip('.')}")
         result_lines.extend(signed_downloads.url_lines(url, ttl, "complete message"))
         result_lines.append("Content is NOT included in this response.")
@@ -1941,7 +1941,7 @@ async def get_gmail_message_content(
         Field(
             description=(
                 "When True, return the COMPLETE untruncated message: referenced by a "
-                "download URL (a short-lived signed link when the server enables signed "
+                "download URL (a short-lived encrypted link when the server enables signed "
                 "URLs, else a stored file) or file path instead of the body text, or "
                 "inlined in the response when the server has no file storage (stateless "
                 "mode). Use for messages large enough to hit the truncation "
