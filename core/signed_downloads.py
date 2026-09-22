@@ -6,11 +6,12 @@ the file to local disk and serve it from ``/attachments/{id}`` (impossible in
 stateless mode, and not tied to a user) or hand base64 back through the model.
 
 With ``WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS=true`` the download tools instead
-return ``/attachments/signed/{token}``: an HS256 JWT naming the resource, its
-owner (``sub``) and an expiry. The route verifies the signature, recovers the
-owner's credentials (the in-process session store first, then the persistent
-credential store), fetches from Google and returns the bytes. The signature is
-the authorization; the route never writes to either store.
+return ``/attachments/signed/{token}``: a Fernet token (authenticated
+encryption) naming the resource, its owner (``sub``) and an expiry. Nothing in
+the link is readable without the key. The route decrypts and authenticates the
+token, recovers the owner's credentials (the in-process session store first,
+then the persistent credential store), fetches from Google and returns the
+bytes. The token is the authorization; the route never writes to either store.
 
 Mint and serve share ONE notion of "usable credentials" (``usable_seconds``): a
 URL is only minted while the route would accept it, and its TTL is clamped so it
@@ -23,6 +24,7 @@ import base64
 import binascii
 import functools
 import io
+import json
 import logging
 import math
 import os
@@ -32,7 +34,7 @@ from datetime import datetime, timezone
 from typing import AsyncIterator, Awaitable, Callable, Optional
 from urllib.parse import quote, urlparse
 
-import jwt
+from cryptography.fernet import Fernet
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from google.auth._helpers import REFRESH_THRESHOLD
 from google.auth.transport.requests import Request
@@ -45,11 +47,20 @@ from core.config import get_transport_mode
 logger = logging.getLogger(__name__)
 
 FLAG_ENV = "WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS"
-_ALG = "HS256"
 _KEY_SALT = "workspace-mcp-signed-download"
 URL_TTL_SECONDS = 900
 # A URL must expire at least this long before the credential stops being usable.
 _EXPIRY_MARGIN_SECONDS = 30
+# Tolerated clock difference between the replica that minted a token and the one
+# serving it: ``iat`` may sit this far in the future, and Fernet's own timestamp
+# may be this much older than ``URL_TTL_SECONDS`` before the token is refused.
+_CLOCK_SKEW_SECONDS = 30
+# Hard ceiling on a token's age, checked by Fernet from its own timestamp before
+# the payload is decrypted, so a token never outlives the maximum link lifetime
+# even if its ``exp`` claim were wrong.
+_MAX_TOKEN_AGE_SECONDS = URL_TTL_SECONDS + _CLOCK_SKEW_SECONDS
+# Bound on what the route will even try to decrypt; minting refuses to exceed it.
+_MAX_TOKEN_CHARS = 8192
 _RESERVED_CLAIMS = frozenset({"src", "sub", "iat", "exp", "fn", "mt"})
 # Sender-typed bytes on a public route: never sniff, never cache (success or error).
 _RESPONSE_HEADERS = {"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"}
@@ -128,8 +139,13 @@ def validate_startup(transport: str) -> None:
 
 @functools.lru_cache(maxsize=1)
 def _signing_key() -> bytes:
-    """Derive the HMAC key from the OAuth proxy's key material under a dedicated
-    salt, so it is isolated from the server's other derived keys."""
+    """Derive the Fernet key from the OAuth proxy's key material under a dedicated
+    salt, so it is isolated from the server's other derived keys.
+
+    ``derive_jwt_key`` returns the URL-safe base64 of exactly 32 derived bytes
+    (HKDF-SHA256 for high-entropy material, PBKDF2 for low-entropy), which is
+    precisely Fernet's key encoding, so the result is used as the key as-is.
+    """
     from auth.oauth_config import get_oauth_config
     from fastmcp.server.auth.jwt_issuer import derive_jwt_key
 
@@ -219,7 +235,9 @@ def mint_url(
     filename: Optional[str] = None,
     mime_type: Optional[str] = None,
 ) -> str:
-    """Sign a capability URL for one resource (``ref``: fetcher-specific locator) and owner."""
+    """Encrypt a capability URL for one resource (``ref``: fetcher-specific
+    locator) and owner. The claims travel as compact JSON inside the token; the
+    Fernet timestamp is set to ``iat`` so both clocks agree."""
     collisions = _RESERVED_CLAIMS & ref.keys()
     if collisions:
         raise ValueError(f"ref must not contain reserved claims: {sorted(collisions)}")
@@ -235,21 +253,51 @@ def mint_url(
         claims["fn"] = filename
     if mime_type:
         claims["mt"] = mime_type
-    token = jwt.encode(claims, _signing_key(), algorithm=_ALG)
-    return f"{_base_url()}/attachments/signed/{token}"
+    payload = json.dumps(claims, separators=(",", ":"), ensure_ascii=False)
+    token = Fernet(_signing_key()).encrypt_at_time(payload.encode("utf-8"), now)
+    if len(token) > _MAX_TOKEN_CHARS:
+        raise ValueError("download token too large for the route to accept")
+    return f"{_base_url()}/attachments/signed/{token.decode('ascii')}"
+
+
+def _is_timestamp(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def verify_token(token: str) -> Optional[dict]:
-    """Claims for a valid token, else None (bad signature, expired, malformed, no key)."""
+    """Claims for a valid token, else None (tampered, wrong key, expired,
+    malformed, no key). Every check happens before any credential lookup.
+
+    The token must be the canonical URL-safe base64 Fernet emitted (the decoder
+    would otherwise ignore bytes appended after the padding). Fernet then
+    authenticates it and refuses one older than ``_MAX_TOKEN_AGE_SECONDS`` by its
+    own timestamp (the hard ceiling); then the decrypted claims must carry a
+    non-empty ``sub`` and integer ``iat``/``exp``, ``exp`` must still be in the
+    future and ``iat`` may not lead the clock by more than the skew allowance.
+    """
+    if not isinstance(token, str) or not token or len(token) > _MAX_TOKEN_CHARS:
+        return None
+    now = int(time.time())
     try:
-        return jwt.decode(
-            token,
-            _signing_key(),
-            algorithms=[_ALG],
-            options={"require": ["exp", "sub", "iat"]},
+        raw = token.encode("ascii")
+        if base64.urlsafe_b64encode(base64.urlsafe_b64decode(raw)) != raw:
+            return None
+        payload = Fernet(_signing_key()).decrypt_at_time(
+            raw, ttl=_MAX_TOKEN_AGE_SECONDS, current_time=now
         )
+        claims = json.loads(payload.decode("utf-8"))
     except Exception:
         return None
+    if not isinstance(claims, dict):
+        return None
+    sub, iat, exp = claims.get("sub"), claims.get("iat"), claims.get("exp")
+    if not (isinstance(sub, str) and sub):
+        return None
+    if not (_is_timestamp(iat) and _is_timestamp(exp)):
+        return None
+    if exp <= now or iat > now + _CLOCK_SKEW_SECONDS:
+        return None
+    return claims
 
 
 def _recover_credentials(user_email: str) -> Optional[Credentials]:
