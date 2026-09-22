@@ -103,6 +103,7 @@ def test_configure_server_for_http_uses_protocol_auth_required_scopes(monkeypatc
         lambda: {
             "token_expiry_threshold_seconds": 120,
             "fastmcp_access_token_expiry_seconds": 86400,
+            "fallback_refresh_token_expiry_seconds": 2592000,
         },
     )
 
@@ -130,6 +131,7 @@ def test_configure_server_for_http_uses_protocol_auth_required_scopes(monkeypatc
     assert captured["valid_scopes"] == sorted(server_module.get_current_scopes())
     assert captured["token_expiry_threshold_seconds"] == 120
     assert captured["fastmcp_access_token_expiry_seconds"] == 86400
+    assert captured["fallback_refresh_token_expiry_seconds"] == 2592000
     assert (
         server_module.server.auth.client_registration_options.default_scopes
         == sorted(server_module.get_current_scopes())
@@ -227,6 +229,7 @@ def test_configure_server_for_http_accepts_client_secret_from_file(
         lambda: {
             "token_expiry_threshold_seconds": 120,
             "fastmcp_access_token_expiry_seconds": 86400,
+            "fallback_refresh_token_expiry_seconds": 2592000,
         },
     )
     monkeypatch.setattr(server_module, "_auth_provider", server_module._auth_provider)
@@ -338,6 +341,9 @@ def test_configure_server_for_http_passes_expiry_config_to_external_provider(
         "WORKSPACE_MCP_OAUTH_PROXY_TOKEN_EXPIRY_THRESHOLD_SECONDS", "120"
     )
     monkeypatch.setenv("WORKSPACE_MCP_OAUTH_PROXY_ACCESS_TOKEN_EXPIRY_SECONDS", "86400")
+    monkeypatch.setenv(
+        "WORKSPACE_MCP_OAUTH_PROXY_REFRESH_TOKEN_EXPIRY_SECONDS", "2592000"
+    )
     monkeypatch.setattr(server_module, "get_transport_mode", lambda: "streamable-http")
     monkeypatch.setattr(server_module, "set_auth_provider", lambda provider: None)
     monkeypatch.setattr(server_module, "_auth_provider", server_module._auth_provider)
@@ -368,3 +374,4 @@ def test_configure_server_for_http_passes_expiry_config_to_external_provider(
 
     assert captured["token_expiry_threshold_seconds"] == 120
     assert captured["fastmcp_access_token_expiry_seconds"] == 86400
+    assert captured["fallback_refresh_token_expiry_seconds"] == 2592000
