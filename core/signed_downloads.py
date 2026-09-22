@@ -30,7 +30,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import AsyncIterator, Awaitable, Callable, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import jwt
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -75,6 +75,55 @@ def log_if_ignored(transport: str) -> None:
             FLAG_ENV,
             transport,
         )
+
+
+def validate_startup(transport: str) -> None:
+    """Run once from each server entrypoint: with the flag on over streamable-http,
+    raise ``ValueError`` (one line per problem) unless every minted link can work,
+    then log the base URL links will use. Flag off or stdio: no check, no log.
+
+    Links are absolute URLs clients open outside the MCP session, so they need an
+    externally reachable base; the ``host:port`` fallback is the bind address, not
+    something a client can reach. The key check calls ``_signing_key`` itself, so
+    it cannot disagree with minting."""
+    if not _flag_set() or transport != "streamable-http":
+        return
+    problems = []
+    external = os.getenv("WORKSPACE_EXTERNAL_URL")
+    if not external or not external.strip():
+        problems.append(
+            f"{FLAG_ENV}=true requires WORKSPACE_EXTERNAL_URL; set it to the "
+            "absolute http:// or https:// URL clients reach this server at "
+            "(e.g. https://mcp.example.com)."
+        )
+    else:
+        parsed = urlparse(external)
+        # urlparse strips surrounding whitespace, but the links would keep it.
+        if (
+            external != external.strip()
+            or parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+        ):
+            problems.append(
+                f"Invalid WORKSPACE_EXTERNAL_URL={external!r} for {FLAG_ENV}=true; "
+                "expected an absolute http:// or https:// URL "
+                "(e.g. https://mcp.example.com)."
+            )
+    try:
+        _signing_key()
+    except RuntimeError:
+        problems.append(
+            f"{FLAG_ENV}=true requires signing key material; set "
+            "GOOGLE_OAUTH_CLIENT_SECRET or FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY."
+        )
+    if problems:
+        raise ValueError("\n".join(problems))
+    logger.info(
+        "%s is on: signed download links will use base URL %s; "
+        "/attachments/signed/* must be publicly reachable there.",
+        FLAG_ENV,
+        _base_url(),
+    )
 
 
 @functools.lru_cache(maxsize=1)
