@@ -472,7 +472,9 @@ async def _export_full_message(
     # Signed URL: the route re-fetches the message from Gmail at download time, so
     # nothing is fetched, written or inlined here. Works in stateless mode too.
     extension = {"raw": ".eml", "html": ".html", "text": ".txt"}[body_format]
-    signed = user_google_email and signed_downloads.offer_url(
+    # A fallback after a failed offer says so, as the attachment and Drive tools do.
+    signed_wanted = bool(user_google_email) and signed_downloads.enabled()
+    signed = signed_wanted and signed_downloads.offer_url(
         user_google_email,
         source="gmail_message",
         ref={"mid": message_id, "fmt": body_format},
@@ -530,6 +532,8 @@ async def _export_full_message(
             "\nStateless mode: no file storage available, so the complete message is "
             "included inline below instead of as a download URL. It is NOT truncated."
         )
+        if signed_wanted:
+            result_lines.append(signed_downloads.UNAVAILABLE_NOTE)
         result_lines.append(
             "\n--- BODY (COMPLETE, NOT TRUNCATED) ---\n"
             f"{content_bytes.decode('utf-8', errors='replace')}"
@@ -574,6 +578,8 @@ async def _export_full_message(
             "\nFetch the full message from the URL above (content is NOT included "
             "in this response). The file will expire after 1 hour."
         )
+        if signed_wanted:
+            result_lines.append(signed_downloads.UNAVAILABLE_NOTE)
 
     logger.info(
         f"[get_gmail_message_content] Exported {size_kb:.1f} KB "
