@@ -9,6 +9,15 @@ import pytest
 import core.signed_downloads as sd
 from gmail.gmail_tools import _export_full_message, get_gmail_attachment_content
 
+
+@pytest.fixture(autouse=True)
+def _long_form_links(monkeypatch):
+    """This fork shortens minted links to /dl/{handle} by default
+    (core.download_handles); these tests pin the long form the tools were
+    written against. The short form is covered in tests/core/test_download_handles.py."""
+    monkeypatch.setenv("WORKSPACE_MCP_SHORT_SIGNED_URLS", "false")
+
+
 USER = "user@example.com"
 URL = "https://mcp.example.com/attachments/signed/TOKEN"
 HEADERS = {"Subject": "Quarterly numbers", "From": "cfo@example.com"}

@@ -33,7 +33,7 @@ from googleapiclient.errors import HttpError
 
 from auth.oauth_config import is_stateless_mode
 from auth.service_decorator import require_google_service
-from core import signed_downloads
+from core import download_handles, signed_downloads
 from core.attachment_storage import (
     get_attachment_storage,
     get_attachment_url,
@@ -529,11 +529,13 @@ async def _export_full_message(
     extension = {"raw": ".eml", "html": ".html", "text": ".txt"}[body_format]
     # A fallback after a failed offer says so, as the attachment and Drive tools do.
     signed_wanted = bool(user_google_email) and signed_downloads.enabled()
-    signed = signed_wanted and signed_downloads.offer_url(
-        user_google_email,
-        source="gmail_message",
-        ref={"mid": message_id, "fmt": body_format},
-        filename=f"{file_stem[:80]}{extension}",
+    signed = signed_wanted and await download_handles.shorten_signed_url(
+        signed_downloads.offer_url(
+            user_google_email,
+            source="gmail_message",
+            ref={"mid": message_id, "fmt": body_format},
+            filename=f"{file_stem[:80]}{extension}",
+        )
     )
     if signed:
         url, ttl = signed
@@ -2731,12 +2733,14 @@ async def get_gmail_attachment_content(
             filename, mime_type = await _resolve_attachment_name(
                 service, message_id, attachment_id
             )
-        signed = signed_downloads.offer_url(
-            user_google_email,
-            source="gmail",
-            ref={"mid": message_id, "aid": download_attachment_id},
-            filename=filename,
-            mime_type=mime_type,
+        signed = await download_handles.shorten_signed_url(
+            signed_downloads.offer_url(
+                user_google_email,
+                source="gmail",
+                ref={"mid": message_id, "aid": download_attachment_id},
+                filename=filename,
+                mime_type=mime_type,
+            )
         )
         if signed:
             url, ttl = signed
