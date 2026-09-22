@@ -1,4 +1,4 @@
-"""Tests for Drive-sourced Gmail attachments and the local-path remote guard.
+"""Tests for Drive-sourced Gmail attachments and the local-path guard.
 
 ``_resolve_drive_attachments`` lets a caller reference a Google Drive file by id
 instead of a server-local path (which is meaningless when the server runs
@@ -88,25 +88,48 @@ def test_drive_attachment_as_link_goes_to_body():
     ]
 
 
-def test_local_path_rejected_in_remote_mode():
-    """A local 'path' attachment becomes an error entry when running remotely."""
-    with patch("gmail.gmail_tools.get_transport_mode", return_value="streamable-http"):
+def test_local_path_rejected_when_local_files_disabled():
+    """A local 'path' attachment becomes an error entry when the server cannot
+    read local files (WORKSPACE_MCP_DISABLE_LOCAL_FILES=true / stateless)."""
+    with patch("gmail.gmail_tools.local_file_access_enabled", return_value=False):
         resolved, links = asyncio.run(
             _resolve_drive_attachments(Mock(), [{"path": "/tmp/secret.pdf"}])
         )
 
     assert links == []
     assert resolved[0].get("error")
+    assert "WORKSPACE_MCP_DISABLE_LOCAL_FILES" in resolved[0]["error"]
+    assert "drive_file_id" in resolved[0]["error"]
 
 
-def test_local_path_allowed_in_stdio_mode():
-    """In stdio mode a local 'path' attachment passes through untouched."""
-    with patch("gmail.gmail_tools.get_transport_mode", return_value="stdio"):
+def test_local_path_allowed_when_local_files_enabled():
+    """With local file access enabled a 'path' attachment passes through untouched."""
+    with patch("gmail.gmail_tools.local_file_access_enabled", return_value=True):
         att = {"path": "/tmp/report.pdf"}
         resolved, links = asyncio.run(_resolve_drive_attachments(Mock(), [att]))
 
     assert links == []
     assert resolved == [att]
+
+
+def test_local_path_guard_ignores_transport():
+    """The guard follows the local-files setting, not the transport: a
+    streamable-http server on localhost shares the caller's disk (the
+    WORKSPACE_MCP_DISABLE_LOCAL_FILES rationale), so 'path' still works there."""
+    att = {"path": "/tmp/report.pdf"}
+    with (
+        patch("gmail.gmail_tools.get_transport_mode", return_value="streamable-http"),
+        patch("gmail.gmail_tools.local_file_access_enabled", return_value=True),
+    ):
+        resolved, _ = asyncio.run(_resolve_drive_attachments(Mock(), [att]))
+    assert resolved == [att]
+
+    with (
+        patch("gmail.gmail_tools.get_transport_mode", return_value="stdio"),
+        patch("gmail.gmail_tools.local_file_access_enabled", return_value=False),
+    ):
+        resolved, _ = asyncio.run(_resolve_drive_attachments(Mock(), [att]))
+    assert resolved[0].get("error")
 
 
 def test_append_drive_links_plain_and_html():
