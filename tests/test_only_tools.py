@@ -403,8 +403,11 @@ import json, os, sys
 import main
 
 def _stop(*_a, **_k):
-    # Runs INSIDE main() right after the scope union is applied
-    # (set_transport_mode is the next hook), before any server binds a port.
+    # Runs INSIDE main() after the scope union is applied and before any server
+    # binds a port: configure_server_for_http is the first hook past that point
+    # on a streamable-http run. (set_transport_mode used to serve here, but it
+    # now runs BEFORE tool imports so decoration-time schema adaptation sees the
+    # real transport — too early to observe the derived grant.)
     # Dump the state and hard-exit here: main() wraps its run in a broad
     # except Exception, so an exception-based sentinel would be swallowed.
     from auth.scopes import get_scopes_for_tools
@@ -417,8 +420,11 @@ def _stop(*_a, **_k):
     sys.stdout.flush()
     os._exit(0)
 
-main.set_transport_mode = _stop
-sys.argv = ["main.py", "--only-tools", "send_gmail_message", "manage_drive_access"]
+main.configure_server_for_http = _stop
+sys.argv = [
+    "main.py", "--transport", "streamable-http",
+    "--only-tools", "send_gmail_message", "manage_drive_access",
+]
 main.main()
 raise SystemExit("main() was not stopped by the sentinel")
 """
