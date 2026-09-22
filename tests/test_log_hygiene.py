@@ -396,11 +396,15 @@ def _resumable_session_ok():
         ("import_to_google_doc", {"source_format": "docx"}),
     ],
 )
-async def test_resumable_upload_url_logs_event_not_file_name(caplog, tool, kwargs):
+async def test_resumable_upload_url_logs_event_not_file_name(
+    caplog, monkeypatch, tool, kwargs
+):
     """A file name is user content; the return_upload_url paths log the event at
     INFO and the name only at DEBUG (via the invocation log)."""
     import gdrive.drive_tools as drive_tools
 
+    # return_upload_url is offered only where local file access is disabled.
+    monkeypatch.setenv("WORKSPACE_MCP_DISABLE_LOCAL_FILES", "true")
     service = Mock()
     service.files().get().execute.return_value = {
         "id": "root",

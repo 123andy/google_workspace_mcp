@@ -37,6 +37,7 @@ from core.utils import (
     UserInputError,
     local_file_access_enabled,
     local_file_args,
+    remote_only_args,
     encode_image_content,
     OfficeXmlExtractionError,
     OfficeXmlTooLargeError,
@@ -1122,6 +1123,7 @@ def _resumable_upload_result(summary: str, upload_url: str, mime_type: str) -> s
 
 @server.tool(
     title="Create Drive File",
+    exclude_args=remote_only_args("return_upload_url"),
     annotations=ToolAnnotations(
         readOnlyHint=False,
         destructiveHint=False,
@@ -1149,8 +1151,6 @@ async def create_drive_file(
     Accepts direct text content, inline base64 bytes, or a fileUrl to fetch content from.
     This stores the supplied bytes without converting them to Google Docs, Sheets, or
     Slides. Use the matching import_to_google_* tool for Google-native conversion.
-    For large or binary files, or when this server is remote, set
-    return_upload_url=True and PUT the bytes straight to Google instead.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -1162,7 +1162,7 @@ async def create_drive_file(
         base64_content (Optional[str]): Standard base64-encoded file bytes.
         content_mime_type (Optional[str]): MIME type for base64_content uploads.
         base64_sha256 (Optional[str]): Expected SHA-256 of decoded base64_content. Recommended for binary payload integrity checks.
-        return_upload_url (bool): Return a Google resumable-upload session URL for a new file of mime_type instead of creating it from inline content; the caller PUTs the bytes there directly (no Authorization header). Not combinable with other content sources.
+        return_upload_url (bool): Return a Google resumable-upload session URL for a new file of mime_type instead of creating it from inline content; the caller PUTs the bytes there directly (no Authorization header). Preferred for large or binary files. Not combinable with other content sources. Offered only where local file access is disabled.
 
     Returns:
         str: Confirmation message of the successful file creation with file link,
@@ -1180,6 +1180,10 @@ async def create_drive_file(
         content_mime_type = content_mime_type.strip().lower()
 
     if return_upload_url:
+        if local_file_access_enabled():
+            raise _upload_url_not_offered_error(
+                ("fileUrl", "content", "base64_content")
+            )
         _reject_sources_with_upload_url(
             "creates the file",
             content=content,
@@ -1501,7 +1505,23 @@ def _file_path_disabled_error(inline_params: tuple[str, ...]) -> UserInputError:
         "'file_path' is unavailable: local file access is disabled on this "
         "server, since paths resolve on its filesystem, not the caller's. "
         "Instead, pass 'file_url' if the file is already at a URL the server "
-        f"can reach, or, {qualifier}send it inline via {inline}."
+        f"can reach, or, {qualifier}send it inline via {inline}, or set "
+        "'return_upload_url' to PUT the bytes to Google directly."
+    )
+
+
+def _upload_url_not_offered_error(routes: tuple[str, ...]) -> UserInputError:
+    """Build the error for ``return_upload_url`` sent while local file access is enabled.
+
+    The parameter is hidden from the schema then (``remote_only_args``), but a
+    client with a cached schema can still send it. ``routes`` are the local-disk
+    and inline parameters the calling tool really has.
+    """
+    named = ", ".join(f"'{name}'" for name in routes[:-1]) + f" or '{routes[-1]}'"
+    return UserInputError(
+        "Upload URLs are offered only when local file access is disabled on this "
+        "server (WORKSPACE_MCP_DISABLE_LOCAL_FILES=true); pass the file via "
+        f"{named}."
     )
 
 
@@ -1555,6 +1575,8 @@ async def _import_with_conversion(
         raise _file_path_disabled_error(inline_params)
 
     if return_upload_url:
+        if local_file_access_enabled():
+            raise _upload_url_not_offered_error(("file_path", *inline_params))
         _reject_sources_with_upload_url(
             "uploads the source",
             content=content,
@@ -1665,7 +1687,7 @@ async def _import_with_conversion(
 
 @server.tool(
     title="Import to Google Doc",
-    exclude_args=local_file_args("file_path"),
+    exclude_args=local_file_args("file_path") or remote_only_args("return_upload_url"),
     annotations=ToolAnnotations(
         readOnlyHint=False,
         destructiveHint=False,
@@ -1708,7 +1730,7 @@ async def import_to_google_doc(
         folder_id (str): The ID of the parent folder. Defaults to 'root'.
         base64_content (Optional[str]): Standard base64-encoded bytes for a binary source such as DOCX or ODT.
         base64_sha256 (Optional[str]): Expected SHA-256 of decoded base64_content. Recommended for binary payload integrity checks.
-        return_upload_url (bool): Return a Google resumable-upload session URL instead of ingesting the source here; the caller PUTs the source bytes there directly (no Authorization header) and Drive converts them. Requires source_format; not combinable with other content sources.
+        return_upload_url (bool): Return a Google resumable-upload session URL instead of ingesting the source here; the caller PUTs the source bytes there directly (no Authorization header) and Drive converts them. Requires source_format; not combinable with other content sources. Offered only where local file access is disabled.
 
     Returns:
         str: Confirmation message with the new Google Doc link, or the resumable upload URL.
@@ -1751,7 +1773,7 @@ async def import_to_google_doc(
 
 @server.tool(
     title="Import to Google Slides",
-    exclude_args=local_file_args("file_path"),
+    exclude_args=local_file_args("file_path") or remote_only_args("return_upload_url"),
     annotations=ToolAnnotations(
         readOnlyHint=False,
         destructiveHint=False,
@@ -1792,7 +1814,7 @@ async def import_to_google_slides(
         folder_id (str): The ID of the parent folder. Defaults to 'root'.
         base64_content (Optional[str]): Standard base64-encoded bytes for a PPTX or ODP source.
         base64_sha256 (Optional[str]): Expected SHA-256 of decoded base64_content. Recommended for binary payload integrity checks.
-        return_upload_url (bool): Return a Google resumable-upload session URL instead of ingesting the source here; the caller PUTs the source bytes there directly (no Authorization header) and Drive converts them. Requires source_format; not combinable with other content sources.
+        return_upload_url (bool): Return a Google resumable-upload session URL instead of ingesting the source here; the caller PUTs the source bytes there directly (no Authorization header) and Drive converts them. Requires source_format; not combinable with other content sources. Offered only where local file access is disabled.
 
     Returns:
         str: Confirmation message with the new Google Slides link, or the resumable upload URL.
@@ -1830,7 +1852,7 @@ async def import_to_google_slides(
 
 @server.tool(
     title="Import to Google Sheets",
-    exclude_args=local_file_args("file_path"),
+    exclude_args=local_file_args("file_path") or remote_only_args("return_upload_url"),
     annotations=ToolAnnotations(
         readOnlyHint=False,
         destructiveHint=False,
@@ -1873,7 +1895,7 @@ async def import_to_google_sheets(
         folder_id (str): The ID of the parent folder. Defaults to 'root'.
         base64_content (Optional[str]): Standard base64-encoded bytes for an XLSX, XLS, or ODS source.
         base64_sha256 (Optional[str]): Expected SHA-256 of decoded base64_content. Recommended for binary payload integrity checks.
-        return_upload_url (bool): Return a Google resumable-upload session URL instead of ingesting the source here; the caller PUTs the source bytes there directly (no Authorization header) and Drive converts them. Requires source_format; not combinable with other content sources.
+        return_upload_url (bool): Return a Google resumable-upload session URL instead of ingesting the source here; the caller PUTs the source bytes there directly (no Authorization header) and Drive converts them. Requires source_format; not combinable with other content sources. Offered only where local file access is disabled.
 
     Returns:
         str: Confirmation message with the new Google Sheets link, or the resumable upload URL.
@@ -2190,7 +2212,7 @@ async def check_drive_file_public_access(
 
 @server.tool(
     title="Update Drive File",
-    exclude_args=local_file_args("file_path"),
+    exclude_args=local_file_args("file_path") or remote_only_args("return_upload_url"),
     annotations=ToolAnnotations(
         readOnlyHint=False,
         destructiveHint=True,
@@ -2256,9 +2278,7 @@ async def update_drive_file(
         description (Optional[str]): New description for the file.
         mime_type (Optional[str]): New MIME type (note: changing type may require
             content upload). For a shortcut ID, this must accompany content and applies
-            to the resolved target. With return_upload_url it names the MIME type of
-            the bytes to be uploaded; on a native Google file (where it is required)
-            it names only that and leaves the file's type untouched.
+            to the resolved target.
         add_parents (Optional[str]): Comma-separated folder IDs to add as parents.
         remove_parents (Optional[str]): Comma-separated folder IDs to remove from parents.
         starred (Optional[bool]): Whether to star/unstar the file.
@@ -2284,7 +2304,10 @@ async def update_drive_file(
         return_upload_url (bool): Return a Google resumable-upload session URL to
             PUT the replacement bytes to directly (no Authorization header); any
             metadata changes are applied once the session is open. Only with
-            mode='replace'; not combinable with content/file_path/file_url.
+            mode='replace'; not combinable with content/file_path/file_url. Here
+            mime_type names the MIME type of the bytes to be uploaded; on a native
+            Google file it is required, names only that, and leaves the file's type
+            untouched. Offered only where local file access is disabled.
 
     Returns:
         str: Confirmation message with details of the updates applied, or the
@@ -2303,6 +2326,8 @@ async def update_drive_file(
             f"Unsupported mode: '{mode}'. Supported: {', '.join(CONTENT_UPDATE_MODES)}."
         )
     if return_upload_url:
+        if local_file_access_enabled():
+            raise _upload_url_not_offered_error(("file_path", "content"))
         if mode != "replace":
             raise ValueError(
                 "return_upload_url replaces the file's whole content; it cannot be "

@@ -183,6 +183,20 @@ def local_file_args(*names: str) -> list[str] | None:
     return None if local_file_access_enabled() else list(names)
 
 
+def remote_only_args(*names: str) -> list[str] | None:
+    """Tool-registration helper: hide remote-only parameters when local files work.
+
+    The inverse of ``local_file_args``: a parameter such as ``return_upload_url``
+    exists for hosted deployments that cannot read the caller's disk, so it is
+    advertised only when local file access is disabled. Both helpers read
+    ``local_file_access_enabled()``, so exactly one of them returns a list under
+    any setting, and a tool with both kinds of parameter composes them as
+    ``exclude_args=local_file_args("file_path") or remote_only_args("return_upload_url")``.
+    Runtime guards stay in place here too, for clients with a cached schema.
+    """
+    return list(names) if local_file_access_enabled() else None
+
+
 def _get_allowed_file_dirs() -> list[Path]:
     """Return the list of directories from which local file access is permitted."""
     from core.attachment_storage import STORAGE_DIR
