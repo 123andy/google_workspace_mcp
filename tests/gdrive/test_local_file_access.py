@@ -9,6 +9,7 @@ Transport alone never disables it.
 """
 
 import inspect
+import json
 import os
 import re
 import subprocess
@@ -300,3 +301,86 @@ asyncio.run(main())
     def test_http_without_opt_in_still_advertises_file_path(self):
         out = _run_subprocess(self.CODE, {})
         assert "ADVERTISED:True" in out
+
+
+class TestShippedTextNeverNamesAHiddenParameter:
+    """FastMCP ships the docstring body above ``Args:`` as the tool description
+    and each ``Args:`` line as its property's description. Hiding ``file_path``
+    from the signature drops its own line, but prose elsewhere that names it
+    would send a model after a parameter the schema does not have. One static
+    text serves both settings, so it must not enumerate the local-only route."""
+
+    # The four tools whose signature hides file_path when local file access is
+    # off. Named here rather than borrowed from TestSchemaThroughFastMCP, whose
+    # subprocess on this line still probes a single tool.
+    TOOLS = (
+        "import_to_google_doc",
+        "import_to_google_slides",
+        "import_to_google_sheets",
+        "update_drive_file",
+    )
+
+    CODE = """
+import asyncio, json
+from core.server import server, set_transport_mode
+set_transport_mode('streamable-http')
+import gdrive.drive_tools
+from fastmcp import Client
+
+async def main():
+    async with Client(server) as client:
+        shipped = {
+            t.name: {
+                "description": t.description or "",
+                "properties": {
+                    name: prop.get("description", "")
+                    for name, prop in t.inputSchema["properties"].items()
+                },
+            }
+            for t in await client.list_tools()
+            if t.name in %r
+        }
+        print("SHIPPED:" + json.dumps(shipped, sort_keys=True))
+
+asyncio.run(main())
+""" % (TOOLS,)
+
+    def _shipped(self, env):
+        out = _run_subprocess(self.CODE, env)
+        return json.loads(out.split("SHIPPED:", 1)[1])
+
+    def test_disabled_ships_no_text_naming_file_path(self):
+        shipped = self._shipped({"WORKSPACE_MCP_DISABLE_LOCAL_FILES": "true"})
+        assert set(shipped) == set(self.TOOLS)
+        offenders = [
+            (name, where)
+            for name, tool in shipped.items()
+            for where, text in [("description", tool["description"])]
+            + list(tool["properties"].items())
+            if "file_path" in text
+        ]
+        assert offenders == []
+
+    def test_enabled_ships_the_same_text_plus_the_parameter(self):
+        """The wording is not switched per setting: hidden or shown, the
+        description and every commonly-advertised property read the same.
+
+        On this line the setting swaps a pair rather than just dropping one:
+        ``remote_only_args`` hides ``return_upload_url`` wherever local files
+        work, so exactly one of the two is advertised under either setting
+        (see core.utils.remote_only_args). That swap is pinned below so it
+        cannot widen unnoticed; everything else must be identical text."""
+        on = self._shipped({"WORKSPACE_MCP_DISABLE_LOCAL_FILES": "true"})
+        off = self._shipped({})
+        for name in self.TOOLS:
+            assert off[name]["description"] == on[name]["description"]
+            assert "file_path" in off[name]["properties"]
+            assert "file_path" not in on[name]["properties"]
+            only_off = set(off[name]["properties"]) - set(on[name]["properties"])
+            only_on = set(on[name]["properties"]) - set(off[name]["properties"])
+            assert only_off == {"file_path"}
+            assert only_on <= {"return_upload_url"}
+            shared = set(off[name]["properties"]) & set(on[name]["properties"])
+            assert {k: off[name]["properties"][k] for k in shared} == {
+                k: on[name]["properties"][k] for k in shared
+            }
