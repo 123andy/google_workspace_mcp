@@ -210,7 +210,7 @@ class TestFilePathRejectedWhenDisabled:
         removing one of these parameters fails here instead of leaving the
         guidance quietly wrong."""
         fn = _unwrap(tool)
-        has = {"content", "base64_content", "file_url"} & set(
+        has = {"content", "base64_content", "file_url", "return_upload_url"} & set(
             inspect.signature(fn).parameters
         )
         service = Mock()

@@ -175,29 +175,57 @@ def local_file_access_enabled() -> bool:
     return os.environ.get(_DISABLE_LOCAL_FILES_ENV, "").strip().lower() != "true"
 
 
-def hide_local_file_args(*names: str):
-    """Tool decorator: drop server-side path parameters when local files are off.
+def _hide_parameters(func, names: tuple[str, ...], hide: bool):
+    """Drop ``names`` from ``func``'s signature when ``hide`` is set.
 
     FastMCP builds a tool's input schema from ``inspect.signature``, which
     honours ``__signature__``; ``require_google_service`` hides ``service`` (and
-    ``user_google_email`` under OAuth 2.1) the same way. Apply this directly
-    under ``@server.tool`` so the rewritten signature is what FastMCP sees.
-    A hidden parameter is then rejected by FastMCP's argument validation before
-    the tool runs, so a client with a cached schema cannot reach it. No-op when
-    local file access is enabled. The names are checked against the signature
-    either way, so a stale name fails at import rather than silently.
+    ``user_google_email`` under OAuth 2.1) the same way. A hidden parameter is
+    then rejected by FastMCP's argument validation before the tool runs, so a
+    client with a cached schema cannot reach it. The names are checked against
+    the signature either way, so a stale name fails at import rather than
+    silently. Because ``inspect.signature`` reads the signature a previous
+    decorator left, the decorators below stack.
+    """
+    sig = inspect.signature(func)
+    missing = [name for name in names if name not in sig.parameters]
+    if missing:
+        raise ValueError(f"{func.__name__} has no parameter(s) {missing} to hide.")
+    if hide:
+        func.__signature__ = sig.replace(
+            parameters=[p for p in sig.parameters.values() if p.name not in names]
+        )
+    return func
+
+
+def hide_local_file_args(*names: str):
+    """Tool decorator: drop server-side path parameters when local files are off.
+
+    Apply directly under ``@server.tool`` so the rewritten signature is what
+    FastMCP sees (see ``_hide_parameters``). No-op when local file access is
+    enabled.
     """
 
     def decorator(func):
-        sig = inspect.signature(func)
-        missing = [name for name in names if name not in sig.parameters]
-        if missing:
-            raise ValueError(f"{func.__name__} has no parameter(s) {missing} to hide.")
-        if not local_file_access_enabled():
-            func.__signature__ = sig.replace(
-                parameters=[p for p in sig.parameters.values() if p.name not in names]
-            )
-        return func
+        return _hide_parameters(func, names, hide=not local_file_access_enabled())
+
+    return decorator
+
+
+def hide_remote_only_args(*names: str):
+    """Tool decorator: drop remote-only parameters when local files work.
+
+    The inverse of ``hide_local_file_args``: a parameter such as
+    ``return_upload_url`` exists for hosted deployments that cannot read the
+    caller's disk, so it is advertised only when local file access is disabled.
+    Both decorators read ``local_file_access_enabled()``, so under any setting a
+    tool carrying both kinds of parameter hides exactly one of them. Apply
+    directly under ``@server.tool``, stacked with ``hide_local_file_args`` in
+    either order. No-op when local file access is disabled.
+    """
+
+    def decorator(func):
+        return _hide_parameters(func, names, hide=local_file_access_enabled())
 
     return decorator
 
