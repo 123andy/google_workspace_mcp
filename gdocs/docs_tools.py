@@ -25,11 +25,6 @@ from core.file_limits import (
     download_media_bytes,
     ensure_within_file_size_limit,
 )
-from gdrive.drive_helpers import (
-    folder_move_failed_note,
-    folder_note,
-    place_created_file_in_folder,
-)
 from core.utils import (
     GOOGLE_API_WRITE_RETRIES,
     OfficeXmlExtractionError,
@@ -87,6 +82,7 @@ from gdocs.managers import (
     ValidationManager,
     BatchOperationManager,
 )
+from gdrive.drive_helpers import move_new_file_to_folder
 import json
 
 logger = logging.getLogger(__name__)
@@ -492,25 +488,9 @@ async def create_doc(
     )
     doc_id = doc.get("documentId")
 
-    placement_note = folder_note(folder_id)
-    if folder_id and folder_id != "root":
-        try:
-            # Drive is authenticated here rather than on the tool decorator so
-            # the "root" default needs no Drive scope at all.
-            await place_created_file_in_folder(
-                user_google_email=user_google_email,
-                file_id=doc_id,
-                folder_id=folder_id,
-                tool_name="create_doc",
-            )
-        except Exception as e:
-            # The doc exists either way; report it with its ID rather than
-            # raising and leaving an orphan in My Drive root.
-            logger.warning(
-                f"[create_doc] Created doc {doc_id} but could not move it into "
-                f"folder '{folder_id}': {e}"
-            )
-            placement_note = folder_move_failed_note(folder_id, e)
+    placement_note = await move_new_file_to_folder(
+        user_google_email, doc_id, folder_id, "create_doc"
+    )
 
     if content:
         requests = [{"insertText": {"location": {"index": 1}, "text": content}}]

@@ -1,9 +1,7 @@
 """Tests for the shared Drive folder-placement helpers.
 
-``place_file_in_folder`` always moves the file; callers decide whether a move is
-wanted. The "no move for root" behaviour therefore lives with the create tools
-(see tests/gdocs/test_create_doc_folder.py and
-tests/gsheets/test_create_spreadsheet_folder.py).
+``place_file_in_folder`` always moves the file; ``move_new_file_to_folder``
+decides whether a move is wanted and turns the outcome into a reply note.
 """
 
 from unittest.mock import AsyncMock, Mock, patch
@@ -12,8 +10,7 @@ import pytest
 
 from auth.scopes import DRIVE_FILE_SCOPE
 from gdrive.drive_helpers import (
-    folder_move_failed_note,
-    folder_note,
+    move_new_file_to_folder,
     place_created_file_in_folder,
     place_file_in_folder,
 )
@@ -139,32 +136,56 @@ async def test_place_file_in_folder_sends_no_remove_when_already_in_place():
     assert service.files().update.call_args.kwargs["removeParents"] == ""
 
 
+def _patch_placement(**mock_kwargs):
+    return patch(
+        "gdrive.drive_helpers.place_created_file_in_folder",
+        new=AsyncMock(**mock_kwargs),
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("folder_id", ["root", "", None])
-def test_folder_note_empty_for_root(folder_id):
-    assert folder_note(folder_id) == ""
+async def test_move_new_file_skips_drive_for_root(folder_id):
+    with _patch_placement() as place:
+        note = await move_new_file_to_folder(
+            "user@example.com", "file-1", folder_id, "create_doc"
+        )
+
+    place.assert_not_awaited()
+    assert note == ""
 
 
-def test_folder_move_failed_note_names_folder_and_reason():
-    note = folder_move_failed_note("folder-abc", Exception("is not a folder"))
+@pytest.mark.asyncio
+async def test_move_new_file_names_destination():
+    with _patch_placement(return_value="resolved-folder") as place:
+        note = await move_new_file_to_folder(
+            "user@example.com", "file-1", "folder-abc", "create_doc"
+        )
+
+    place.assert_awaited_once_with(
+        user_google_email="user@example.com",
+        file_id="file-1",
+        folder_id="folder-abc",
+        tool_name="create_doc",
+    )
+    assert note == " Placed in folder 'folder-abc'."
+
+
+@pytest.mark.asyncio
+async def test_move_new_file_reports_failure_instead_of_raising():
+    with _patch_placement(side_effect=Exception("is not a folder")):
+        note = await move_new_file_to_folder(
+            "user@example.com", "file-1", "folder-abc", "create_doc"
+        )
 
     assert "folder-abc" in note
     assert "is not a folder" in note
     assert "My Drive root" in note
-
-
-def test_folder_note_names_destination():
-    assert folder_note("folder-abc") == " Placed in folder 'folder-abc'."
+    assert "Placed in folder" not in note
 
 
 def test_placement_still_requires_drive_file_scope():
-    """
-    Moving the Drive requirement off the create tools must not drop it.
-
-    create_doc and create_spreadsheet no longer declare drive.file, so this
-    helper is the only thing standing between a Sheets- or Docs-only credential
-    and arbitrary-folder placement. It authenticates Drive itself, which fails
-    closed: without drive.file the move raises and the file stays in root.
-    """
+    """The create tools do not declare drive.file, so this helper must."""
     assert place_created_file_in_folder._required_google_scopes == [DRIVE_FILE_SCOPE]
 
 

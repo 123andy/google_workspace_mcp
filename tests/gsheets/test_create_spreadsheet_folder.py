@@ -26,7 +26,7 @@ def _sheets_mock(spreadsheet_id="sheet-123"):
 def _patch_placement(**mock_kwargs):
     """Stand in for the on-demand Drive move; its mechanics are tested separately."""
     return patch(
-        "gsheets.sheets_tools.place_created_file_in_folder",
+        "gdrive.drive_helpers.place_created_file_in_folder",
         new=AsyncMock(**mock_kwargs),
     )
 

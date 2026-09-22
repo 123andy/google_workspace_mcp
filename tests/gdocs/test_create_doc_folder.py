@@ -23,7 +23,7 @@ def _docs_mock(document_id="doc-123"):
 def _patch_placement(**mock_kwargs):
     """Stand in for the on-demand Drive move; its mechanics are tested separately."""
     return patch(
-        "gdocs.docs_tools.place_created_file_in_folder",
+        "gdrive.drive_helpers.place_created_file_in_folder",
         new=AsyncMock(**mock_kwargs),
     )
 

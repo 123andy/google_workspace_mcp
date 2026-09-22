@@ -13,14 +13,10 @@ from typing import List, Optional, Union
 from mcp.types import ToolAnnotations
 
 from auth.service_decorator import require_google_service
-from gdrive.drive_helpers import (
-    folder_move_failed_note,
-    folder_note,
-    place_created_file_in_folder,
-)
 from core.server import server
 from core.utils import handle_http_errors, UserInputError, StringList
 from core.comments import create_comment_tools
+from gdrive.drive_helpers import move_new_file_to_folder
 from gsheets.sheets_helpers import (
     CONDITION_TYPES,
     MAX_READ_SHEET_ROWS,
@@ -1261,25 +1257,9 @@ async def create_spreadsheet(
     spreadsheet_url = spreadsheet.get("spreadsheetUrl")
     locale = properties.get("locale", "Unknown")
 
-    placement_note = folder_note(folder_id)
-    if folder_id and folder_id != "root":
-        try:
-            # Drive is authenticated here rather than on the tool decorator so
-            # the "root" default needs no Drive scope at all.
-            await place_created_file_in_folder(
-                user_google_email=user_google_email,
-                file_id=spreadsheet_id,
-                folder_id=folder_id,
-                tool_name="create_spreadsheet",
-            )
-        except Exception as e:
-            # The spreadsheet exists either way; report it with its ID rather
-            # than raising and leaving an orphan in My Drive root.
-            logger.warning(
-                f"[create_spreadsheet] Created spreadsheet {spreadsheet_id} but could "
-                f"not move it into folder '{folder_id}': {e}"
-            )
-            placement_note = folder_move_failed_note(folder_id, e)
+    placement_note = await move_new_file_to_folder(
+        user_google_email, spreadsheet_id, folder_id, "create_spreadsheet"
+    )
 
     text_output = (
         f"Successfully created spreadsheet '{title}' for {user_google_email}."

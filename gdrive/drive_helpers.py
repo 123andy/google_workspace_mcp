@@ -508,30 +508,10 @@ async def place_file_in_folder(
     tool_name: str = "place_file_in_folder",
 ) -> str:
     """
-    Re-parent a freshly created Drive file into ``folder_id``.
+    Move ``file_id`` into ``folder_id`` (ID or shortcut), removing its other parents.
 
-    The Docs and Sheets ``create`` endpoints always drop the new file in My Drive
-    root; neither accepts a parent. To honour a caller-supplied ``folder_id`` the
-    file has to be re-parented with this follow-up Drive call.
-
-    Always moves the file, so call it only when a move is actually wanted::
-
-        if folder_id and folder_id != "root":
-            await place_file_in_folder(drive_service, file_id, folder_id)
-
-    ``folder_id`` may be a folder ID, a folder shortcut, or anything else
-    ``resolve_folder_id`` accepts; it is resolved to a real folder ID first, so a
-    non-folder target raises before any move happens. The file's other existing
-    parents are removed so the file lands in exactly one place.
-
-    Args:
-        drive_service: Authenticated Drive service.
-        file_id: ID of the file to move.
-        folder_id: Destination folder. Must name a real folder, not ``"root"``.
-        tool_name: Calling tool, for log prefixes.
-
-    Returns:
-        The resolved destination folder ID.
+    The Docs and Sheets create endpoints accept no parent, so new files land in
+    My Drive root and must be re-parented afterwards. Returns the resolved folder ID.
     """
     resolved_folder_id = await resolve_folder_id(drive_service, folder_id)
     existing = await asyncio.to_thread(
@@ -539,9 +519,7 @@ async def place_file_in_folder(
         .get(fileId=file_id, fields="parents", supportsAllDrives=True)
         .execute
     )
-    # The destination is excluded so a caller naming the file's current parent
-    # outright (e.g. the literal My Drive root ID, which sidesteps the "root"
-    # alias) does not send the same ID as both addParents and removeParents.
+    # Skip the destination so a file already there is not both added and removed.
     remove_parents = ",".join(
         parent for parent in existing.get("parents", []) if parent != resolved_folder_id
     )
@@ -572,53 +550,45 @@ async def place_created_file_in_folder(
     tool_name: str = "place_created_file_in_folder",
 ) -> str:
     """
-    Authenticate Drive on demand, then re-parent ``file_id`` into ``folder_id``.
+    Authenticate Drive on demand, then run ``place_file_in_folder``.
 
-    ``create_doc`` and ``create_spreadsheet`` need Drive only when the caller
-    names a real folder. Declaring Drive on the tool's own decorator instead
-    would make every call demand ``drive.file`` up front, including the
-    ``folder_id="root"`` default that touches Drive not at all, and would drop
-    the tool from the registry under any permission set omitting that scope.
-    Service-account mode is worse still: ``_widen_drive_scope_for_dwd``
-    substitutes the full Drive scope for ``drive.file``, so the default path
-    would ask for read/write access to the user's entire Drive.
-
-    Call it only when a move is actually wanted::
-
-        if folder_id and folder_id != "root":
-            await place_created_file_in_folder(...)
-
-    Args:
-        user_google_email: User whose Drive credentials to use.
-        file_id: ID of the file to move.
-        folder_id: Destination folder. Must name a real folder, not ``"root"``.
-        tool_name: Calling tool, for log prefixes.
-
-    Returns:
-        The resolved destination folder ID.
+    Kept off the calling tool's decorator so the ``folder_id="root"`` default
+    needs no Drive scope (and no full-Drive scope under domain-wide delegation).
     """
     return await place_file_in_folder(service, file_id, folder_id, tool_name=tool_name)
 
 
-def folder_note(folder_id: Optional[str]) -> str:
-    """Confirmation-message fragment naming the destination folder, if any."""
+async def move_new_file_to_folder(
+    user_google_email: str,
+    file_id: str,
+    folder_id: Optional[str],
+    tool_name: str,
+) -> str:
+    """
+    Move a just-created file into ``folder_id`` and return a note for the reply.
+
+    A failed move is reported, not raised: the file already exists in My Drive
+    root, so the caller still needs its ID.
+    """
     if not folder_id or folder_id == "root":
         return ""
+    try:
+        await place_created_file_in_folder(
+            user_google_email=user_google_email,
+            file_id=file_id,
+            folder_id=folder_id,
+            tool_name=tool_name,
+        )
+    except Exception as e:
+        logger.warning(
+            f"[{tool_name}] Created file {file_id} but could not move it into "
+            f"folder '{folder_id}': {e}"
+        )
+        return (
+            f" WARNING: left in My Drive root - could not move it into folder "
+            f"'{folder_id}': {e}"
+        )
     return f" Placed in folder '{folder_id}'."
-
-
-def folder_move_failed_note(folder_id: str, error: Exception) -> str:
-    """
-    Confirmation-message fragment for a file that was created but not moved.
-
-    The file already exists in My Drive root at this point, so its ID has to
-    reach the caller: raising instead would strand an invisible copy that a
-    retry would duplicate.
-    """
-    return (
-        f" WARNING: left in My Drive root - could not move it into folder "
-        f"'{folder_id}': {error}"
-    )
 
 
 DOWNLOAD_CHUNK_SIZE_BYTES = 256 * 1024  # 256 KB
