@@ -114,3 +114,49 @@ def test_no_filtering_when_nothing_is_configured() -> None:
 
     assert filter_server_tools(server) == 0
     assert server.local_provider.removed == []
+
+
+STRICT_ENV = "WORKSPACE_MCP_STRICT_DISABLED_TOOLS"
+
+
+def test_strict_block_list_refuses_to_start_on_a_typo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(STRICT_ENV, "true")
+    server = _fake_server("set_drive_file_permissions")
+    set_disabled_tools({"set_drive_file_permisions"})
+
+    with pytest.raises(SystemExit, match="set_drive_file_permisions"):
+        filter_server_tools(server)
+
+
+def test_strict_block_list_allows_retired_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Kept on the list for rollback safety: present on the previous image only.
+    monkeypatch.setenv(STRICT_ENV, "true")
+    server = _fake_server("set_drive_file_permissions")
+    set_disabled_tools({"set_drive_file_permissions", "send_gmail_draft"})
+
+    assert filter_server_tools(server) == 1
+    assert server.local_provider.removed == ["set_drive_file_permissions"]
+
+
+def test_strict_block_list_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(STRICT_ENV, raising=False)
+    server = _fake_server("search_gmail_messages")
+    set_disabled_tools({"send_gmail_mesage"})
+
+    assert filter_server_tools(server) == 0
+
+
+@pytest.mark.parametrize("value", [" true ", "TRUE"])
+def test_strict_block_list_setting_is_normalised(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv(STRICT_ENV, value)
+    server = _fake_server("search_gmail_messages")
+    set_disabled_tools({"send_gmail_mesage"})
+
+    with pytest.raises(SystemExit):
+        filter_server_tools(server)
