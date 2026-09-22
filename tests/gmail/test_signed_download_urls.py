@@ -44,6 +44,7 @@ def _service(payload=b"bytes", filename="report.pdf"):
 @pytest.fixture
 def enabled(monkeypatch):
     monkeypatch.setenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", "true")
+    monkeypatch.setattr(sd, "get_transport_mode", lambda: "streamable-http")
     monkeypatch.delenv("WORKSPACE_MCP_MAX_FILE_BYTES", raising=False)
 
 

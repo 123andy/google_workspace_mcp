@@ -2425,8 +2425,8 @@ async def get_gmail_attachment_content(
 
     # Signed URL: the route fetches the bytes from Gmail at download time, so the
     # attachment is not downloaded here. return_base64 asks for the bytes inline.
-    no_url = not return_base64 and signed_downloads.enabled()
-    if no_url:
+    signed_wanted = not return_base64 and signed_downloads.enabled()
+    if signed_wanted:
         if not filename:
             filename, mime_type = await _resolve_attachment_name(
                 service, message_id, attachment_id
@@ -2499,12 +2499,12 @@ async def get_gmail_attachment_content(
     if is_stateless_mode():
         result_lines = [
             "Attachment fetched, but NO download URL could be issued."
-            if no_url
+            if signed_wanted
             else "Attachment downloaded successfully!",
             f"Message ID: {message_id}",
             f"Size: {size_kb:.1f} KB ({size_bytes} bytes)",
             "\n⚠️ Stateless mode: File storage disabled.",
-            *([signed_downloads.UNAVAILABLE_NOTE] if no_url else []),
+            *([signed_downloads.UNAVAILABLE_NOTE] if signed_wanted else []),
             "\nBase64-encoded content (first 100 characters shown):",
             f"{base64_data[:100]}...",
             "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch.",
@@ -2555,7 +2555,7 @@ async def get_gmail_attachment_content(
             download_url = get_attachment_url(result.file_id)
             result_lines.append(f"\n📎 Download URL: {download_url}")
             result_lines.append("\nThe file will expire after 1 hour.")
-            if no_url:
+            if signed_wanted:
                 result_lines.append(signed_downloads.UNAVAILABLE_NOTE)
 
         result_lines.append(
