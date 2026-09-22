@@ -27,7 +27,7 @@ def _service(mime="application/vnd.google-apps.document", name="Plan"):
 
 @pytest.fixture
 def enabled(monkeypatch):
-    monkeypatch.setenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", "true")
+    monkeypatch.setenv("WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS", "true")
     monkeypatch.setattr(sd, "get_transport_mode", lambda: "streamable-http")
 
 
@@ -86,7 +86,7 @@ async def test_stateless_fallback_is_loud_when_url_cannot_be_minted(
 
     assert "downloaded successfully" not in result
     assert "NO download URL could be issued" in result
-    assert "Re-authenticate" in result
+    assert "could not recover usable credentials" in result
     assert not blob.exists()
 
 
@@ -97,7 +97,7 @@ async def test_stateless_wording_unchanged_when_feature_off(
 ):
     import gdrive.drive_tools as drive_tools
 
-    monkeypatch.delenv("WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS", raising=False)
+    monkeypatch.delenv("WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS", raising=False)
     monkeypatch.setattr(drive_tools, "is_stateless_mode", lambda: True)
     blob = tmp_path / "clip.mp4"
     blob.write_bytes(b"x" * 300)
