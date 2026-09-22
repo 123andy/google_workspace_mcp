@@ -265,6 +265,7 @@ def test_palette_exactly_matches_the_discovery_document_snapshot():
         {"labelListVisibility": "labelHide", "messageListVisibility": "hide"},
         {"labelListVisibility": "labelHide", "messageListVisibility": "show"},
         {"labelListVisibility": "labelShow", "messageListVisibility": "hide"},
+        {"labelListVisibility": "labelShowIfUnread", "messageListVisibility": "hide"},
     ],
 )
 async def test_update_without_visibility_keeps_the_stored_visibility(stored):
@@ -280,7 +281,8 @@ async def test_update_without_visibility_keeps_the_stored_visibility(stored):
 
 
 @pytest.mark.asyncio
-async def test_update_still_applies_visibility_when_asked():
+@pytest.mark.parametrize("requested", ["labelShow", "labelShowIfUnread"])
+async def test_update_still_applies_visibility_when_asked(requested):
     service = _build_mock_service(
         {
             "id": "Label_1",
@@ -291,32 +293,12 @@ async def test_update_still_applies_visibility_when_asked():
     )
 
     await _update(
-        service, label_list_visibility="labelShow", message_list_visibility="show"
+        service, label_list_visibility=requested, message_list_visibility="show"
     )
 
     body = _sent_body(service, "update")
-    assert body["labelListVisibility"] == "labelShow"
+    assert body["labelListVisibility"] == requested
     assert body["messageListVisibility"] == "show"
-
-
-@pytest.mark.asyncio
-async def test_update_without_visibility_keeps_stored_visibility():
-    """Carrying the stored value over preserves a visibility the caller did
-    not mention."""
-    service = _build_mock_service(
-        {
-            "id": "Label_1",
-            "name": "Urgent",
-            "labelListVisibility": "labelShowIfUnread",
-            "messageListVisibility": "hide",
-        }
-    )
-
-    await _update(service, name="Renamed")
-
-    body = _sent_body(service, "update")
-    assert body["labelListVisibility"] == "labelShowIfUnread"
-    assert body["messageListVisibility"] == "hide"
 
 
 def test_label_list_visibility_accepts_all_three_gmail_values():
