@@ -30,19 +30,25 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import AsyncIterator, Awaitable, Callable, Optional
 from urllib.parse import quote, urlparse
 
 from cryptography.fernet import Fernet
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from google.auth._helpers import REFRESH_THRESHOLD
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
 from core.config import get_transport_mode
+from core.file_limits import FileTooLargeError, ensure_within_file_size_limit
+
+try:
+    from google.auth._helpers import REFRESH_THRESHOLD
+except ImportError:  # private google-auth API: keep this module importable
+    # google-auth 2.x's value; TestUsability pins it against the installed release.
+    REFRESH_THRESHOLD = timedelta(seconds=225)
 
 logger = logging.getLogger(__name__)
 
@@ -405,6 +411,17 @@ class SignedDownloadError(Exception):
     """A fetcher could not produce the bytes (served as 502)."""
 
 
+def _within_file_limit(content: bytes, what: str) -> bytes:
+    """Buffered fetches enforce ``WORKSPACE_MCP_MAX_FILE_BYTES`` on the actual bytes:
+    the size checked at mint time is Google's declaration, which can be absent or
+    understated (``sizeEstimate`` is approximate)."""
+    try:
+        ensure_within_file_size_limit(len(content), kind=what)
+    except FileTooLargeError as exc:
+        raise SignedDownloadError(f"{what} exceeds the file size limit") from exc
+    return content
+
+
 def _decode_urlsafe(data: str, what: str) -> bytes:
     if not data:
         raise SignedDownloadError(f"{what} has no content")
@@ -435,7 +452,10 @@ async def _fetch_gmail_attachment(
     return DownloadResult(
         filename=claims.get("fn") or "attachment",
         media_type=claims.get("mt") or "application/octet-stream",
-        content=_decode_urlsafe(attachment.get("data", ""), "Gmail attachment"),
+        content=_within_file_limit(
+            _decode_urlsafe(attachment.get("data", ""), "Gmail attachment"),
+            "attachment",
+        ),
     )
 
 
@@ -458,7 +478,7 @@ async def _fetch_gmail_message(
     return DownloadResult(
         filename=claims.get("fn") or f"message{extension}",
         media_type=mime_type,
-        content=content,
+        content=_within_file_limit(content, "message export"),
     )
 
 
@@ -502,9 +522,12 @@ async def _fetch_drive(claims: dict, credentials: Credentials) -> DownloadResult
                 return
             try:
                 pending, finished = await asyncio.to_thread(next_chunk)
-            except Exception as exc:  # headers are out; the stream can only end early
+            except Exception as exc:
                 logger.error("Drive stream interrupted mid-download: %s", exc)
-                return
+                # Headers are out. Raising makes the server abort the chunked body
+                # without its terminating chunk, so the client sees an incomplete
+                # transfer; returning would end it cleanly as a complete file.
+                raise SignedDownloadError(f"Drive stream interrupted: {exc}") from exc
 
     return DownloadResult(
         filename=claims.get("fn") or "download",

@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
 
 import h11
+import httpx
 import pytest
 import requests
 from cryptography.fernet import Fernet
@@ -622,6 +623,19 @@ class TestUsability:
         creds.expiry = _now() + timedelta(seconds=self.THRESHOLD - 5)
         assert creds.valid is False  # still 220 s on the clock, already "expired"
 
+    def test_module_imports_without_googles_private_threshold(self, monkeypatch):
+        """REFRESH_THRESHOLD is private google-auth API. A release without it must not
+        make this module (imported by the Gmail and Drive tools) unimportable."""
+        import importlib.util
+
+        import google.auth._helpers
+
+        monkeypatch.delattr(google.auth._helpers, "REFRESH_THRESHOLD")
+        spec = importlib.util.spec_from_file_location("_sd_copy", sd.__file__)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        assert module.REFRESH_THRESHOLD == timedelta(seconds=self.THRESHOLD)
+
     def test_non_refreshable_usable_until_threshold_not_expiry(self):
         creds = self._creds(3600)
         assert sd.usable_seconds(creds, now=self.NOW) == 3600 - self.THRESHOLD
@@ -1058,6 +1072,60 @@ class TestDriveFetcher:
         with pytest.raises(sd.SignedDownloadError):
             await sd._fetch_drive({"fid": "F"}, Mock())
 
+    @pytest.fixture
+    def fails_on_second_chunk(self, monkeypatch):
+        """Drive answers the first chunk, then the connection to Google drops."""
+        import gdrive.drive_tools as drive_tools
+
+        class Flaky(_FakeDownloader):
+            def next_chunk(self):
+                if self._pos:
+                    raise OSError("connection reset by Google")
+                return super().next_chunk()
+
+        files = _FakeFiles([], self.PAYLOAD)
+        monkeypatch.setattr(sd, "build", lambda *a, **k: Mock(files=lambda: files))
+        monkeypatch.setattr(sd, "MediaIoBaseDownload", Flaky)
+        monkeypatch.setattr(drive_tools, "DOWNLOAD_CHUNK_SIZE", self.CHUNK)
+
+    @pytest.mark.asyncio
+    async def test_mid_stream_failure_raises_instead_of_ending_cleanly(
+        self, fails_on_second_chunk
+    ):
+        """A generator that returns ends the chunked body normally, which the
+        client reads as a complete file. It must raise."""
+        result = await sd._fetch_drive({"fid": "F"}, Mock())
+        received = []
+        with pytest.raises(sd.SignedDownloadError):
+            async for chunk in result.stream:
+                received.append(chunk)
+        assert b"".join(received) == self.PAYLOAD[: self.CHUNK]
+
+    @pytest.mark.asyncio
+    async def test_mid_stream_failure_is_never_a_complete_200_over_http(
+        self, fails_on_second_chunk, monkeypatch
+    ):
+        """Through the route over ASGI: the truncated body must not arrive as a
+        finished 200 response (uvicorn drops the connection without the final
+        chunk; httpx's in-process transport surfaces the app's exception)."""
+        from starlette.applications import Starlette
+        from starlette.routing import Route
+
+        monkeypatch.setenv(sd.FLAG_ENV, "true")
+        monkeypatch.setattr(sd, "_recover_credentials", lambda email: _credentials())
+
+        async def route(request):
+            return await sd.serve(request.path_params["token"])
+
+        app = Starlette(routes=[Route("/attachments/signed/{token}", route)])
+        token = _token(_mint(source="drive", ref={"fid": "F"}))
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as http:
+            with pytest.raises(sd.SignedDownloadError):
+                await http.get(f"/attachments/signed/{token}")
+
 
 class TestGmailFetchers:
     @pytest.mark.asyncio
@@ -1111,3 +1179,42 @@ class TestGmailFetchers:
             await sd._fetch_gmail_message({"fmt": "raw"}, Mock())
         with pytest.raises(sd.SignedDownloadError):
             await sd._fetch_gmail_message({"mid": "m", "fmt": "pdf"}, Mock())
+
+    @pytest.mark.asyncio
+    async def test_attachment_over_the_file_limit_is_a_download_error(
+        self, monkeypatch
+    ):
+        """The size checked at mint time is Google's declaration; the route enforces
+        the limit on the bytes it actually got."""
+        gmail = Mock()
+        gmail.users().messages().attachments().get().execute.return_value = {
+            "data": "aGVsbG8"  # b"hello", 5 bytes
+        }
+        monkeypatch.setattr(sd, "build", lambda *a, **k: gmail)
+        monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", "4")
+        with pytest.raises(sd.SignedDownloadError, match="file size limit"):
+            await sd._fetch_gmail_attachment({"mid": "m", "aid": "a"}, Mock())
+        monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", "5")
+        result = await sd._fetch_gmail_attachment({"mid": "m", "aid": "a"}, Mock())
+        assert result.content == b"hello"
+
+    @pytest.mark.asyncio
+    async def test_message_export_over_the_file_limit_is_a_download_error(
+        self, monkeypatch
+    ):
+        """sizeEstimate is approximate: an understated one must not let an
+        over-limit export through the route."""
+        import base64
+
+        raw = b"From: a@example.com\r\nSubject: hi\r\n\r\nbody\r\n"
+        gmail = Mock()
+        gmail.users().messages().get().execute.return_value = {
+            "raw": base64.urlsafe_b64encode(raw).decode().rstrip("=")
+        }
+        monkeypatch.setattr(sd, "build", lambda *a, **k: gmail)
+        monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", str(len(raw) - 1))
+        with pytest.raises(sd.SignedDownloadError, match="file size limit"):
+            await sd._fetch_gmail_message({"mid": "m1", "fmt": "raw"}, Mock())
+        monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", str(len(raw)))
+        result = await sd._fetch_gmail_message({"mid": "m1", "fmt": "raw"}, Mock())
+        assert result.content == raw
