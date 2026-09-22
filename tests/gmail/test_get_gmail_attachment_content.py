@@ -5,7 +5,7 @@ localhost download URLs or local file paths.
 """
 
 import base64
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 from unittest.mock import Mock
 
 import pytest
@@ -16,6 +16,17 @@ from gmail.gmail_tools import (
     _format_base64_content_block,
     get_gmail_attachment_content,
 )
+from tests.gmail.message_fixtures import (
+    GmailMessage,
+    build_message,
+    document,
+    inline_image,
+    mock_gmail_service,
+    unnamed_part,
+)
+
+# Position of the attachment under test inside ``_message_with_target``.
+_TARGET = 1
 
 
 def _unwrap(tool: Any) -> Callable[..., Any]:
@@ -26,13 +37,49 @@ def _unwrap(tool: Any) -> Callable[..., Any]:
     return fn
 
 
+def _message_with_target(
+    payload: bytes,
+    *,
+    filename: str = "attachment.bin",
+    mime_type: str = "application/octet-stream",
+    declared_size: Optional[int] = None,
+) -> GmailMessage:
+    """A nested message carrying ``payload`` beside realistic sibling parts.
+
+    The target is neither the only attachment nor the first part, so resolving
+    it has to walk the MIME tree instead of falling back to "take the only one".
+    """
+    return build_message(
+        parts=[
+            inline_image(
+                "logo.png",
+                content_id="logo@example.com",
+                content=b"\x89PNG\r\n\x1a\n" + b"\x11" * 900,
+            ),
+            document(
+                filename,
+                content=payload,
+                mime_type=mime_type,
+                declared_size=declared_size,
+            ),
+            unnamed_part(content=b"unnamed trailing part bytes"),
+        ]
+    )
+
+
 def _build_mock_service(
     payload: bytes,
     *,
     filename: str = "attachment.bin",
     mime_type: str = "application/octet-stream",
 ) -> Mock:
-    """Build a Mock google-api service returning ``payload`` as an attachment."""
+    """Build a Mock google-api service returning ``payload`` as an attachment.
+
+    Kept for the tests that model Gmail's partial-response projection -- a part
+    below the ``fields`` mask -- rather than a message's MIME shape;
+    ``message_fixtures`` deliberately ignores ``fields`` and always returns the
+    whole tree.
+    """
     urlsafe_b64 = base64.urlsafe_b64encode(payload).decode("ascii")
 
     mock_service = Mock()
@@ -120,14 +167,13 @@ def test_format_base64_content_block_handles_invalid_input_gracefully():
 async def test_default_call_omits_base64_content(isolated_attachment_env):
     """Without return_base64, the response should not contain the base64 block (backwards compat)."""
     payload = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
-    mock_service = _build_mock_service(
-        payload, filename="test.png", mime_type="image/png"
-    )
+    message = _message_with_target(payload, filename="test.png", mime_type="image/png")
+    mock_service = mock_gmail_service(message)
 
     result = await _unwrap(get_gmail_attachment_content)(
         service=mock_service,
-        message_id="msg-1",
-        attachment_id="att-123",
+        message_id=message.message_id,
+        attachment_id=message.attachment_id(_TARGET),
         user_google_email="user@example.com",
     )
 
@@ -160,28 +206,16 @@ async def test_uncapped_stateless_download_skips_metadata_preflight(monkeypatch)
 async def test_rejects_oversized_before_download(monkeypatch, isolated_attachment_env):
     """Declared attachment size should block attachments().get() entirely."""
     monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", "100")
-    mock_service = _build_mock_service(
-        b"x" * 50, filename="huge.bin", mime_type="application/octet-stream"
-    )
     # Metadata declares an oversized attachment.
-    mock_service.users().messages().get().execute.return_value = {
-        "payload": {
-            "parts": [
-                {
-                    "filename": "huge.bin",
-                    "mimeType": "application/octet-stream",
-                    "body": {"attachmentId": "att-123", "size": 500},
-                }
-            ],
-        },
-    }
+    message = _message_with_target(b"x" * 50, filename="huge.bin", declared_size=500)
+    mock_service = mock_gmail_service(message)
     download_execute = mock_service.users().messages().attachments().get().execute
     download_execute.reset_mock()
 
     result = await _unwrap(get_gmail_attachment_content)(
         service=mock_service,
-        message_id="msg-1",
-        attachment_id="att-123",
+        message_id=message.message_id,
+        attachment_id=message.attachment_id(_TARGET),
         user_google_email="user@example.com",
     )
 
@@ -197,35 +231,68 @@ async def test_cap_uses_index_to_survive_refreshed_attachment_id(
 ):
     """A metadata refresh may rotate IDs; the emitted ordinal remains usable."""
     monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", "100")
-    mock_service = _build_mock_service(b"small payload", filename="report.pdf")
-    mock_service.users().messages().get().execute.return_value = {
-        "payload": {
-            "parts": [
-                {
-                    "filename": "other.txt",
-                    "mimeType": "text/plain",
-                    "body": {"attachmentId": "refreshed-other", "size": 4},
-                },
-                {
-                    "filename": "report.pdf",
-                    "mimeType": "application/pdf",
-                    "body": {"attachmentId": "refreshed-target", "size": 13},
-                },
-            ]
-        }
-    }
+    message = build_message(
+        parts=[
+            inline_image("logo.png", content_id="logo@example.com"),
+            unnamed_part(content=b"unlisted part"),
+            document("other.txt", content=b"note"),
+            document("report.pdf", content=b"small payload"),
+        ]
+    )
+    target = 3
+    # The server's metadata refresh sees generation 2; the caller holds an ID
+    # and an ordinal from generation 1.
+    mock_service = mock_gmail_service(message, generation=2)
 
     result = await _unwrap(get_gmail_attachment_content)(
         service=mock_service,
-        message_id="msg-1",
-        attachment_id="stale-id",
-        attachment_index=1,
+        message_id=message.message_id,
+        attachment_id=message.attachment_id(target, generation=1),
+        attachment_index=message.attachment_ordinal(target),
         user_google_email="user@example.com",
     )
 
     assert "Attachment downloaded successfully!" in result
     download_get = mock_service.users().messages().attachments().get
-    assert download_get.call_args.kwargs["id"] == "refreshed-target"
+    assert download_get.call_args.kwargs["id"] == message.attachment_id(
+        target, generation=2
+    )
+
+
+def _two_similar_pdfs() -> GmailMessage:
+    """Two named PDFs whose sizes sit inside the size fallback's tolerance."""
+    return build_message(
+        parts=[
+            document("report.pdf", content=b"%PDF-1.7 quarterly numbers"),
+            document("cover-letter.pdf", content=b"%PDF-1.7 cover letter text"),
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_cap_recovers_the_name_the_rotated_id_lost(
+    monkeypatch, isolated_attachment_env
+):
+    """The same rotation resolves to the right name once the cap is configured.
+
+    Only the capped path consults ``attachment_index``, so it names the file
+    the previous test could not.
+    """
+    monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", "100000")
+    message = _two_similar_pdfs()
+    service = mock_gmail_service(message, generation=2)
+
+    result = await _unwrap(get_gmail_attachment_content)(
+        service=service,
+        message_id=message.message_id,
+        attachment_id=message.attachment_id(0, generation=1),
+        attachment_index=message.attachment_ordinal(0),
+        user_google_email="user@example.com",
+    )
+
+    assert "Filename: report.pdf" in result
+    download_get = service.users().messages().attachments().get
+    assert download_get.call_args.kwargs["id"] == message.attachment_id(0, generation=2)
 
 
 @pytest.mark.asyncio
@@ -266,14 +333,15 @@ async def test_download_response_reports_sanitized_saved_filename(
 ):
     """Windows-reserved filename characters should be sanitized before saving."""
     payload = b"attached email bytes"
-    mock_service = _build_mock_service(
+    message = _message_with_target(
         payload, filename="RE: Foo?.eml", mime_type="message/rfc822"
     )
+    mock_service = mock_gmail_service(message)
 
     result = await _unwrap(get_gmail_attachment_content)(
         service=mock_service,
-        message_id="msg-1",
-        attachment_id="att-123",
+        message_id=message.message_id,
+        attachment_id=message.attachment_id(_TARGET),
         user_google_email="user@example.com",
     )
 
@@ -308,12 +376,13 @@ async def test_return_base64_true_includes_standard_base64_block(
     mime_type: str,
 ):
     """With return_base64=True, the response must contain decoded standard base64."""
-    mock_service = _build_mock_service(payload, filename=filename, mime_type=mime_type)
+    message = _message_with_target(payload, filename=filename, mime_type=mime_type)
+    mock_service = mock_gmail_service(message)
 
     result = await _unwrap(get_gmail_attachment_content)(
         service=mock_service,
-        message_id="msg-1",
-        attachment_id="att-123",
+        message_id=message.message_id,
+        attachment_id=message.attachment_id(_TARGET),
         user_google_email="user@example.com",
         return_base64=True,
     )
@@ -338,12 +407,13 @@ async def test_return_base64_true_includes_standard_base64_block(
 async def test_return_base64_preserves_file_save_behavior(isolated_attachment_env):
     """return_base64 should be additive: file is still saved and path/URL still returned."""
     payload = b"additive behavior check " + bytes(range(100))
-    mock_service = _build_mock_service(payload, filename="doc.bin")
+    message = _message_with_target(payload, filename="doc.bin")
+    mock_service = mock_gmail_service(message)
 
     result = await _unwrap(get_gmail_attachment_content)(
         service=mock_service,
-        message_id="msg-1",
-        attachment_id="att-123",
+        message_id=message.message_id,
+        attachment_id=message.attachment_id(_TARGET),
         user_google_email="user@example.com",
         return_base64=True,
     )
