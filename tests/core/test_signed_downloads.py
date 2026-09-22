@@ -630,7 +630,7 @@ class TestUsability:
 
         import google.auth._helpers
 
-        monkeypatch.delattr(google.auth._helpers, "REFRESH_THRESHOLD")
+        monkeypatch.delattr(google.auth._helpers, "REFRESH_THRESHOLD", raising=False)
         spec = importlib.util.spec_from_file_location("_sd_copy", sd.__file__)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
