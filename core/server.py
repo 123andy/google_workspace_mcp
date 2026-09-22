@@ -692,8 +692,11 @@ async def serve_short_download(request: Request):
     exactly as a bad long-form token does.
     """
     from core.download_handles import load_download_ref
-    from core.signed_downloads import serve
+    from core.signed_downloads import enabled, serve
 
+    # Off means inert: answer as the long form does, without touching the store.
+    if not enabled():
+        return await serve("")
     token = await load_download_ref(request.path_params["handle"])
     return await serve(token or "")
 

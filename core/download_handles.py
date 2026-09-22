@@ -191,3 +191,27 @@ async def shorten_signed_url(
         logger.info("Short download link unavailable; returning the long link.")
         return offer
     return f"{base}/dl/{handle}", ttl
+
+
+# Settings this fork used before the signed-download feature went upstream.
+# They are read nowhere now; a deployment that still sets them has missed the
+# rename, so signed links are silently off. Say so once at startup.
+_RETIRED_SETTINGS = {
+    "WORKSPACE_MCP_SIGNED_ATTACHMENT_URLS": "WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS",
+    "WORKSPACE_MCP_ATTACHMENT_SIGNING_KEY": None,
+}
+
+
+def warn_retired_settings() -> None:
+    """Log one warning per retired setting that is still set."""
+    for name, replacement in _RETIRED_SETTINGS.items():
+        if os.environ.get(name) is None:
+            continue
+        if replacement:
+            logger.warning("%s is no longer read; set %s instead.", name, replacement)
+        else:
+            logger.warning(
+                "%s is no longer read; the download key is derived from the "
+                "OAuth client secret. Remove it.",
+                name,
+            )

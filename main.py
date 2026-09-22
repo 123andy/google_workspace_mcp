@@ -668,6 +668,9 @@ def main():
 
     validate_streamable_http_auth(args.transport)
     signed_downloads.log_if_ignored(args.transport)
+    from core.download_handles import warn_retired_settings
+
+    warn_retired_settings()  # fork-only: settings renamed when downloads went upstream
     try:
         signed_downloads.validate_startup(args.transport)
     except ValueError as exc:
