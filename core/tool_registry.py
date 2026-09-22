@@ -136,6 +136,31 @@ def get_tool_components(server) -> dict:
     return tools
 
 
+# Fork-only: an opt-in strict block list. Upstream only warns on an unmatched
+# name, because a name is legitimately absent when --tools or --tool-tier leaves
+# its service unloaded. A deployment that loads every service can turn a typo
+# into a refusal to start, so the server never runs with a tool it meant to hide.
+# Names retired since a previous release stay allowed, so one block list works
+# on both the new and the previous image during a rollback.
+_STRICT_BLOCK_LIST_ENV = "WORKSPACE_MCP_STRICT_DISABLED_TOOLS"
+_RETIRED_TOOL_NAMES = frozenset({"send_gmail_draft", "list_drafts"})
+
+
+def _enforce_strict_block_list(unmatched: list) -> None:
+    if os.environ.get(_STRICT_BLOCK_LIST_ENV, "").strip().lower() != "true":
+        return
+    unknown = [name for name in unmatched if name not in _RETIRED_TOOL_NAMES]
+    if unknown:
+        raise SystemExit(
+            f"{_STRICT_BLOCK_LIST_ENV}=true: block list "
+            f"{'entry' if len(unknown) == 1 else 'entries'} "
+            f"{', '.join(repr(n) for n in unknown)} "
+            f"{'matches' if len(unknown) == 1 else 'match'} no registered tool. Fix "
+            "the spelling, or unset the setting if the service is deliberately "
+            "not loaded."
+        )
+
+
 def filter_server_tools(server) -> int:
     """Remove disabled tools from the server after registration.
 
@@ -223,16 +248,19 @@ def filter_server_tools(server) -> int:
     # 5. Explicit per-tool block list (subtractive, so it wins over tier and
     # permission selection). Unmatched entries only warn: a name is legitimately
     # absent when its service was not loaded by --tools or --tool-tier.
+    unmatched = []
     for tool_name in sorted(disabled_tools):
         if tool_name in tool_components:
             logger.info("Block list: disabling tool '%s'", tool_name)
             tools_to_remove.add(tool_name)
         else:
+            unmatched.append(tool_name)
             logger.warning(
                 "Block list entry '%s' matches no registered tool - check spelling, "
                 "or its service may not be loaded by the current tool selection",
                 tool_name,
             )
+    _enforce_strict_block_list(unmatched)
 
     for tool_name in tools_to_remove:
         try:
