@@ -32,6 +32,7 @@ from gdrive.drive_tools import (
     import_to_google_slides,
     update_drive_file,
 )
+from tests.gdrive.test_local_file_access import _run_subprocess
 
 UPLOAD_URL = (
     "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=X"
@@ -102,9 +103,8 @@ async def test_create_opens_post_session_and_creates_nothing_else(folder):
         "mimeType": "application/pdf",
     }
     assert UPLOAD_URL in result
-    assert "single-use" not in result
     assert "only when the upload completes" in result
-    service.files.assert_not_called()  # no files().create — Google creates on PUT
+    service.files.assert_not_called()  # Google creates the file on PUT
 
 
 @pytest.mark.asyncio
@@ -144,40 +144,42 @@ async def test_create_rejects_folders():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "mime_type",
-    [GOOGLE_DOC, "application/vnd.google-apps.shortcut", "", "   "],
-    ids=["native-doc", "shortcut", "empty", "whitespace"],
+    "mime_type, message",
+    [
+        (GOOGLE_DOC, "import_to_google_doc"),
+        ("application/vnd.google-apps.shortcut", "import_to_google_doc"),
+        (None, "requires mime_type"),
+        ("", "requires mime_type"),
+        ("   ", "requires mime_type"),
+    ],
+    ids=["native-doc", "shortcut", "omitted", "empty", "whitespace"],
 )
-async def test_create_rejects_native_or_empty_mime_type(folder, mime_type):
-    """A native type is a conversion target and can never describe the PUT's bytes;
-    the import_to_google_* tools are the route, exactly as on the inline path."""
+async def test_create_rejects_native_or_missing_mime_type(folder, mime_type, message):
+    """The upload's type must be named: the inline default of text/plain would
+    silently mislabel binary bytes, and a native type is a conversion target."""
     service = _service()
-    with pytest.raises(ValueError, match="import_to_google_doc"):
+    kwargs = {} if mime_type is None else {"mime_type": mime_type}
+    with pytest.raises(ValueError, match=message):
         await _unwrap(create_drive_file)(
             service=service,
             user_google_email="user@example.com",
             file_name="Report",
-            mime_type=mime_type,
             return_upload_url=True,
+            **kwargs,
         )
     service._http.request.assert_not_called()
 
 
 @pytest.mark.asyncio
 @patch("gdrive.drive_tools.resolve_drive_item", new_callable=AsyncMock)
-async def test_update_opens_patch_session_then_applies_metadata(resolve_item):
+async def test_update_session_carries_the_metadata(resolve_item):
+    """Metadata rides in the session body, so Drive applies it with the content
+    when the PUT completes; an abandoned upload changes nothing."""
     resolve_item.return_value = (
         "file123",
         {"name": "Doc", "mimeType": "application/vnd.google-apps.document"},
     )
     service = _service()
-    calls = []
-    service._http.request.side_effect = lambda *a, **k: (
-        calls.append("session") or _session_response()
-    )
-    service.files.return_value.update.return_value.execute.side_effect = lambda **k: (
-        calls.append("metadata") or {}
-    )
 
     result = await _unwrap(update_drive_file)(
         service=service,
@@ -188,19 +190,14 @@ async def test_update_opens_patch_session_then_applies_metadata(resolve_item):
         return_upload_url=True,
     )
 
-    # Metadata went through files().update without media and WITHOUT mimeType:
-    # Drive rejects metadata mimeType changes on native files.
-    update_kwargs = service.files.return_value.update.call_args.kwargs
-    assert "media_body" not in update_kwargs
-    assert update_kwargs["body"] == {"name": "Renamed"}
     (url,), kwargs = service._http.request.call_args
     assert url.startswith("https://www.googleapis.com/upload/drive/v3/files/file123?")
     assert kwargs["method"] == "PATCH"
     assert kwargs["headers"]["X-Upload-Content-Type"] == "text/markdown"
+    # No mimeType: Drive rejects a metadata mimeType change on a native file.
+    assert json.loads(kwargs["body"]) == {"name": "Renamed"}
     assert UPLOAD_URL in result
-    # Session first: it has no effect until the PUT, so a failed initiation can
-    # never leave a half-applied rename/move/trash behind.
-    assert calls == ["session", "metadata"]
+    service.files.return_value.update.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -229,7 +226,7 @@ async def test_update_initiation_failure_applies_no_metadata(resolve_item):
     "current_mime, expected_body",
     [
         ("text/markdown", {"mimeType": "text/plain"}),
-        (GOOGLE_DOC, None),
+        (GOOGLE_DOC, {}),
     ],
     ids=["non-native-keeps-mimeType", "native-drops-mimeType"],
 )
@@ -247,15 +244,9 @@ async def test_update_metadata_mime_type_only_dropped_for_native(
         mime_type="text/plain",
         return_upload_url=True,
     )
-    update = service.files.return_value.update
-    if expected_body is None:
-        update.assert_not_called()
-    else:
-        assert update.call_args.kwargs["body"] == expected_body
-    assert (
-        service._http.request.call_args.kwargs["headers"]["X-Upload-Content-Type"]
-        == "text/plain"
-    )
+    kwargs = service._http.request.call_args.kwargs
+    assert json.loads(kwargs["body"]) == expected_body
+    assert kwargs["headers"]["X-Upload-Content-Type"] == "text/plain"
 
 
 @pytest.mark.asyncio
@@ -326,7 +317,7 @@ async def test_update_unsupported_mode_reported_before_flag_combination():
 
 @pytest.mark.asyncio
 @patch("gdrive.drive_tools.resolve_drive_item", new_callable=AsyncMock)
-async def test_update_without_metadata_skips_the_update_call(resolve_item):
+async def test_update_without_metadata_sends_an_empty_session_body(resolve_item):
     resolve_item.return_value = (
         "f1",
         {"name": "notes.md", "mimeType": "text/markdown"},
@@ -340,8 +331,36 @@ async def test_update_without_metadata_skips_the_update_call(resolve_item):
         return_upload_url=True,
     )
 
+    kwargs = service._http.request.call_args.kwargs
+    assert kwargs["method"] == "PATCH"
+    assert json.loads(kwargs["body"]) == {}
     service.files.return_value.update.assert_not_called()
-    assert service._http.request.call_args.kwargs["method"] == "PATCH"
+
+
+@pytest.mark.asyncio
+@patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+@patch("gdrive.drive_tools.resolve_drive_item", new_callable=AsyncMock)
+async def test_update_parent_moves_ride_on_the_session_url(
+    resolve_item, resolve_folder
+):
+    resolve_item.return_value = ("f1", {"name": "a.pdf", "mimeType": "application/pdf"})
+    resolve_folder.side_effect = lambda service, folder: f"resolved-{folder}"
+    service = _service()
+
+    await _unwrap(update_drive_file)(
+        service=service,
+        user_google_email="user@example.com",
+        file_id="f1",
+        add_parents="new",
+        remove_parents="old",
+        return_upload_url=True,
+    )
+
+    (url,), kwargs = service._http.request.call_args
+    assert "addParents=resolved-new" in url
+    assert "removeParents=resolved-old" in url
+    assert json.loads(kwargs["body"]) == {}
+    service.files.return_value.update.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -719,8 +738,6 @@ asyncio.run(main())
 
     @classmethod
     def _props(cls, extra_env, call=False):
-        from tests.gdrive.test_local_file_access import _run_subprocess
-
         code = f"CALL = {call!r}\n" + cls.CODE
         out = _run_subprocess(code, extra_env)
         props = json.loads(out.split("PROPS:", 1)[1].splitlines()[0])

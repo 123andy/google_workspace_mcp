@@ -212,15 +212,11 @@ def hide_local_file_args(*names: str):
 
 
 def hide_remote_only_args(*names: str):
-    """Tool decorator: drop remote-only parameters when local files work.
+    """Tool decorator: drop remote-only parameters when local files are on.
 
-    The inverse of ``hide_local_file_args``: a parameter such as
-    ``return_upload_url`` exists for hosted deployments that cannot read the
-    caller's disk, so it is advertised only when local file access is disabled.
-    Both decorators read ``local_file_access_enabled()``, so under any setting a
-    tool carrying both kinds of parameter hides exactly one of them. Apply
-    directly under ``@server.tool``, stacked with ``hide_local_file_args`` in
-    either order. No-op when local file access is disabled.
+    The inverse of ``hide_local_file_args``, so a tool carrying both kinds of
+    parameter advertises exactly one under any setting. Apply directly under
+    ``@server.tool``, stacked with ``hide_local_file_args`` in either order.
     """
 
     def decorator(func):

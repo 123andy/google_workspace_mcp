@@ -12,7 +12,7 @@ import json
 
 from typing import Optional, List, Dict, Any
 from tempfile import NamedTemporaryFile, SpooledTemporaryFile
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 from urllib.request import url2pathname
 from pathlib import Path
 from weakref import WeakValueDictionary
@@ -1028,16 +1028,20 @@ async def _initiate_resumable_upload_session(
     upload_mime_type: str,
     file_metadata: Optional[Dict[str, Any]] = None,
     file_id: Optional[str] = None,
+    query: Optional[Dict[str, str]] = None,
 ) -> str:
     """Open a Drive resumable upload session and return its pre-authorized URL.
 
     ``file_id`` absent: POST creates a new file; present: PATCH replaces that
-    file's content. The caller PUTs the bytes to the returned URL with no
-    Authorization header, so the payload never passes through this server;
-    only this initiation call uses the user's authorized transport.
+    file's content. ``file_metadata`` and ``query`` (e.g. ``addParents``) take
+    effect only when the upload completes. The caller PUTs the bytes to the
+    returned URL with no Authorization header, so the payload never passes
+    through this server; only this initiation call uses the user's authorized
+    transport.
     """
     path = f"/{file_id}" if file_id else ""
-    url = f"{_RESUMABLE_UPLOAD_BASE}{path}?uploadType=resumable&supportsAllDrives=true"
+    params = {"uploadType": "resumable", "supportsAllDrives": "true", **(query or {})}
+    url = f"{_RESUMABLE_UPLOAD_BASE}{path}?{urlencode(params)}"
     # service._http is the discovery Resource's private handle on the user's
     # AuthorizedHttp; the client library has no public call for a raw resumable
     # initiation, so this depends on that attribute name.
@@ -1053,8 +1057,7 @@ async def _initiate_resumable_upload_session(
     )
     status = int(response.status)
     if status not in (200, 201):
-        # An HttpError keeps Google's reason and gets handle_http_errors' formatting,
-        # log scrubbing and 401/403 re-auth guidance, like any other Drive call.
+        # HttpError so handle_http_errors reports it like any other Drive failure.
         raise HttpError(response, content, uri=url)
     upload_url = response.get("location")
     if not upload_url:
@@ -1074,6 +1077,20 @@ def _reject_sources_with_upload_url(verb: str, **sources: Any) -> None:
         )
 
 
+def _upload_url_not_offered_error(routes: tuple[str, ...]) -> UserInputError:
+    """Refuse ``return_upload_url`` while local file access is enabled.
+
+    FastMCP already rejects the hidden parameter, so this reaches only direct
+    callers. ``routes`` are the source parameters the calling tool has.
+    """
+    named = ", ".join(f"'{name}'" for name in routes[:-1]) + f" or '{routes[-1]}'"
+    return UserInputError(
+        "Upload URLs are offered only when local file access is disabled on this "
+        "server (WORKSPACE_MCP_DISABLE_LOCAL_FILES=true); pass the file via "
+        f"{named}."
+    )
+
+
 def _resumable_upload_result(summary: str, upload_url: str, mime_type: str) -> str:
     return (
         f"{summary}\n\n"
@@ -1082,7 +1099,7 @@ def _resumable_upload_result(summary: str, upload_url: str, mime_type: str) -> s
         f"  curl -X PUT -H 'Content-Type: {mime_type}' --data-binary @<file> '{upload_url}'\n\n"
         "The session takes one upload; an interrupted PUT can be resumed with "
         "Content-Range until Google expires the session (about a week). The file "
-        "is created, or its content replaced, only when the upload completes, and "
+        "is created or updated only when the upload completes, and "
         "the final PUT's response body is the file's metadata (including its id)."
     )
 
@@ -1105,7 +1122,7 @@ async def create_drive_file(
     file_name: str,
     content: Optional[str] = None,  # Now explicitly Optional
     folder_id: str = "root",
-    mime_type: str = "text/plain",
+    mime_type: Optional[str] = None,
     fileUrl: Optional[str] = None,  # Now explicitly Optional
     base64_content: Optional[str] = None,
     content_mime_type: Optional[str] = None,
@@ -1123,7 +1140,7 @@ async def create_drive_file(
         file_name (str): The name for the new file.
         content (Optional[str]): If provided, the content to write to the file.
         folder_id (str): The ID of the parent folder. Defaults to 'root'. For shared drives, this must be a folder ID within the shared drive.
-        mime_type (str): The MIME type of the file. Defaults to 'text/plain'.
+        mime_type (Optional[str]): The MIME type of the file. Defaults to 'text/plain'; required with return_upload_url.
         fileUrl (Optional[str]): If provided, fetches the file content from this URL. Supports file://, http://, and https:// protocols.
         base64_content (Optional[str]): Standard base64-encoded file bytes.
         content_mime_type (Optional[str]): MIME type for base64_content uploads.
@@ -1141,7 +1158,8 @@ async def create_drive_file(
     )
     logger.debug(f"[create_drive_file] File Name: {file_name}")
 
-    mime_type = mime_type.strip().lower()
+    if mime_type is not None:
+        mime_type = mime_type.strip().lower()
     if content_mime_type is not None:
         content_mime_type = content_mime_type.strip().lower()
 
@@ -1158,13 +1176,17 @@ async def create_drive_file(
             content_mime_type=content_mime_type,
             base64_sha256=base64_sha256,
         )
+        if not mime_type:
+            raise ValueError(
+                "return_upload_url requires mime_type: the MIME type of the bytes "
+                "to be uploaded."
+            )
         if mime_type == FOLDER_MIME_TYPE:
             raise ValueError("return_upload_url is not applicable to folders.")
-        if not mime_type or mime_type.startswith(GOOGLE_APPS_MIME_PREFIX):
+        if mime_type.startswith(GOOGLE_APPS_MIME_PREFIX):
             raise ValueError(
-                "return_upload_url needs mime_type to be the MIME type of the bytes "
-                "to be uploaded; Google-native files cannot be created from uploaded "
-                "bytes with create_drive_file. Use import_to_google_doc, "
+                "Google-native files cannot be created from uploaded bytes with "
+                "create_drive_file. Use import_to_google_doc, "
                 "import_to_google_sheets, or import_to_google_slides so Drive receives "
                 "separate source and target MIME types."
             )
@@ -1185,6 +1207,7 @@ async def create_drive_file(
             mime_type,
         )
 
+    mime_type = mime_type or "text/plain"
     has_existing_content_source = content is not None or bool(fileUrl)
     if (
         not has_existing_content_source
@@ -1455,23 +1478,6 @@ async def create_drive_file(
     confirmation_message = f"Successfully created file '{created_file.get('name', file_name)}' (ID: {created_file.get('id', 'N/A')}) in folder '{folder_id}' for {user_google_email}. Link: {link}"
     logger.info(f"Successfully created file. Link: {link}")
     return confirmation_message
-
-
-def _upload_url_not_offered_error(routes: tuple[str, ...]) -> UserInputError:
-    """Build the error for ``return_upload_url`` sent while local file access is enabled.
-
-    Over MCP the parameter is hidden from the signature then
-    (``hide_remote_only_args``) and FastMCP rejects it before the tool runs, so
-    this only reaches direct callers, or a setting flipped after import.
-    ``routes`` are the local-disk and inline parameters the calling tool really
-    has.
-    """
-    named = ", ".join(f"'{name}'" for name in routes[:-1]) + f" or '{routes[-1]}'"
-    return UserInputError(
-        "Upload URLs are offered only when local file access is disabled on this "
-        "server (WORKSPACE_MCP_DISABLE_LOCAL_FILES=true); pass the file via "
-        f"{named}."
-    )
 
 
 async def _import_with_conversion(
@@ -2254,7 +2260,7 @@ async def update_drive_file(
             find_and_replace_doc, which edit in place instead of rewriting the file.
         return_upload_url (bool): Return a Google resumable-upload session URL to
             PUT the replacement bytes to directly (no Authorization header); any
-            metadata changes are applied once the session is open. Only with
+            metadata changes take effect with the upload. Only with
             mode='replace'; not combinable with another content source. Here
             mime_type names the MIME type of the bytes to be uploaded; on a native
             Google file it is required, names only that, and leaves the file's type
@@ -2421,21 +2427,13 @@ async def update_drive_file(
 
     if return_upload_url:
         current_mime = current_file.get("mimeType") or ""
-        # Same rule as the inline replace path: a native target must be an
-        # editable Google type, and its import allowlist bounds the upload's type.
         format_map = _native_replace_format_map(current_mime)
         if format_map is not None:
-            # On a native file mime_type describes the bytes to be uploaded, not a
-            # metadata change: Drive rejects metadata mimeType changes there, and
-            # the file's own type is the conversion target. Non-native files keep
-            # it in the metadata body, as the inline path sends it.
+            # mime_type names the uploaded bytes here; Drive rejects a metadata
+            # mimeType change on a native file.
             update_body.pop("mimeType", None)
-            if not update_body:
-                query_params.pop("body", None)
         upload_mime = mime_type or current_mime or "application/octet-stream"
         if upload_mime.startswith(GOOGLE_APPS_MIME_PREFIX):
-            # A native type is the conversion TARGET; it can never describe the
-            # uploaded bytes, and Google would reject or mis-convert the PUT.
             raise ValueError(
                 f"This file is a native Google type ({upload_mime}); pass mime_type "
                 "with the MIME type of the bytes you will upload (e.g. 'text/markdown') "
@@ -2446,15 +2444,17 @@ async def update_drive_file(
                 f"Unsupported mime_type for a {current_mime} upload: '{upload_mime}'. "
                 f"Supported: {', '.join(dict.fromkeys(format_map.values()))}."
             )
-        # Open the session first: it has no effect until the PUT, so a failed
-        # initiation leaves the file untouched instead of half-updated.
         upload_url = await _initiate_resumable_upload_session(
-            service, upload_mime_type=upload_mime, file_id=file_id
+            service,
+            upload_mime_type=upload_mime,
+            file_metadata=update_body,
+            file_id=file_id,
+            query={
+                k: query_params[k]
+                for k in ("addParents", "removeParents")
+                if k in query_params
+            },
         )
-        if any(k in query_params for k in ("body", "addParents", "removeParents")):
-            await asyncio.to_thread(
-                service.files().update(**query_params).execute, num_retries=0
-            )
         logger.info(f"[update_drive_file] Returned resumable upload URL for {file_id}.")
         return _resumable_upload_result(
             "Resumable upload session created to replace the content of "
