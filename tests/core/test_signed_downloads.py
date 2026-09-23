@@ -1339,7 +1339,10 @@ class TestDriveFetcher:
         thread = threading.Thread(target=server.run, daemon=True)
         thread.start()
         try:
+            deadline = time.monotonic() + 10
             while not server.started:
+                if not thread.is_alive() or time.monotonic() > deadline:
+                    pytest.fail("uvicorn test server did not start")
                 time.sleep(0.02)
             token = _token(_mint(source="drive", ref={"fid": "F"}))
             with pytest.raises(httpx.RemoteProtocolError):
