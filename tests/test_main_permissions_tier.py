@@ -353,7 +353,9 @@ def signed_startup(monkeypatch):
         oauth_config,
         "get_oauth_config",
         lambda: SimpleNamespace(
-            client_secret=None, is_service_account_enabled=lambda: False
+            client_secret=None,
+            is_service_account_enabled=lambda: False,
+            is_external_oauth21_provider=lambda: False,
         ),
     )
     monkeypatch.setenv("PORT", "0")

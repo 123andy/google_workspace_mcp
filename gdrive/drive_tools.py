@@ -521,7 +521,7 @@ async def get_drive_file_download_url(
     resolved_file_id, file_metadata = await resolve_drive_item(
         service,
         file_id,
-        extra_fields="name, webViewLink, mimeType",
+        extra_fields="name, webViewLink, mimeType, size",
     )
     file_id = resolved_file_id
     mime_type = file_metadata.get("mimeType", "")
@@ -586,15 +586,22 @@ async def get_drive_file_download_url(
     # Folders and native types with no export mapping (Forms, Sites, Apps Script,
     # …) have no bytes to stream: they take the normal path, which reports the
     # failure now rather than as an error when the link is fetched.
+    # A stored file's recorded size becomes the link's Content-Length.
+    recorded_size = str(file_metadata.get("size") or "")
     downloadable = mime_type != "application/vnd.google-apps.folder" and (
-        export_mime_type or not mime_type.startswith("application/vnd.google-apps.")
+        export_mime_type
+        or (
+            not mime_type.startswith("application/vnd.google-apps.")
+            and recorded_size.isdigit()
+        )
     )
     offer = signed_downloads.Offer()
     if downloadable:
-        ref = {
-            "fid": file_id,
-            **({"emt": export_mime_type} if export_mime_type else {}),
-        }
+        ref = (
+            {"fid": file_id, "emt": export_mime_type}
+            if export_mime_type
+            else {"fid": file_id, "sz": int(recorded_size)}
+        )
         offer = await signed_downloads.offer_url(
             user_google_email,
             source="drive",

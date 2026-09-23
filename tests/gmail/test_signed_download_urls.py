@@ -499,3 +499,129 @@ async def test_size_cap_nameless_match_keeps_its_type(enabled, monkeypatch):
     assert kwargs["ref"]["aid"] == "att-NAMELESS"
     # One metadata fetch (the cap pass), not a second identical one.
     assert service.users().messages().get.call_count == 2  # Mock() setup call + 1
+
+
+@pytest.mark.asyncio
+async def test_size_cap_pass_uses_the_same_rule_as_the_signed_path(
+    enabled, monkeypatch
+):
+    """With the cap on and a rotated ID for the unnamed part, the pre-pass no
+    longer settles on the only *named* attachment: both paths refuse to guess,
+    so no link is minted for someone else's bytes."""
+    monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", "10485760")
+    with patch.object(sd, "offer_url", new_callable=AsyncMock) as offer:
+        result = await _unwrap(get_gmail_attachment_content)(
+            service=_inline_image_and_pdf_service(),
+            message_id="msg-1",
+            attachment_id="att-ROTATED",
+            user_google_email=USER,
+        )
+    offer.assert_not_called()
+    assert "Could not verify the attachment size" in result
+
+
+@pytest.mark.asyncio
+async def test_size_cap_still_rejects_an_out_of_range_index(enabled, monkeypatch):
+    monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", "10485760")
+    result = await _unwrap(get_gmail_attachment_content)(
+        service=_inline_image_and_pdf_service(),
+        message_id="msg-1",
+        attachment_id="att-ROTATED",
+        user_google_email=USER,
+        attachment_index=5,
+    )
+    assert "Invalid attachment_index 5" in result
+
+
+def _deep_message_service():
+    """A named attachment nested below the metadata mask's depth, ahead of the
+    one the caller means in depth-first order."""
+    node = {"mimeType": "multipart/mixed", "parts": []}
+    deepest = node
+    for _ in range(7):
+        child = {"mimeType": "multipart/mixed", "parts": []}
+        deepest["parts"].append(child)
+        deepest = child
+    deepest["parts"].append(
+        {
+            "filename": "deep.pdf",
+            "mimeType": "application/pdf",
+            "body": {"attachmentId": "deep", "size": 10},
+        }
+    )
+    node["parts"].append(
+        {
+            "filename": "report.xlsx",
+            "mimeType": "application/vnd.ms-excel",
+            "body": {"attachmentId": "new-report", "size": 20},
+        }
+    )
+
+    def masked(tree, depth=0):
+        """What the depth-6 fields mask returns: no parts below the limit."""
+        copy = {k: v for k, v in tree.items() if k != "parts"}
+        if "parts" in tree and depth < 6:
+            copy["parts"] = [masked(p, depth + 1) for p in tree["parts"]]
+        return copy
+
+    service = Mock()
+    service.users().messages().get().execute.return_value = {"payload": masked(node)}
+    service.users().messages().attachments().get().execute.return_value = {
+        "size": 20,
+        "data": base64.urlsafe_b64encode(b"x" * 20).decode(),
+    }
+    return service
+
+
+@pytest.mark.asyncio
+async def test_an_index_is_not_trusted_when_the_mask_may_hide_parts(
+    enabled, monkeypatch
+):
+    """The listing counted the deep attachment; the masked metadata cannot see
+    it, so index 1 would land on a different file. No link is minted."""
+    monkeypatch.setattr("gmail.gmail_tools.is_stateless_mode", lambda: True)
+    with patch.object(sd, "offer_url", new_callable=AsyncMock) as offer:
+        await _unwrap(get_gmail_attachment_content)(
+            service=_deep_message_service(),
+            message_id="msg-1",
+            attachment_id="old-report",
+            user_google_email=USER,
+            attachment_index=1,
+        )
+    offer.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stored_copies_keep_upstreams_naming(monkeypatch):
+    """Signed links off: the downloaded bytes are named by upstream's rules (the
+    only named attachment), unaffected by the stricter link rules."""
+    monkeypatch.delenv("WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS", raising=False)
+    monkeypatch.delenv("WORKSPACE_MCP_MAX_FILE_BYTES", raising=False)
+    saved = {}
+
+    class Storage:
+        def save_attachment(self, base64_data, filename=None, mime_type=None):
+            saved.update(filename=filename, mime_type=mime_type)
+            return type("R", (), {"path": "/tmp/x", "file_id": "f1"})()
+
+    monkeypatch.setattr(
+        "core.attachment_storage.get_attachment_storage", lambda: Storage()
+    )
+    monkeypatch.setattr(
+        "core.attachment_storage.get_attachment_url", lambda fid: f"/a/{fid}"
+    )
+    monkeypatch.setattr("core.config.get_transport_mode", lambda: "streamable-http")
+    # The tool imports this at call time, so patch it where it is looked up.
+    monkeypatch.setattr("auth.oauth_config.is_stateless_mode", lambda: False)
+    service = _inline_image_and_pdf_service()
+    service.users().messages().attachments().get().execute.return_value = {
+        "size": 5,
+        "data": base64.urlsafe_b64encode(b"bytes").decode(),
+    }
+    result = await _unwrap(get_gmail_attachment_content)(
+        service=service,
+        message_id="msg-1",
+        attachment_id="att-ROTATED",
+        user_google_email=USER,
+    )
+    assert saved.get("filename") == "contract.pdf", result

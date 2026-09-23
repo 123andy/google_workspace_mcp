@@ -969,17 +969,23 @@ def _render_attached_messages(
 class _ResolvedAttachment:
     """What a metadata pass could establish about the part being downloaded.
 
-    ``attachment_id`` is the current ID of the part that was selected and
-    ``matched_by`` how it was selected: ``"id"`` (the caller's ID is in the
-    message), ``"index"`` (the caller's ``attachment_index``), ``"size"`` or
-    ``"only"`` (the message has exactly one attachment part). All None when no
-    part was identified.
+    ``attachment_id`` is the current ID of the part that was selected, ``size``
+    its declared size, and ``matched_by`` how it was selected: ``"id"`` (the
+    caller's ID is in the message), ``"index"`` (the caller's
+    ``attachment_index``), ``"size"`` or ``"only"``. All None when no part was
+    identified. ``named_count`` is how many named attachments the metadata
+    listed, when it could be read.
     """
 
     filename: Optional[str] = None
     mime_type: Optional[str] = None
     attachment_id: Optional[str] = None
     matched_by: Optional[str] = None
+    size: Optional[int] = None
+    named_count: Optional[int] = None
+
+
+_ATTACHMENT_MASK_DEPTH = 6
 
 
 def _attachment_parts(payload: dict) -> List[dict]:
@@ -995,22 +1001,58 @@ def _attachment_parts(payload: dict) -> List[dict]:
     return parts
 
 
+def _mask_may_hide_parts(payload: dict) -> bool:
+    """True when a multipart node sits at the fields mask's depth limit, so parts
+    below it — and their places in the attachment order — were not returned."""
+    pending = [(payload, 0)]
+    while pending:
+        part, depth = pending.pop()
+        children = part.get("parts") or []
+        if depth >= _ATTACHMENT_MASK_DEPTH and (
+            (part.get("mimeType") or "").lower().startswith("multipart/")
+        ):
+            return True
+        pending.extend((child, depth + 1) for child in children)
+    return False
+
+
+def _resolved(part: dict, matched_by: str, named_count: int) -> _ResolvedAttachment:
+    """``part`` is a raw MIME part or an ``_extract_attachments`` entry, which
+    carries the ID and size at the top level instead of under ``body``."""
+    body = part.get("body") or {}
+    return _ResolvedAttachment(
+        part.get("filename") or None,
+        part.get("mimeType"),
+        part.get("attachmentId") or body.get("attachmentId"),
+        matched_by,
+        part.get("size", body.get("size")),
+        named_count,
+    )
+
+
 async def _resolve_attachment(
     service,
     message_id: str,
     attachment_id: str,
     size_bytes: Optional[int] = None,
     attachment_index: Optional[int] = None,
+    *,
+    naming_only: bool = False,
 ) -> _ResolvedAttachment:
-    """Best-effort name, MIME type and *current* ID for an attachment.
+    """Best-effort name, MIME type, size and *current* ID for an attachment.
 
     The caller's ID wins whenever it is in the message, named part or not. Only
     when it is absent (Gmail rotates IDs between fetches) does a fallback select
     a part: the named attachment at ``attachment_index`` (the ordinal the listing
     emitted next to the ID, stable across rotation), then the one attachment part
     of ``size_bytes`` when that size is known, then the message's only attachment
-    part. A fallback never picks a named part while an unnamed one could be the
-    one meant, so it cannot swap one part's bytes or name for another's.
+    part. No fallback is tried when the metadata mask may have cut off parts, since
+    those would shift the order and could be the part meant. A fallback never picks a named part while an unnamed one
+    could be the one meant, so it cannot swap one part's bytes for another's.
+
+    ``naming_only`` is for bytes already downloaded by the caller's ID: it keeps
+    upstream's looser rules (size and only-attachment among named parts), since
+    it only labels a file and cannot change which bytes were fetched.
     """
     try:
         message_full = await asyncio.to_thread(
@@ -1030,14 +1072,24 @@ async def _resolve_attachment(
         )
         return _ResolvedAttachment()
     payload = message_full.get("payload", {})
+    named = _extract_attachments(payload)
 
     exact = _find_attachment_metadata(payload, attachment_id)
     if exact is not None:
         return _ResolvedAttachment(
-            exact.get("filename"), exact.get("mimeType"), attachment_id, "id"
+            exact.get("filename"),
+            exact.get("mimeType"),
+            attachment_id,
+            "id",
+            exact.get("size"),
+            len(named),
         )
 
-    named = _extract_attachments(payload)
+    if not naming_only and _mask_may_hide_parts(payload):
+        # Parts below the mask are invisible here, so neither an ordinal nor
+        # "the only attachment" can be trusted to mean the part the caller meant.
+        return _ResolvedAttachment(named_count=None)
+
     if attachment_index is not None and 0 <= attachment_index < len(named):
         matched = named[attachment_index]
         logger.info(
@@ -1045,42 +1097,30 @@ async def _resolve_attachment(
             f"selected by attachment_index={attachment_index} as "
             f"'{matched.get('filename')}'"
         )
-        return _ResolvedAttachment(
-            matched.get("filename"),
-            matched.get("mimeType"),
-            matched.get("attachmentId"),
-            "index",
-        )
+        return _resolved(matched, "index", len(named))
 
-    parts = _attachment_parts(payload)
+    # naming_only keeps upstream's rules over named parts; otherwise every part
+    # with an attachment ID counts, named or not.
+    parts = named if naming_only else _attachment_parts(payload)
+
+    def size_of(part):
+        return part.get("size", (part.get("body") or {}).get("size"))
+
     if size_bytes is not None:
         same_size = [
             part
             for part in parts
-            if (part.get("body") or {}).get("size")
-            and abs(part["body"]["size"] - size_bytes) < 100
+            if size_of(part) and abs(size_of(part) - size_bytes) < 100
         ]
         if len(same_size) == 1 and same_size[0].get("filename"):
-            part = same_size[0]
             logger.warning(
                 f"Attachment {attachment_id} matched by size fallback as "
-                f"'{part.get('filename')}'"
+                f"'{same_size[0].get('filename')}'"
             )
-            return _ResolvedAttachment(
-                part.get("filename"),
-                part.get("mimeType"),
-                part["body"]["attachmentId"],
-                "size",
-            )
+            return _resolved(same_size[0], "size", len(named))
     if len(parts) == 1:
-        part = parts[0]
-        return _ResolvedAttachment(
-            part.get("filename") or None,
-            part.get("mimeType"),
-            part["body"]["attachmentId"],
-            "only",
-        )
-    return _ResolvedAttachment()
+        return _resolved(parts[0], "only", len(named))
+    return _ResolvedAttachment(named_count=len(named))
 
 
 def _find_attachment_metadata(payload: dict, attachment_id: str) -> Optional[dict]:
@@ -2373,7 +2413,7 @@ def _attachment_metadata_fields(depth: int) -> str:
     return f"payload({node})"
 
 
-_ATTACHMENT_METADATA_FIELDS = _attachment_metadata_fields(6)
+_ATTACHMENT_METADATA_FIELDS = _attachment_metadata_fields(_ATTACHMENT_MASK_DEPTH)
 
 
 @server.tool(
@@ -2446,49 +2486,27 @@ async def get_gmail_attachment_content(
     attachment_id_is_current = False
     max_file_bytes = get_max_file_bytes()
     if max_file_bytes is not None:
-        try:
-            message_full = await asyncio.to_thread(
-                service.users()
-                .messages()
-                .get(
-                    userId="me",
-                    id=message_id,
-                    format="full",
-                    fields=_ATTACHMENT_METADATA_FIELDS,
-                )
-                .execute
+        # The same selection rules the signed path uses, so both agree on which
+        # part the caller means.
+        resolved = await _resolve_attachment(
+            service, message_id, attachment_id, attachment_index=attachment_index
+        )
+        if (
+            resolved.matched_by is None
+            and attachment_index is not None
+            and resolved.named_count is not None
+            and not 0 <= attachment_index < resolved.named_count
+        ):
+            return (
+                f"Error: Invalid attachment_index {attachment_index}. Message "
+                f"has {resolved.named_count} downloadable attachment(s)."
             )
-            payload = message_full.get("payload", {})
-            attachments = _extract_attachments(payload)
-            matched = _find_attachment_metadata(payload, attachment_id)
-
-            if matched is None and attachment_index is not None:
-                if attachment_index < 0 or attachment_index >= len(attachments):
-                    return (
-                        f"Error: Invalid attachment_index {attachment_index}. Message "
-                        f"has {len(attachments)} downloadable attachment(s)."
-                    )
-                # Gmail can refresh attachment IDs between messages.get calls.
-                # The stable ordinal emitted with the original ID selects the
-                # corresponding current attachment safely.
-                matched = attachments[attachment_index]
-            elif matched is None and len(attachments) == 1:
-                # A single attachment is unambiguous even if Gmail refreshed
-                # its ID since the caller fetched the message.
-                matched = attachments[0]
-
-            if matched is not None:
-                filename = matched.get("filename")
-                mime_type = matched.get("mimeType")
-                declared_size = matched.get("size")
-                # _find_attachment_metadata matched on the ID itself, so its
-                # result carries none: there the caller's ID is the current one.
-                download_attachment_id = matched.get("attachmentId", attachment_id)
-                attachment_id_is_current = True
-        except Exception:
-            logger.debug(
-                f"Could not fetch attachment metadata for {attachment_id} before download"
-            )
+        if resolved.matched_by:
+            filename = resolved.filename
+            mime_type = resolved.mime_type
+            declared_size = resolved.size
+            download_attachment_id = resolved.attachment_id
+            attachment_id_is_current = True
 
         # attachments().get() returns the complete base64 payload in one API
         # response, so there is no opportunity to stop mid-body. If the bounded
@@ -2645,6 +2663,7 @@ async def get_gmail_attachment_content(
                 attachment_id,
                 size_bytes,
                 attachment_index=attachment_index,
+                naming_only=True,
             )
             if resolved.filename or resolved.mime_type:
                 filename, mime_type = resolved.filename, resolved.mime_type

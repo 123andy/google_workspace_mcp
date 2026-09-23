@@ -851,6 +851,12 @@ async def serve_signed_attachment(request: Request):
     """Stream a Gmail/Drive resource named by a signed capability URL; nothing is stored."""
     from core.signed_downloads import serve
 
+    if request.method != "GET":
+        # Starlette answers HEAD on every GET route; here that would fetch the
+        # whole file from Google only to discard the body.
+        return JSONResponse(
+            {"error": "Method not allowed"}, status_code=405, headers={"Allow": "GET"}
+        )
     return await serve(request.path_params["token"])
 
 

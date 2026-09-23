@@ -28,6 +28,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import time
 from collections import OrderedDict
@@ -69,8 +70,11 @@ _MIN_TTL_SECONDS = 60
 # Bound on names carried in a token, so a long sender-controlled filename cannot
 # push the token past _MAX_TOKEN_CHARS.
 _MAX_FILENAME_CHARS = 200
-# Concurrent downloads the public route will run; beyond this it answers 503.
+# Concurrent downloads the public route will run, in total and per link owner;
+# beyond either it answers 503. The per-owner bound keeps one leaked link (or one
+# slow client) from holding every slot.
 _MAX_CONCURRENT_DOWNLOADS = 4
+_MAX_DOWNLOADS_PER_OWNER = 2
 # Owners whose stored access token the route refreshed in memory, so repeat
 # fetches of a link reuse the refreshed copy instead of refreshing again.
 _REFRESHED_CACHE_SIZE = 256
@@ -131,11 +135,25 @@ def validate_startup(
         return
     from auth.oauth_config import is_service_account_enabled
 
+    from auth.oauth_config import is_external_oauth21_provider
+
     problems = []
     if is_service_account_enabled():
         problems.append(
             f"{FLAG_ENV}=true needs per-user OAuth credentials and cannot work in "
             "service-account (domain-wide delegation) mode; unset one of them."
+        )
+    if is_external_oauth21_provider():
+        problems.append(
+            f"{FLAG_ENV}=true needs Google credentials this server stores, which "
+            "EXTERNAL_OAUTH21_PROVIDER mode never does; unset one of them."
+        )
+    session_seconds = _session_link_seconds()
+    if session_seconds is not None and session_seconds < _MIN_TTL_SECONDS:
+        problems.append(
+            f"{FLAG_ENV}=true issues links of at least {_MIN_TTL_SECONDS}s, but "
+            f"WORKSPACE_MCP_OAUTH_PROXY_ACCESS_TOKEN_EXPIRY_SECONDS={session_seconds} "
+            "caps them below that, so none could ever be issued."
         )
     external = os.getenv("WORKSPACE_EXTERNAL_URL")
     if not external or not external.strip():
@@ -166,10 +184,37 @@ def validate_startup(
         )
     if problems:
         raise ValueError("\n".join(problems))
+    install_access_log_redaction()
     (notice or logger.info)(
         f"{FLAG_ENV} is on: signed download links will use base URL "
         f"{external_base_url()}; /attachments/signed/* must be publicly reachable there."
     )
+
+
+class _RedactSignedTokens(logging.Filter):
+    """A link's token is a bearer credential for its lifetime; request logs (the
+    server's access log above all) record the path, so replace the token there."""
+
+    _TOKEN = re.compile(r"(/attachments/signed/)[^\s?\"']+")
+
+    def _redact(self, value):
+        return (
+            self._TOKEN.sub(r"\1<redacted>", value) if isinstance(value, str) else value
+        )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = self._redact(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(self._redact(arg) for arg in record.args)
+        return True
+
+
+def install_access_log_redaction() -> None:
+    """Idempotent; run once the feature is known to be on."""
+    for name in ("uvicorn.access", "uvicorn.error"):
+        target = logging.getLogger(name)
+        if not any(isinstance(f, _RedactSignedTokens) for f in target.filters):
+            target.addFilter(_RedactSignedTokens())
 
 
 @functools.lru_cache(maxsize=1)
@@ -235,22 +280,27 @@ def usable_seconds(
     return (expiry - REFRESH_THRESHOLD - ref).total_seconds()
 
 
+def _session_link_seconds() -> Optional[int]:
+    """The MCP access-token lifetime an operator configured, or None. Parsed with
+    the OAuth proxy's own bounds but without its warning, which it already logs
+    once at startup."""
+    from auth.oauth_proxy_config import (
+        MAX_OAUTH_ACCESS_TOKEN_EXPIRY_SECONDS,
+        OAUTH_ACCESS_TOKEN_EXPIRY_ENV,
+    )
+
+    try:
+        seconds = int(os.getenv(OAUTH_ACCESS_TOKEN_EXPIRY_ENV, "").strip())
+    except ValueError:
+        return None
+    return seconds if 1 <= seconds <= MAX_OAUTH_ACCESS_TOKEN_EXPIRY_SECONDS else None
+
+
 def _max_link_seconds() -> int:
     """Longest a link may live: ``URL_TTL_SECONDS``, shortened to the MCP access
     token lifetime when an operator configured a shorter one, so a link cannot
     keep serving long after the session that minted it would have lapsed."""
-    from auth.oauth_proxy_config import (
-        MAX_OAUTH_ACCESS_TOKEN_EXPIRY_SECONDS,
-        OAUTH_ACCESS_TOKEN_EXPIRY_ENV,
-        _parse_expiry_seconds_env,
-    )
-
-    session_seconds = _parse_expiry_seconds_env(
-        OAUTH_ACCESS_TOKEN_EXPIRY_ENV,
-        minimum=1,
-        maximum=MAX_OAUTH_ACCESS_TOKEN_EXPIRY_SECONDS,
-    )
-    return min(URL_TTL_SECONDS, session_seconds or URL_TTL_SECONDS)
+    return min(URL_TTL_SECONDS, _session_link_seconds() or URL_TTL_SECONDS)
 
 
 def clamp_ttl(credentials: Credentials, *, now: Optional[datetime] = None) -> int:
@@ -376,9 +426,13 @@ def _recover_credentials(user_email: str) -> Optional[Credentials]:
 
     try:
         credentials = get_oauth21_session_store().get_credentials(user_email)
-        if credentials is None and not is_stateless_mode():
-            credentials = get_credential_store().get_credential(user_email)
-        return credentials
+        if is_stateless_mode() or (credentials and _refreshable(credentials)):
+            return credentials
+        # A session entry built from a bare access token must not shadow a
+        # refreshable entry in the persistent store: take whichever lasts longer.
+        stored = get_credential_store().get_credential(user_email)
+        candidates = [c for c in (credentials, stored) if c is not None]
+        return max(candidates, key=usable_seconds, default=None)
     except Exception as exc:
         logger.debug("Could not recover credentials for %s: %s", user_email, exc)
         return None
@@ -425,12 +479,12 @@ async def offer_url(
     if not enabled():
         return Offer()
     credentials = await asyncio.to_thread(_recover_credentials, user_email)
+    ttl = clamp_ttl(credentials) if credentials is not None else 0
     if credentials is None:
         reason = NO_CREDENTIALS
-    elif clamp_ttl(credentials) <= 0:
+    elif ttl <= 0:
         reason = SHORT_LIVED_CREDENTIALS
     else:
-        ttl = clamp_ttl(credentials)
         try:
             return Offer(
                 mint_url(
@@ -455,8 +509,8 @@ def url_lines(url: str, ttl: int, what: str) -> list[str]:
     return [
         f"\n📎 Download URL: {url}",
         f"\nThe server fetches the {what} directly from Google when this URL is "
-        f"requested; the link is tied to your account and expires in {format_ttl(ttl)}. "
-        "Fetch it promptly; do not queue it for later.",
+        f"requested. Anyone with the link can download it until it expires in "
+        f"{format_ttl(ttl)}: fetch it promptly, and do not paste it anywhere shared.",
     ]
 
 
@@ -478,6 +532,8 @@ class DownloadResult:
     content: Optional[bytes] = None
     stream: Optional[AsyncIterator[bytes]] = None
     close: Optional[Callable[[], None]] = None
+    # Exact byte count of ``stream``, sent as Content-Length when known.
+    length: Optional[int] = None
 
 
 class SignedDownloadError(Exception):
@@ -515,19 +571,28 @@ def _google_error(exc: Exception, what: str) -> SignedDownloadError:
             return SignedDownloadError(
                 f"{what} failed: {exc}",
                 status=404,
-                public=f"The {what.split()[0]} item no longer exists or is not accessible.",
+                public="The requested item no longer exists or is not accessible.",
             )
     return SignedDownloadError(f"{what} failed: {exc}")
 
 
-def _tool_module(name: str):
-    """A tool module this server already loaded, or None.
+def _tool_module(name: str, source: str):
+    """A tool module this server already loaded; otherwise the source is not
+    served here (404).
 
     Importing a tool module registers its tools on the server as a side effect, so
     the public route must never be the first to import one: a server started
-    without Gmail must not grow Gmail tools because a Gmail token arrived. A source
-    whose tools this server does not load is simply not served here."""
-    return sys.modules.get(name)
+    without Gmail must not grow Gmail tools because a Gmail token arrived. The
+    same rule covers every source, so a server that does not offer a tool does
+    not serve its links either."""
+    module = sys.modules.get(name)
+    if module is None:
+        raise SignedDownloadError(
+            f"{source} tools are not loaded on this server",
+            status=404,
+            public="Not found",
+        )
+    return module
 
 
 def _close_service(service) -> None:
@@ -566,6 +631,7 @@ async def _fetch_gmail_attachment(
     claims: dict, credentials: Credentials
 ) -> DownloadResult:
     """Gmail returns the attachment as one JSON response: buffered, not streamed."""
+    _tool_module("gmail.gmail_tools", "Gmail")
     message_id, attachment_id = claims.get("mid"), claims.get("aid")
     if not (message_id and attachment_id):
         raise SignedDownloadError("Gmail token missing mid/aid")
@@ -594,6 +660,10 @@ async def _fetch_gmail_attachment(
     )
 
 
+# _render_message_export's own "nothing to export" reasons, in caller-safe words.
+_EMPTY_EXPORT = "The message has no content to export in that format."
+
+
 async def _fetch_gmail_message(
     claims: dict, credentials: Credentials
 ) -> DownloadResult:
@@ -602,13 +672,7 @@ async def _fetch_gmail_message(
     The extension follows what was actually rendered — an ``html`` export of a
     message with no HTML part falls back to plain text — so the token's ``fn`` is
     the name without one."""
-    gmail_tools = _tool_module("gmail.gmail_tools")
-    if gmail_tools is None:
-        raise SignedDownloadError(
-            "Gmail tools are not loaded on this server",
-            status=404,
-            public="Not found",
-        )
+    gmail_tools = _tool_module("gmail.gmail_tools", "Gmail")
     message_id, body_format = claims.get("mid"), claims.get("fmt")
     if not message_id or body_format not in ("raw", "html", "text"):
         raise SignedDownloadError("Gmail message token missing mid/fmt")
@@ -622,11 +686,13 @@ async def _fetch_gmail_message(
                 _notes,
             ) = await gmail_tools._render_message_export(gmail, message_id, body_format)
         except ValueError as exc:
-            # _render_message_export's ValueErrors are its user-facing reasons.
+            empty = "no readable body content" in str(exc) or "no raw content" in str(
+                exc
+            )
             raise SignedDownloadError(
                 f"Gmail message export failed: {exc}",
-                status=422,
-                public=f"The message {exc}",
+                status=422 if empty else 502,
+                public=_EMPTY_EXPORT if empty else None,
             ) from exc
         except Exception as exc:
             raise _google_error(exc, "Gmail message export") from exc
@@ -641,16 +707,31 @@ async def _fetch_gmail_message(
 
 
 async def _fetch_drive(claims: dict, credentials: Credentials) -> DownloadResult:
-    """Stream a Drive file in bounded chunks; ``emt`` set means export a native file."""
-    drive_tools = _tool_module("gdrive.drive_tools")
-    if drive_tools is None:
-        raise SignedDownloadError(
-            "Drive tools are not loaded on this server", status=404, public="Not found"
-        )
+    """A Drive file; ``emt`` set means export a native file.
+
+    Exports are buffered: Google caps them at 10 MB, and buffering turns a failure
+    anywhere in the body into an error status. Stored files stream in bounded
+    chunks with a ``Content-Length`` from the file's recorded ``sz``, so a stream
+    that fails partway ends short of it and the client sees an incomplete transfer
+    rather than a complete-looking file (middleware between the route and the
+    server would otherwise close the chunked body cleanly)."""
+    drive_tools = _tool_module("gdrive.drive_tools", "Drive")
     file_id = claims.get("fid")
     if not file_id:
         raise SignedDownloadError("Drive token missing fid")
     export_mime = claims.get("emt")
+    size = claims.get("sz")
+    if not export_mime and not _is_timestamp(size):
+        raise SignedDownloadError("Drive token missing sz")
+    if not export_mime:
+        try:
+            ensure_within_file_size_limit(size, kind="file")
+        except FileTooLargeError as exc:
+            raise SignedDownloadError(
+                "Drive file exceeds the file size limit",
+                status=413,
+                public="The file exceeds this server's file size limit.",
+            ) from exc
     drive = await asyncio.to_thread(build, "drive", "v3", credentials=credentials)
     buffer = io.BytesIO()
     downloader = MediaIoBaseDownload(
@@ -667,6 +748,26 @@ async def _fetch_drive(claims: dict, credentials: Credentials) -> DownloadResult
         buffer.truncate()
         return chunk, done
 
+    media_type = claims.get("mt") or export_mime or "application/octet-stream"
+    filename = claims.get("fn") or "download"
+
+    if export_mime:
+        parts = []
+        try:
+            done = False
+            while not done:
+                chunk, done = await asyncio.to_thread(next_chunk)
+                parts.append(chunk)
+        except Exception as exc:
+            raise _google_error(exc, "Drive export") from exc
+        finally:
+            _close_service(drive)
+        return DownloadResult(
+            filename=filename,
+            media_type=media_type,
+            content=_within_file_limit(b"".join(parts), "export"),
+        )
+
     # Pull the first chunk eagerly so auth / not-found errors become an error
     # status instead of a truncated 200.
     try:
@@ -677,25 +778,40 @@ async def _fetch_drive(claims: dict, credentials: Credentials) -> DownloadResult
 
     async def body() -> AsyncIterator[bytes]:
         pending, finished = chunk, done
-        while True:
-            if pending:
-                yield pending
-            if finished:
-                return
-            try:
-                pending, finished = await asyncio.to_thread(next_chunk)
-            except Exception as exc:
-                logger.error("Drive stream interrupted mid-download: %s", exc)
-                # Headers are out. Raising makes the server abort the chunked body
-                # without its terminating chunk, so the client sees an incomplete
-                # transfer; returning would end it cleanly as a complete file.
-                raise SignedDownloadError(f"Drive stream interrupted: {exc}") from exc
+        in_flight = None
+        try:
+            while True:
+                if pending:
+                    yield pending
+                if finished:
+                    return
+                in_flight = asyncio.ensure_future(asyncio.to_thread(next_chunk))
+                try:
+                    # Shielded: cancelling this await (a disconnect) must not mark
+                    # the chunk done while its worker thread is still running.
+                    pending, finished = await asyncio.shield(in_flight)
+                except Exception as exc:
+                    logger.error("Drive stream interrupted mid-download: %s", exc)
+                    raise SignedDownloadError(
+                        f"Drive stream interrupted: {exc}"
+                    ) from exc
+        finally:
+            # A client that disconnects mid-chunk cancels only the await: the
+            # worker thread keeps using the client until its chunk completes. Wait
+            # for it, so the slot and the client are released only once the
+            # thread is done with them.
+            if in_flight is not None and not in_flight.done():
+                try:
+                    await asyncio.shield(in_flight)
+                except BaseException:
+                    pass
 
     return DownloadResult(
-        filename=claims.get("fn") or "download",
-        media_type=claims.get("mt") or export_mime or "application/octet-stream",
+        filename=filename,
+        media_type=media_type,
         stream=body(),
         close=lambda: _close_service(drive),
+        length=size,
     )
 
 
@@ -721,6 +837,19 @@ def _content_disposition(name: str) -> str:
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(name, safe='')}"
 
 
+def _safe_media_type(value: str) -> str:
+    """Content types come from file metadata a sharer controls; anything that is
+    not a plain printable-ASCII ``type/subtype`` is served as octet-stream."""
+    if (
+        value
+        and value.isascii()
+        and "/" in value
+        and all(0x20 < ord(ch) < 0x7F or ch == " " for ch in value)
+    ):
+        return value
+    return "application/octet-stream"
+
+
 def _error(status: int, message: str, headers: Optional[dict] = None) -> Response:
     return JSONResponse(
         {"error": message},
@@ -730,6 +859,7 @@ def _error(status: int, message: str, headers: Optional[dict] = None) -> Respons
 
 
 _download_slots: Optional[asyncio.Semaphore] = None
+_owner_downloads: "dict[str, int]" = {}
 # Refreshed in-memory credentials, keyed by owner. Never written to any store.
 _refreshed: "OrderedDict[str, Credentials]" = OrderedDict()
 
@@ -776,8 +906,9 @@ async def _usable_credentials(user_email: str) -> Optional[Credentials]:
 async def serve(token: str) -> Response:
     """Verify a signed token, then return the resource with its owner's credentials.
 
-    At most ``_MAX_CONCURRENT_DOWNLOADS`` run at once (503 beyond that); a streamed
-    body keeps its slot and its API client until the last byte is sent."""
+    At most ``_MAX_CONCURRENT_DOWNLOADS`` run at once, and at most
+    ``_MAX_DOWNLOADS_PER_OWNER`` per link owner (503 beyond either). A response
+    keeps its slot, and a stream its API client, until its body has been sent."""
     if not enabled():  # keep the public route inert unless the feature is on
         return _error(404, "Not found")
     claims = verify_token(token)
@@ -785,12 +916,14 @@ async def serve(token: str) -> Response:
     if not (claims and fetcher and claims.get("sub")):
         return _error(403, "Invalid or expired download link")
 
+    owner = claims["sub"]
     slots = _slots()
-    if slots.locked():
+    if slots.locked() or _owner_downloads.get(owner, 0) >= _MAX_DOWNLOADS_PER_OWNER:
         return _error(
             503, "Too many downloads in progress; retry shortly", {"Retry-After": "5"}
         )
     await slots.acquire()
+    _owner_downloads[owner] = _owner_downloads.get(owner, 0) + 1
     released = False
 
     def release() -> None:
@@ -798,12 +931,17 @@ async def serve(token: str) -> Response:
         if not released:
             released = True
             slots.release()
+            remaining = _owner_downloads.get(owner, 1) - 1
+            if remaining > 0:
+                _owner_downloads[owner] = remaining
+            else:
+                _owner_downloads.pop(owner, None)
 
-    streaming = False
+    handed_off = False
     try:
         # Only a validly signed token naming this user reaches the lookup.
         try:
-            credentials = await _usable_credentials(claims["sub"])
+            credentials = await _usable_credentials(owner)
         except Exception:
             return _error(
                 401, "The download owner's credentials could not be refreshed"
@@ -824,10 +962,19 @@ async def serve(token: str) -> Response:
             **_RESPONSE_HEADERS,
             "Content-Disposition": _content_disposition(result.filename),
         }
+        media_type = _safe_media_type(result.media_type)
         if result.stream is None:
-            return Response(
-                content=result.content, media_type=result.media_type, headers=headers
+            response = Response(
+                content=result.content,
+                media_type=media_type,
+                headers=headers,
+                background=BackgroundTask(release),
             )
+            handed_off = True
+            return response
+
+        if result.length is not None:
+            headers["Content-Length"] = str(result.length)
 
         def finish() -> None:
             if released:  # the stream and the background task both call this
@@ -843,16 +990,18 @@ async def serve(token: str) -> Response:
                 async for part in result.stream:
                     yield part
             finally:
+                await result.stream.aclose()
                 finish()
 
-        streaming = True
         # The background task covers a response that ends before its body starts.
-        return StreamingResponse(
+        response = StreamingResponse(
             body(),
-            media_type=result.media_type,
+            media_type=media_type,
             headers=headers,
             background=BackgroundTask(finish),
         )
+        handed_off = True
+        return response
     finally:
-        if not streaming:
+        if not handed_off:
             release()

@@ -26,6 +26,15 @@ from google.oauth2.credentials import Credentials
 import core.signed_downloads as sd
 
 
+async def _serve(token):
+    """``sd.serve`` as the server runs it: a buffered response's background task
+    (which gives its download slot back) runs once the body is sent."""
+    response = await sd.serve(token)
+    if response.background is not None and not hasattr(response, "body_iterator"):
+        await response.background()
+    return response
+
+
 def _run(coro):
     """Run a coroutine from a sync test without clearing the default event loop
     (``asyncio.run`` does, which breaks later tests that ask for it)."""
@@ -209,7 +218,7 @@ class TestEnabledFlag:
         token = _token(_mint())
         monkeypatch.delenv(sd.FLAG_ENV)
         monkeypatch.setattr(sd, "_recover_credentials", Mock())
-        response = await sd.serve(token)
+        response = await _serve(token)
         assert response.status_code == 404
         sd._recover_credentials.assert_not_called()
 
@@ -271,6 +280,7 @@ class TestStartupValidation:
                 {
                     "client_secret": None,
                     "is_service_account_enabled": lambda self: False,
+                    "is_external_oauth21_provider": lambda self: False,
                 },
             )(),
         )
@@ -756,11 +766,29 @@ class TestCredentialRecovery:
     """Session store first, then the persistent store — the same order for the
     tool-side gate and the route, so what gets offered can be served."""
 
-    def test_session_hit_skips_the_persistent_store(self, stores):
-        stores.session = {USER: _credentials(token="ya29.session")}
+    def test_refreshable_session_skips_the_persistent_store(self, stores):
+        stores.session = {
+            USER: _credentials(token="ya29.session", refresh_token="1//s")
+        }
         stores.persistent = {USER: _credentials(token="ya29.store")}
         assert sd._recover_credentials(USER).token == "ya29.session"
         assert stores.persistent_lookups == []
+
+    def test_a_bare_session_token_does_not_shadow_a_refreshable_store_entry(
+        self, stores
+    ):
+        """A session built from an access token alone must not win over stored
+        credentials that can refresh: whichever the route can use longer wins."""
+        stores.session = {USER: _credentials(seconds_left=200, token="ya29.session")}
+        stores.persistent = {
+            USER: _credentials(token="ya29.store", refresh_token="1//r")
+        }
+        assert sd._recover_credentials(USER).token == "ya29.store"
+
+    def test_a_longer_lived_session_token_still_wins(self, stores):
+        stores.session = {USER: _credentials(seconds_left=3600, token="ya29.session")}
+        stores.persistent = {USER: _credentials(seconds_left=600, token="ya29.store")}
+        assert sd._recover_credentials(USER).token == "ya29.session"
 
     def test_session_miss_falls_back_to_the_persistent_store(self, stores):
         stores.persistent = {USER: _credentials(token="ya29.store")}
@@ -876,7 +904,7 @@ class TestMintAndServeAgree:
         stores.session = {USER: _credentials(seconds_left=200)}
         assert stores.session[USER].valid is False
         assert not await self._offer()
-        response = await sd.serve(_token(_mint()))  # a link minted by force
+        response = await _serve(_token(_mint()))  # a link minted by force
         assert response.status_code == 401 and "token" not in fetcher
 
     @pytest.mark.asyncio
@@ -889,7 +917,7 @@ class TestMintAndServeAgree:
         offer = await self._offer()
         assert offer.ttl == sd.URL_TTL_SECONDS
 
-        response = await sd.serve(_token(offer.url))
+        response = await _serve(_token(offer.url))
 
         assert response.status_code == 200 and response.body == b"ok"
         assert fetcher["token"] == "ya29.refreshed"
@@ -905,7 +933,7 @@ class TestMintAndServeAgree:
         outcome.update(status=400, body={"error": "invalid_grant"})
         stores.session = {USER: _credentials(seconds_left=200, refresh_token="1//r")}
         offer = await self._offer()
-        response = await sd.serve(_token(offer.url))
+        response = await _serve(_token(offer.url))
         assert response.status_code == 401 and "token" not in fetcher
         assert stores.writes == []
 
@@ -916,7 +944,7 @@ class TestMintAndServeAgree:
         calls, _ = token_endpoint
         stores.session = {USER: _credentials(seconds_left=300, refresh_token="1//r")}
         offer = await self._offer()
-        assert (await sd.serve(_token(offer.url))).status_code == 200
+        assert (await _serve(_token(offer.url))).status_code == 200
         assert fetcher["token"] == "ya29.access" and calls == []
 
     @pytest.mark.asyncio
@@ -931,7 +959,7 @@ class TestMintAndServeAgree:
         decline a URL the route would still have served — that gap is on purpose."""
         stores.session = {USER: _credentials(seconds_left=seconds_left)}
         offered = bool(await self._offer())
-        status = (await sd.serve(_token(_mint()))).status_code
+        status = (await _serve(_token(_mint()))).status_code
         if offered:
             assert status == 200, (seconds_left, status)
         threshold = sd.REFRESH_THRESHOLD.total_seconds()
@@ -967,7 +995,7 @@ class TestServe:
 
     @pytest.mark.asyncio
     async def test_streams_with_the_token_owners_credentials(self, collaborators):
-        response = await sd.serve(_token(_mint()))
+        response = await _serve(_token(_mint()))
 
         assert response.status_code == 200
         assert response.body == b"%PDF-1.3"
@@ -995,7 +1023,7 @@ class TestServe:
             )
 
         monkeypatch.setitem(sd._FETCHERS, "gmail", fetcher)
-        response = await sd.serve(_token(_mint()))
+        response = await _serve(_token(_mint()))
         disposition = response.headers["content-disposition"]
         assert 'filename="badnametab.txt"' in disposition
         assert "filename*=UTF-8''bad%00name%7F%09tab%01.txt" in disposition
@@ -1017,24 +1045,24 @@ class TestServe:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("bad", ["garbage", "a.b.c", ""])
     async def test_invalid_token_is_403_before_any_lookup(self, collaborators, bad):
-        response = await sd.serve(bad)
+        response = await _serve(bad)
         assert response.status_code == 403
         assert "emails" not in collaborators and "claims" not in collaborators
 
     @pytest.mark.asyncio
     async def test_expired_token_is_403(self, collaborators):
-        assert (await sd.serve(_token(_mint(ttl_seconds=-5)))).status_code == 403
+        assert (await _serve(_token(_mint(ttl_seconds=-5)))).status_code == 403
         assert "claims" not in collaborators
 
     @pytest.mark.asyncio
     async def test_unknown_source_is_403(self, collaborators):
-        assert (await sd.serve(_token(_mint(source="ftp")))).status_code == 403
+        assert (await _serve(_token(_mint(source="ftp")))).status_code == 403
 
     @pytest.mark.asyncio
     async def test_owner_without_credentials_is_401_and_nothing_is_fetched(
         self, collaborators
     ):
-        response = await sd.serve(_token(_mint(user_email="other@example.com")))
+        response = await _serve(_token(_mint(user_email="other@example.com")))
         assert response.status_code == 401
         assert collaborators["emails"] == ["other@example.com"]
         assert "claims" not in collaborators
@@ -1044,7 +1072,7 @@ class TestServe:
         creds = collaborators["creds"]  # no refresh token
         creds.expiry = _now() + timedelta(seconds=100)
         assert creds.valid is False
-        assert (await sd.serve(_token(_mint()))).status_code == 401
+        assert (await _serve(_token(_mint()))).status_code == 401
         assert "claims" not in collaborators
 
     @pytest.mark.asyncio
@@ -1053,7 +1081,7 @@ class TestServe:
             raise sd.SignedDownloadError("boom")
 
         monkeypatch.setitem(sd._FETCHERS, "gmail", failing)
-        assert (await sd.serve(_token(_mint()))).status_code == 502
+        assert (await _serve(_token(_mint()))).status_code == 502
 
     @pytest.mark.asyncio
     async def test_every_response_is_nosniff_and_uncacheable(
@@ -1061,18 +1089,18 @@ class TestServe:
     ):
         """Sender-typed bytes on a public capability URL: success and every error."""
         responses = {
-            "ok": await sd.serve(_token(_mint())),
-            "403": await sd.serve("garbage"),
-            "401": await sd.serve(_token(_mint(user_email="other@example.com"))),
+            "ok": await _serve(_token(_mint())),
+            "403": await _serve("garbage"),
+            "401": await _serve(_token(_mint(user_email="other@example.com"))),
         }
 
         async def failing(claims, credentials):
             raise sd.SignedDownloadError("boom")
 
         monkeypatch.setitem(sd._FETCHERS, "gmail", failing)
-        responses["502"] = await sd.serve(_token(_mint()))
+        responses["502"] = await _serve(_token(_mint()))
         monkeypatch.delenv(sd.FLAG_ENV)
-        responses["404"] = await sd.serve(_token(_mint()))
+        responses["404"] = await _serve(_token(_mint()))
 
         for name, response in responses.items():
             assert response.headers["x-content-type-options"] == "nosniff", name
@@ -1091,7 +1119,7 @@ class TestServe:
             )
 
         monkeypatch.setitem(sd._FETCHERS, "gmail", streaming)
-        response = await sd.serve(_token(_mint()))
+        response = await _serve(_token(_mint()))
         assert response.headers["x-content-type-options"] == "nosniff"
         assert response.headers["cache-control"] == "no-store"
         assert 'filename="v.mov"' in response.headers["content-disposition"]
@@ -1142,10 +1170,17 @@ class TestDriveFetcher:
     @pytest.mark.asyncio
     async def test_streams_bounded_chunks_that_reassemble_exactly(self, drive):
         result = await sd._fetch_drive(
-            {"fid": "F", "fn": "v.mov", "mt": "video/quicktime"}, Mock()
+            {
+                "fid": "F",
+                "sz": len(self.PAYLOAD),
+                "fn": "v.mov",
+                "mt": "video/quicktime",
+            },
+            Mock(),
         )
 
         assert result.content is None and result.stream is not None
+        assert result.length == len(self.PAYLOAD)
         chunks = [c async for c in result.stream]
         assert b"".join(chunks) == self.PAYLOAD
         assert len(chunks) > 1 and max(map(len, chunks)) <= self.CHUNK
@@ -1155,7 +1190,7 @@ class TestDriveFetcher:
     async def test_get_media_supports_shared_drives(self, drive):
         """Without supportsAllDrives=True Drive 404s on shared-drive files, so a
         minted URL would 502 on every fetch while the non-signed path works."""
-        result = await sd._fetch_drive({"fid": "SHARED"}, Mock())
+        result = await sd._fetch_drive({"fid": "SHARED", "sz": 1}, Mock())
         async for _ in result.stream:
             pass
         assert drive == [("get_media", "SHARED", True)]
@@ -1163,10 +1198,25 @@ class TestDriveFetcher:
     @pytest.mark.asyncio
     async def test_export_uses_export_media(self, drive):
         result = await sd._fetch_drive({"fid": "DOC", "emt": "application/pdf"}, Mock())
-        async for _ in result.stream:
-            pass
+        # Exports are buffered: Google caps them at 10 MB, and a failure anywhere
+        # in the body then becomes an error status, never a short file.
+        assert result.stream is None and result.content == self.PAYLOAD
         assert drive == [("export_media", "DOC", "application/pdf")]
         assert result.media_type == "application/pdf"
+
+    @pytest.mark.asyncio
+    async def test_a_stored_file_needs_its_recorded_size(self, drive):
+        with pytest.raises(sd.SignedDownloadError, match="missing sz"):
+            await sd._fetch_drive({"fid": "F"}, Mock())
+
+    @pytest.mark.asyncio
+    async def test_the_recorded_size_is_checked_against_the_file_limit(
+        self, drive, monkeypatch
+    ):
+        monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", "10")
+        with pytest.raises(sd.SignedDownloadError) as caught:
+            await sd._fetch_drive({"fid": "F", "sz": 11}, Mock())
+        assert caught.value.status == 413 and drive == []
 
     @pytest.mark.asyncio
     async def test_missing_fid_and_first_chunk_failure_raise(self, monkeypatch):
@@ -1179,7 +1229,7 @@ class TestDriveFetcher:
             Mock(return_value=Mock(next_chunk=Mock(side_effect=OSError("403")))),
         )
         with pytest.raises(sd.SignedDownloadError):
-            await sd._fetch_drive({"fid": "F"}, Mock())
+            await sd._fetch_drive({"fid": "F", "sz": 5}, Mock())
 
     @pytest.fixture
     def fails_on_second_chunk(self, monkeypatch):
@@ -1203,37 +1253,61 @@ class TestDriveFetcher:
     ):
         """A generator that returns ends the chunked body normally, which the
         client reads as a complete file. It must raise."""
-        result = await sd._fetch_drive({"fid": "F"}, Mock())
+        result = await sd._fetch_drive({"fid": "F", "sz": len(self.PAYLOAD)}, Mock())
         received = []
         with pytest.raises(sd.SignedDownloadError):
             async for chunk in result.stream:
                 received.append(chunk)
         assert b"".join(received) == self.PAYLOAD[: self.CHUNK]
 
-    @pytest.mark.asyncio
-    async def test_mid_stream_failure_is_never_a_complete_200_over_http(
+    def test_mid_stream_failure_is_never_a_complete_200_over_http(
         self, fails_on_second_chunk, monkeypatch
     ):
-        """Through the route over ASGI: the truncated body must not arrive as a
-        finished 200 response (uvicorn drops the connection without the final
-        chunk; httpx's in-process transport surfaces the app's exception)."""
+        """Through the route on a real server, behind a BaseHTTPMiddleware as in
+        production. Such middleware ends a chunked body cleanly after the app
+        raises, so without a Content-Length the client would receive a short file
+        as a complete 200; with it, the server drops the connection instead."""
+        import socket
+        import threading
+
+        import uvicorn
         from starlette.applications import Starlette
+        from starlette.middleware import Middleware
+        from starlette.middleware.base import BaseHTTPMiddleware
         from starlette.routing import Route
 
         monkeypatch.setenv(sd.FLAG_ENV, "true")
         monkeypatch.setattr(sd, "_recover_credentials", lambda email: _credentials())
 
+        class PassThrough(BaseHTTPMiddleware):
+            async def dispatch(self, request, call_next):
+                return await call_next(request)
+
         async def route(request):
             return await sd.serve(request.path_params["token"])
 
-        app = Starlette(routes=[Route("/attachments/signed/{token}", route)])
-        token = _token(_mint(source="drive", ref={"fid": "F"}))
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://testserver"
-        ) as http:
-            with pytest.raises(sd.SignedDownloadError):
-                await http.get(f"/attachments/signed/{token}")
+        app = Starlette(
+            routes=[Route("/attachments/signed/{token}", route)],
+            middleware=[Middleware(PassThrough)],
+        )
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        server = uvicorn.Server(
+            uvicorn.Config(app, host="127.0.0.1", port=port, log_level="critical")
+        )
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        try:
+            while not server.started:
+                time.sleep(0.02)
+            size = len(self.PAYLOAD)
+            token = _token(_mint(source="drive", ref={"fid": "F", "sz": size}))
+            with pytest.raises(httpx.RemoteProtocolError):
+                httpx.get(f"http://127.0.0.1:{port}/attachments/signed/{token}")
+        finally:
+            server.should_exit = True
+            thread.join(5)
 
 
 class TestGmailFetchers:
@@ -1350,7 +1424,7 @@ class TestGmailFetchers:
         with pytest.raises(sd.SignedDownloadError) as caught:
             await sd._fetch_gmail_message({"mid": "m1", "fmt": "text"}, Mock())
         assert caught.value.status == 422
-        assert "no readable body content" in caught.value.public
+        assert caught.value.public == sd._EMPTY_EXPORT
 
     @pytest.mark.asyncio
     async def test_message_export_rejects_bad_claims(self):
@@ -1405,6 +1479,7 @@ def _fresh_route_state(monkeypatch):
     each test starts with neither."""
     monkeypatch.setattr(sd, "_refreshed", sd.OrderedDict())
     monkeypatch.setattr(sd, "_download_slots", None)
+    monkeypatch.setattr(sd, "_owner_downloads", {})
 
 
 class TestRouteResources:
@@ -1423,19 +1498,19 @@ class TestRouteResources:
         slots = sd._slots()
         await slots.acquire()  # one download already in flight
         try:
-            response = await sd.serve(_token(_mint()))
+            response = await _serve(_token(_mint()))
         finally:
             slots.release()
         assert response.status_code == 503
         assert response.headers["retry-after"] == "5"
         assert "claims" not in fetcher
-        assert (await sd.serve(_token(_mint()))).status_code == 200
+        assert (await _serve(_token(_mint()))).status_code == 200
 
     @pytest.mark.asyncio
     async def test_a_buffered_download_gives_its_slot_back(self, stores, fetcher):
         stores.session = {USER: _credentials()}
         for _ in range(sd._MAX_CONCURRENT_DOWNLOADS + 2):
-            assert (await sd.serve(_token(_mint()))).status_code == 200
+            assert (await _serve(_token(_mint()))).status_code == 200
         assert not sd._slots().locked()
 
     @pytest.mark.asyncio
@@ -1474,7 +1549,7 @@ class TestRouteResources:
         calls, _ = token_endpoint
         stores.session = {USER: _credentials(seconds_left=200, refresh_token="1//r")}
         for _ in range(3):
-            assert (await sd.serve(_token(_mint()))).status_code == 200
+            assert (await _serve(_token(_mint()))).status_code == 200
         assert len(calls) == 1 and fetcher["token"] == "ya29.refreshed"
         assert stores.writes == []
 
@@ -1485,9 +1560,9 @@ class TestRouteResources:
         """A re-consent replaces the refresh token; the old grant's copy is dropped."""
         calls, _ = token_endpoint
         stores.session = {USER: _credentials(seconds_left=200, refresh_token="1//a")}
-        await sd.serve(_token(_mint()))
+        await _serve(_token(_mint()))
         stores.session = {USER: _credentials(seconds_left=200, refresh_token="1//b")}
-        await sd.serve(_token(_mint()))
+        await _serve(_token(_mint()))
         assert len(calls) == 2
 
 
@@ -1531,3 +1606,167 @@ class TestToolModuleGate:
             for alias in node.names
         }
         assert not {m for m in imported if m.startswith(("gmail.", "gdrive."))}
+
+
+class TestRoundTwo:
+    """Fixes from the second review of this branch."""
+
+    @pytest.fixture(autouse=True)
+    def _on(self, monkeypatch):
+        monkeypatch.setenv(sd.FLAG_ENV, "true")
+
+    @pytest.mark.asyncio
+    async def test_one_owner_cannot_hold_every_slot(self, stores, monkeypatch):
+        """A leaked link, or one slow client, is bounded per owner so other
+        users keep their downloads."""
+        stores.session = {USER: _credentials(), "other@example.com": _credentials()}
+        started, gate = asyncio.Event(), asyncio.Event()
+
+        async def slow(claims, credentials):
+            started.set()
+            await gate.wait()
+            return sd.DownloadResult(filename="f", media_type="a/b", content=b"x")
+
+        monkeypatch.setitem(sd._FETCHERS, "gmail", slow)
+        held = [
+            asyncio.ensure_future(_serve(_token(_mint())))
+            for _ in range(sd._MAX_DOWNLOADS_PER_OWNER)
+        ]
+        await started.wait()
+        await asyncio.sleep(0)
+        assert (await sd.serve(_token(_mint()))).status_code == 503
+        other = asyncio.ensure_future(
+            _serve(_token(_mint(user_email="other@example.com")))
+        )
+        await asyncio.sleep(0)
+        gate.set()
+        assert [r.status_code for r in await asyncio.gather(*held, other)] == [200] * (
+            sd._MAX_DOWNLOADS_PER_OWNER + 1
+        )
+        assert sd._owner_downloads == {}
+
+    @pytest.mark.asyncio
+    async def test_a_buffered_body_keeps_its_slot_until_sent(self, stores, fetcher):
+        stores.session = {USER: _credentials()}
+        response = await sd.serve(_token(_mint()))
+        assert sd._owner_downloads == {USER: 1}
+        await response.background()  # what the server runs after the body
+        assert sd._owner_downloads == {} and not sd._slots().locked()
+
+    @pytest.mark.asyncio
+    async def test_a_response_that_fails_to_build_gives_its_slot_back(
+        self, stores, monkeypatch
+    ):
+        stores.session = {USER: _credentials()}
+
+        async def streaming(claims, credentials):
+            async def body():
+                yield b"x"
+
+            return sd.DownloadResult(filename="f", media_type="a/b", stream=body())
+
+        monkeypatch.setitem(sd._FETCHERS, "gmail", streaming)
+        monkeypatch.setattr(sd, "StreamingResponse", Mock(side_effect=ValueError))
+        with pytest.raises(ValueError):
+            await sd.serve(_token(_mint()))
+        assert sd._owner_downloads == {} and not sd._slots().locked()
+
+    @pytest.mark.parametrize(
+        "value, served",
+        [
+            ("application/pdf", "application/pdf"),
+            ("text/plain; charset=utf-8", "text/plain; charset=utf-8"),
+            ("application/vnd.évil", "application/octet-stream"),
+            ("bad\r\ninjected: 1", "application/octet-stream"),
+            ("", "application/octet-stream"),
+        ],
+    )
+    def test_media_types_from_metadata_are_sanitised(self, value, served):
+        assert sd._safe_media_type(value) == served
+
+    def test_access_log_lines_never_carry_a_token(self):
+        record = logging.LogRecord(
+            "uvicorn.access",
+            logging.INFO,
+            __file__,
+            1,
+            '%s - "%s %s HTTP/%s" %d',
+            ("1.2.3.4", "GET", "/attachments/signed/gAAAAsecret?x=1", "1.1", 200),
+            None,
+        )
+        sd._RedactSignedTokens().filter(record)
+        line = record.getMessage()
+        assert "gAAAAsecret" not in line
+        assert "/attachments/signed/<redacted>" in line
+
+    def test_startup_installs_the_redaction_once(self):
+        sd.validate_startup("streamable-http")
+        sd.validate_startup("streamable-http")
+        access = logging.getLogger("uvicorn.access")
+        assert sum(isinstance(f, sd._RedactSignedTokens) for f in access.filters) == 1
+
+    def test_external_provider_mode_refuses(self, monkeypatch):
+        monkeypatch.setattr(
+            "auth.oauth_config.is_external_oauth21_provider", lambda: True
+        )
+        with pytest.raises(ValueError, match="EXTERNAL_OAUTH21_PROVIDER"):
+            sd.validate_startup("streamable-http")
+
+    def test_a_session_shorter_than_any_link_refuses(self, monkeypatch):
+        monkeypatch.setenv(
+            "WORKSPACE_MCP_OAUTH_PROXY_ACCESS_TOKEN_EXPIRY_SECONDS", "30"
+        )
+        with pytest.raises(ValueError, match="none could ever be issued"):
+            sd.validate_startup("streamable-http")
+
+    def test_an_invalid_session_setting_is_ignored_quietly(self, monkeypatch, caplog):
+        monkeypatch.setenv("WORKSPACE_MCP_OAUTH_PROXY_ACCESS_TOKEN_EXPIRY_SECONDS", "x")
+        with caplog.at_level(logging.WARNING):
+            assert sd._max_link_seconds() == sd.URL_TTL_SECONDS
+        assert caplog.records == []
+
+    @pytest.mark.asyncio
+    async def test_gmail_attachments_need_gmail_tools_too(self, monkeypatch):
+        import sys
+
+        monkeypatch.delitem(sys.modules, "gmail.gmail_tools", raising=False)
+        with pytest.raises(sd.SignedDownloadError) as caught:
+            await sd._fetch_gmail_attachment({"mid": "m", "aid": "a"}, Mock())
+        assert caught.value.status == 404
+
+    @pytest.mark.asyncio
+    async def test_a_disconnect_waits_for_the_chunk_in_flight(self, monkeypatch):
+        """The slot and the Drive client are released only once the worker
+        thread is done with them, so the limit bounds real Google I/O."""
+        import threading
+
+        import gdrive.drive_tools as drive_tools
+
+        release_chunk = threading.Event()
+        closed = []
+
+        class Slow(_FakeDownloader):
+            def next_chunk(self):
+                if self._pos:
+                    release_chunk.wait(5)
+                return super().next_chunk()
+
+        files = _FakeFiles([], b"x" * 32)
+        service = Mock(files=lambda: files, close=lambda: closed.append(True))
+        monkeypatch.setattr(sd, "build", lambda *a, **k: service)
+        monkeypatch.setattr(sd, "MediaIoBaseDownload", Slow)
+        monkeypatch.setattr(drive_tools, "DOWNLOAD_CHUNK_SIZE", 8)
+
+        result = await sd._fetch_drive({"fid": "F", "sz": 32}, Mock())
+        stream = result.stream
+        assert await stream.__anext__() == b"x" * 8
+        pending = asyncio.ensure_future(stream.__anext__())
+        await asyncio.sleep(0.05)  # the second chunk is now in a worker thread
+        pending.cancel()  # what a client disconnect does to the body task
+        await asyncio.sleep(0.05)
+        assert not pending.done()  # cleanup is waiting on the thread
+        release_chunk.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        result.close()
+        assert closed == [True]

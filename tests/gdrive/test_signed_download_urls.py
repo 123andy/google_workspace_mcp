@@ -19,9 +19,13 @@ def _unwrap(tool):
     return fn
 
 
-def _service(mime="application/vnd.google-apps.document", name="Plan"):
+def _service(mime="application/vnd.google-apps.document", name="Plan", size="300"):
     service = Mock()
-    service.files().get().execute.return_value = {"name": name, "mimeType": mime}
+    service.files().get().execute.return_value = {
+        "name": name,
+        "mimeType": mime,
+        **({"size": size} if size is not None else {}),
+    }
     return service
 
 
@@ -65,7 +69,8 @@ async def test_binary_file_has_no_export_claim(download, enabled):
             user_google_email=USER,
             file_id="v-1",
         )
-    assert offer.call_args.kwargs["ref"] == {"fid": "v-1"}
+    # The recorded size rides in the token and becomes the Content-Length.
+    assert offer.call_args.kwargs["ref"] == {"fid": "v-1", "sz": 300}
     assert offer.call_args.kwargs["mime_type"] == "video/mp4"
 
 
@@ -138,5 +143,19 @@ async def test_items_with_no_bytes_get_no_link(download, enabled, mime):
         with pytest.raises(RuntimeError):
             await _unwrap(get_drive_file_download_url)(
                 service=_service(mime, "thing"), user_google_email=USER, file_id="x"
+            )
+    offer.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("gdrive.drive_tools._download_file_to_temp", new_callable=AsyncMock)
+async def test_a_stored_file_without_a_recorded_size_gets_no_link(download, enabled):
+    download.side_effect = RuntimeError("normal path")
+    with patch.object(sd, "offer_url", new_callable=AsyncMock) as offer:
+        with pytest.raises(RuntimeError):
+            await _unwrap(get_drive_file_download_url)(
+                service=_service("video/mp4", "clip.mp4", size=None),
+                user_google_email=USER,
+                file_id="v-1",
             )
     offer.assert_not_called()
