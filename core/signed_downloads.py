@@ -40,7 +40,6 @@ from urllib.parse import quote, urlparse
 
 from cryptography.fernet import Fernet
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from starlette.background import BackgroundTask
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -73,8 +72,8 @@ _MAX_FILENAME_CHARS = 200
 # Concurrent downloads the public route will run, in total and per link owner;
 # beyond either it answers 503. The per-owner bound keeps one leaked link (or one
 # slow client) from holding every slot.
-_MAX_CONCURRENT_DOWNLOADS = 4
-_MAX_DOWNLOADS_PER_OWNER = 2
+_MAX_CONCURRENT_DOWNLOADS = 8
+_MAX_DOWNLOADS_PER_OWNER = 4
 # Owners whose stored access token the route refreshed in memory, so repeat
 # fetches of a link reuse the refreshed copy instead of refreshing again.
 _REFRESHED_CACHE_SIZE = 256
@@ -195,7 +194,8 @@ class _RedactSignedTokens(logging.Filter):
     """A link's token is a bearer credential for its lifetime; request logs (the
     server's access log above all) record the path, so replace the token there."""
 
-    _TOKEN = re.compile(r"(/attachments/signed/)[^\s?\"']+")
+    # Tokens are URL-safe base64 and far longer than any placeholder like "*".
+    _TOKEN = re.compile(r"(/attachments/signed/)[A-Za-z0-9_\-]{16,}=*")
 
     def _redact(self, value):
         return (
@@ -209,10 +209,16 @@ class _RedactSignedTokens(logging.Filter):
         return True
 
 
+# Loggers known to record a request's path. Filters on a logger do not reach
+# records its children propagate, so the root handlers get the filter too.
+_PATH_LOGGERS = ("uvicorn.access", "uvicorn.error", "auth.mcp_session_middleware")
+
+
 def install_access_log_redaction() -> None:
     """Idempotent; run once the feature is known to be on."""
-    for name in ("uvicorn.access", "uvicorn.error"):
-        target = logging.getLogger(name)
+    targets = [logging.getLogger(name) for name in _PATH_LOGGERS]
+    targets += logging.getLogger().handlers
+    for target in targets:
         if not any(isinstance(f, _RedactSignedTokens) for f in target.filters):
             target.addFilter(_RedactSignedTokens())
 
@@ -281,19 +287,20 @@ def usable_seconds(
 
 
 def _session_link_seconds() -> Optional[int]:
-    """The MCP access-token lifetime an operator configured, or None. Parsed with
-    the OAuth proxy's own bounds but without its warning, which it already logs
-    once at startup."""
+    """The MCP access-token lifetime an operator configured, or None. Parsed by the
+    OAuth proxy's own reader, without the warning it already logs at startup."""
     from auth.oauth_proxy_config import (
         MAX_OAUTH_ACCESS_TOKEN_EXPIRY_SECONDS,
         OAUTH_ACCESS_TOKEN_EXPIRY_ENV,
+        _parse_expiry_seconds_env,
     )
 
-    try:
-        seconds = int(os.getenv(OAUTH_ACCESS_TOKEN_EXPIRY_ENV, "").strip())
-    except ValueError:
-        return None
-    return seconds if 1 <= seconds <= MAX_OAUTH_ACCESS_TOKEN_EXPIRY_SECONDS else None
+    return _parse_expiry_seconds_env(
+        OAUTH_ACCESS_TOKEN_EXPIRY_ENV,
+        minimum=1,
+        maximum=MAX_OAUTH_ACCESS_TOKEN_EXPIRY_SECONDS,
+        warn=False,
+    )
 
 
 def _max_link_seconds() -> int:
@@ -413,8 +420,9 @@ def verify_token(token: str) -> Optional[dict]:
 
 
 def _recover_credentials(user_email: str) -> Optional[Credentials]:
-    """The owner's credentials: session store first, then the persistent
-    credential store (skipped in stateless mode, where nothing is persisted).
+    """The owner's credentials: the session store's while usable, else the
+    persistent credential store's (skipped in stateless mode, where nothing is
+    persisted). A failure in one store never discards the other's answer.
 
     Read-only. Both stores hand back a fresh ``Credentials`` object, so refreshing
     it later never reaches storage. The tool and the route both use this lookup,
@@ -426,16 +434,21 @@ def _recover_credentials(user_email: str) -> Optional[Credentials]:
 
     try:
         credentials = get_oauth21_session_store().get_credentials(user_email)
-        if is_stateless_mode() or (credentials and _refreshable(credentials)):
-            return credentials
-        # A session entry built from a bare access token must not shadow a
-        # refreshable entry in the persistent store: take whichever lasts longer.
-        stored = get_credential_store().get_credential(user_email)
-        candidates = [c for c in (credentials, stored) if c is not None]
-        return max(candidates, key=usable_seconds, default=None)
     except Exception as exc:
-        logger.debug("Could not recover credentials for %s: %s", user_email, exc)
-        return None
+        logger.debug("Session store lookup failed for %s: %s", user_email, exc)
+        credentials = None
+    # The session wins while the route can use it (it holds the grant the tool
+    # just used); only a missing or spent session entry falls back to the store.
+    if is_stateless_mode() or (
+        credentials is not None and usable_seconds(credentials) > 0
+    ):
+        return credentials
+    try:
+        stored = get_credential_store().get_credential(user_email)
+    except Exception as exc:
+        logger.debug("Credential store lookup failed for %s: %s", user_email, exc)
+        return credentials
+    return stored if stored is not None else credentials
 
 
 @dataclass(frozen=True)
@@ -534,6 +547,8 @@ class DownloadResult:
     close: Optional[Callable[[], None]] = None
     # Exact byte count of ``stream``, sent as Content-Length when known.
     length: Optional[int] = None
+    # The chunk fetch a worker thread is running, if any: cleanup waits for it.
+    in_flight: Optional[Callable[[], Optional[asyncio.Future]]] = None
 
 
 class SignedDownloadError(Exception):
@@ -685,15 +700,12 @@ async def _fetch_gmail_message(
                 extension,
                 _notes,
             ) = await gmail_tools._render_message_export(gmail, message_id, body_format)
-        except ValueError as exc:
-            empty = "no readable body content" in str(exc) or "no raw content" in str(
-                exc
-            )
+        except gmail_tools.EmptyExportError as exc:
             raise SignedDownloadError(
-                f"Gmail message export failed: {exc}",
-                status=422 if empty else 502,
-                public=_EMPTY_EXPORT if empty else None,
+                f"Gmail message export failed: {exc}", status=422, public=_EMPTY_EXPORT
             ) from exc
+        except ValueError as exc:
+            raise SignedDownloadError(f"Gmail message export failed: {exc}") from exc
         except Exception as exc:
             raise _google_error(exc, "Gmail message export") from exc
         content = _within_file_limit(content, "message export")
@@ -711,27 +723,16 @@ async def _fetch_drive(claims: dict, credentials: Credentials) -> DownloadResult
 
     Exports are buffered: Google caps them at 10 MB, and buffering turns a failure
     anywhere in the body into an error status. Stored files stream in bounded
-    chunks with a ``Content-Length`` from the file's recorded ``sz``, so a stream
-    that fails partway ends short of it and the client sees an incomplete transfer
-    rather than a complete-looking file (middleware between the route and the
-    server would otherwise close the chunked body cleanly)."""
+    chunks with a ``Content-Length`` taken from the first chunk's response (the
+    exact size Google is serving now), so a stream that fails partway ends short
+    of it and the client sees an incomplete transfer rather than a
+    complete-looking file (middleware between the route and the server would
+    otherwise close a chunked body cleanly)."""
     drive_tools = _tool_module("gdrive.drive_tools", "Drive")
     file_id = claims.get("fid")
     if not file_id:
         raise SignedDownloadError("Drive token missing fid")
     export_mime = claims.get("emt")
-    size = claims.get("sz")
-    if not export_mime and not _is_timestamp(size):
-        raise SignedDownloadError("Drive token missing sz")
-    if not export_mime:
-        try:
-            ensure_within_file_size_limit(size, kind="file")
-        except FileTooLargeError as exc:
-            raise SignedDownloadError(
-                "Drive file exceeds the file size limit",
-                status=413,
-                public="The file exceeds this server's file size limit.",
-            ) from exc
     drive = await asyncio.to_thread(build, "drive", "v3", credentials=credentials)
     buffer = io.BytesIO()
     downloader = MediaIoBaseDownload(
@@ -740,13 +741,13 @@ async def _fetch_drive(claims: dict, credentials: Credentials) -> DownloadResult
         chunksize=drive_tools.DOWNLOAD_CHUNK_SIZE,
     )
 
-    def next_chunk() -> tuple[bytes, bool]:
+    def next_chunk() -> tuple[bytes, bool, Optional[int]]:
         # next_chunk() appends to the buffer; drain it so memory stays at one chunk.
-        _status, done = downloader.next_chunk()
+        status, done = downloader.next_chunk()
         chunk = buffer.getvalue()
         buffer.seek(0)
         buffer.truncate()
-        return chunk, done
+        return chunk, done, getattr(status, "total_size", None)
 
     media_type = claims.get("mt") or export_mime or "application/octet-stream"
     filename = claims.get("fn") or "download"
@@ -756,7 +757,7 @@ async def _fetch_drive(claims: dict, credentials: Credentials) -> DownloadResult
         try:
             done = False
             while not done:
-                chunk, done = await asyncio.to_thread(next_chunk)
+                chunk, done, _total = await asyncio.to_thread(next_chunk)
                 parts.append(chunk)
         except Exception as exc:
             raise _google_error(exc, "Drive export") from exc
@@ -769,49 +770,51 @@ async def _fetch_drive(claims: dict, credentials: Credentials) -> DownloadResult
         )
 
     # Pull the first chunk eagerly so auth / not-found errors become an error
-    # status instead of a truncated 200.
+    # status instead of a truncated 200, and to learn the exact size.
     try:
-        chunk, done = await asyncio.to_thread(next_chunk)
+        chunk, done, total = await asyncio.to_thread(next_chunk)
     except Exception as exc:
         _close_service(drive)
         raise _google_error(exc, "Drive download") from exc
+    if total is not None:
+        try:
+            ensure_within_file_size_limit(total, kind="file")
+        except FileTooLargeError as exc:
+            _close_service(drive)
+            raise SignedDownloadError(
+                "Drive file exceeds the file size limit",
+                status=413,
+                public="The file exceeds this server's file size limit.",
+            ) from exc
+
+    current: dict = {"future": None}
 
     async def body() -> AsyncIterator[bytes]:
         pending, finished = chunk, done
-        in_flight = None
-        try:
-            while True:
-                if pending:
-                    yield pending
-                if finished:
-                    return
-                in_flight = asyncio.ensure_future(asyncio.to_thread(next_chunk))
-                try:
-                    # Shielded: cancelling this await (a disconnect) must not mark
-                    # the chunk done while its worker thread is still running.
-                    pending, finished = await asyncio.shield(in_flight)
-                except Exception as exc:
-                    logger.error("Drive stream interrupted mid-download: %s", exc)
-                    raise SignedDownloadError(
-                        f"Drive stream interrupted: {exc}"
-                    ) from exc
-        finally:
-            # A client that disconnects mid-chunk cancels only the await: the
-            # worker thread keeps using the client until its chunk completes. Wait
-            # for it, so the slot and the client are released only once the
-            # thread is done with them.
-            if in_flight is not None and not in_flight.done():
-                try:
-                    await asyncio.shield(in_flight)
-                except BaseException:
-                    pass
+        while True:
+            if pending:
+                yield pending
+            if finished:
+                return
+            future = asyncio.ensure_future(asyncio.to_thread(next_chunk))
+            current["future"] = future
+            try:
+                # Shielded: cancelling this await (a disconnect) must leave the
+                # future running, so cleanup can wait for its worker thread.
+                pending, finished, _total = await asyncio.shield(future)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("Drive stream interrupted mid-download: %s", exc)
+                raise SignedDownloadError(f"Drive stream interrupted: {exc}") from exc
 
     return DownloadResult(
         filename=filename,
         media_type=media_type,
         stream=body(),
         close=lambda: _close_service(drive),
-        length=size,
+        length=total,
+        in_flight=lambda: current["future"],
     )
 
 
@@ -903,12 +906,44 @@ async def _usable_credentials(user_email: str) -> Optional[Credentials]:
     return credentials
 
 
+class _GuardedResponse(Response):
+    """A buffered response that runs ``on_close`` once it is sent or fails."""
+
+    def __init__(self, *args, on_close: Callable[[], None], **kwargs):
+        super().__init__(*args, **kwargs)
+        self._on_close = on_close
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._on_close()
+
+
+class _GuardedStreamingResponse(StreamingResponse):
+    """A streamed response that runs ``on_close`` however it ends: completed,
+    client gone, or ``send`` raising mid-body (where Starlette skips background
+    tasks and leaves the body generator suspended)."""
+
+    def __init__(self, *args, on_close: Callable[[], None], **kwargs):
+        super().__init__(*args, **kwargs)
+        self._on_close = on_close
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._on_close()
+
+
 async def serve(token: str) -> Response:
     """Verify a signed token, then return the resource with its owner's credentials.
 
     At most ``_MAX_CONCURRENT_DOWNLOADS`` run at once, and at most
     ``_MAX_DOWNLOADS_PER_OWNER`` per link owner (503 beyond either). A response
-    keeps its slot, and a stream its API client, until its body has been sent."""
+    keeps its slot, and a stream its API client, until it has been sent — and a
+    stream, until any chunk fetch its worker thread is still running has
+    finished. All of it happens on the event loop."""
     if not enabled():  # keep the public route inert unless the feature is on
         return _error(404, "Not found")
     claims = verify_token(token)
@@ -928,14 +963,15 @@ async def serve(token: str) -> Response:
 
     def release() -> None:
         nonlocal released
-        if not released:
-            released = True
-            slots.release()
-            remaining = _owner_downloads.get(owner, 1) - 1
-            if remaining > 0:
-                _owner_downloads[owner] = remaining
-            else:
-                _owner_downloads.pop(owner, None)
+        if released:
+            return
+        released = True
+        slots.release()
+        remaining = _owner_downloads.get(owner, 1) - 1
+        if remaining > 0:
+            _owner_downloads[owner] = remaining
+        else:
+            _owner_downloads.pop(owner, None)
 
     handed_off = False
     try:
@@ -964,41 +1000,44 @@ async def serve(token: str) -> Response:
         }
         media_type = _safe_media_type(result.media_type)
         if result.stream is None:
-            response = Response(
+            response = _GuardedResponse(
                 content=result.content,
                 media_type=media_type,
                 headers=headers,
-                background=BackgroundTask(release),
+                on_close=release,
             )
             handed_off = True
             return response
 
         if result.length is not None:
             headers["Content-Length"] = str(result.length)
+        finishing = False
 
         def finish() -> None:
-            if released:  # the stream and the background task both call this
+            nonlocal finishing
+            if finishing:
                 return
+            finishing = True
+            future = result.in_flight() if result.in_flight else None
+            if future is not None and not future.done():
+                # A client that left mid-chunk: the worker thread still holds the
+                # client. Release once it is done, on the loop, not before.
+                future.add_done_callback(lambda _: _finish_now())
+            else:
+                _finish_now()
+
+        def _finish_now() -> None:
             try:
                 if result.close:
                     result.close()
             finally:
                 release()
 
-        async def body() -> AsyncIterator[bytes]:
-            try:
-                async for part in result.stream:
-                    yield part
-            finally:
-                await result.stream.aclose()
-                finish()
-
-        # The background task covers a response that ends before its body starts.
-        response = StreamingResponse(
-            body(),
+        response = _GuardedStreamingResponse(
+            result.stream,
             media_type=media_type,
             headers=headers,
-            background=BackgroundTask(finish),
+            on_close=finish,
         )
         handed_off = True
         return response

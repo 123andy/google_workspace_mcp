@@ -26,12 +26,28 @@ from google.oauth2.credentials import Credentials
 import core.signed_downloads as sd
 
 
+async def _send(response):
+    """Run a response the way the server does (ASGI, spec 2.4) and return the
+    body it sent. Its cleanup runs exactly as it would in production."""
+    sent = []
+
+    async def receive():
+        await asyncio.Event().wait()  # the client never disconnects
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {"type": "http", "asgi": {"spec_version": "2.4"}, "method": "GET"}
+    await response(scope, receive, send)
+    return b"".join(
+        m.get("body", b"") for m in sent if m["type"] == "http.response.body"
+    )
+
+
 async def _serve(token):
-    """``sd.serve`` as the server runs it: a buffered response's background task
-    (which gives its download slot back) runs once the body is sent."""
+    """``sd.serve`` followed by sending the response, as the server does."""
     response = await sd.serve(token)
-    if response.background is not None and not hasattr(response, "body_iterator"):
-        await response.background()
+    response.sent = await _send(response)
     return response
 
 
@@ -1135,7 +1151,9 @@ class _FakeDownloader:
         nxt = self._payload[self._pos : self._pos + self._cs]
         self._fh.write(nxt)
         self._pos += len(nxt)
-        return "status", self._pos >= len(self._payload)
+        # Like googleapiclient: the total comes from the response's Content-Range.
+        status = Mock(total_size=len(self._payload))
+        return status, self._pos >= len(self._payload)
 
 
 class _FakeFiles:
@@ -1172,7 +1190,6 @@ class TestDriveFetcher:
         result = await sd._fetch_drive(
             {
                 "fid": "F",
-                "sz": len(self.PAYLOAD),
                 "fn": "v.mov",
                 "mt": "video/quicktime",
             },
@@ -1190,7 +1207,7 @@ class TestDriveFetcher:
     async def test_get_media_supports_shared_drives(self, drive):
         """Without supportsAllDrives=True Drive 404s on shared-drive files, so a
         minted URL would 502 on every fetch while the non-signed path works."""
-        result = await sd._fetch_drive({"fid": "SHARED", "sz": 1}, Mock())
+        result = await sd._fetch_drive({"fid": "SHARED"}, Mock())
         async for _ in result.stream:
             pass
         assert drive == [("get_media", "SHARED", True)]
@@ -1205,18 +1222,31 @@ class TestDriveFetcher:
         assert result.media_type == "application/pdf"
 
     @pytest.mark.asyncio
-    async def test_a_stored_file_needs_its_recorded_size(self, drive):
-        with pytest.raises(sd.SignedDownloadError, match="missing sz"):
-            await sd._fetch_drive({"fid": "F"}, Mock())
-
-    @pytest.mark.asyncio
-    async def test_the_recorded_size_is_checked_against_the_file_limit(
+    async def test_the_served_size_is_checked_against_the_file_limit(
         self, drive, monkeypatch
     ):
-        monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", "10")
+        """The size Google reports on the first chunk is the one checked: it is
+        what would be sent, even if the file changed since the link was minted."""
+        monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", str(len(self.PAYLOAD) - 1))
         with pytest.raises(sd.SignedDownloadError) as caught:
-            await sd._fetch_drive({"fid": "F", "sz": 11}, Mock())
-        assert caught.value.status == 413 and drive == []
+            await sd._fetch_drive({"fid": "F"}, Mock())
+        assert caught.value.status == 413
+
+    @pytest.mark.asyncio
+    async def test_unknown_total_streams_without_a_length(self, monkeypatch):
+        import gdrive.drive_tools as drive_tools
+
+        class NoTotal(_FakeDownloader):
+            def next_chunk(self):
+                _status, done = super().next_chunk()
+                return Mock(total_size=None), done
+
+        files = _FakeFiles([], b"abc")
+        monkeypatch.setattr(sd, "build", lambda *a, **k: Mock(files=lambda: files))
+        monkeypatch.setattr(sd, "MediaIoBaseDownload", NoTotal)
+        monkeypatch.setattr(drive_tools, "DOWNLOAD_CHUNK_SIZE", 8)
+        result = await sd._fetch_drive({"fid": "F"}, Mock())
+        assert result.length is None
 
     @pytest.mark.asyncio
     async def test_missing_fid_and_first_chunk_failure_raise(self, monkeypatch):
@@ -1229,7 +1259,7 @@ class TestDriveFetcher:
             Mock(return_value=Mock(next_chunk=Mock(side_effect=OSError("403")))),
         )
         with pytest.raises(sd.SignedDownloadError):
-            await sd._fetch_drive({"fid": "F", "sz": 5}, Mock())
+            await sd._fetch_drive({"fid": "F"}, Mock())
 
     @pytest.fixture
     def fails_on_second_chunk(self, monkeypatch):
@@ -1253,7 +1283,7 @@ class TestDriveFetcher:
     ):
         """A generator that returns ends the chunked body normally, which the
         client reads as a complete file. It must raise."""
-        result = await sd._fetch_drive({"fid": "F", "sz": len(self.PAYLOAD)}, Mock())
+        result = await sd._fetch_drive({"fid": "F"}, Mock())
         received = []
         with pytest.raises(sd.SignedDownloadError):
             async for chunk in result.stream:
@@ -1301,8 +1331,7 @@ class TestDriveFetcher:
         try:
             while not server.started:
                 time.sleep(0.02)
-            size = len(self.PAYLOAD)
-            token = _token(_mint(source="drive", ref={"fid": "F", "sz": size}))
+            token = _token(_mint(source="drive", ref={"fid": "F"}))
             with pytest.raises(httpx.RemoteProtocolError):
                 httpx.get(f"http://127.0.0.1:{port}/attachments/signed/{token}")
         finally:
@@ -1536,11 +1565,48 @@ class TestRouteResources:
         monkeypatch.setattr(sd, "_MAX_CONCURRENT_DOWNLOADS", 1)
         response = await sd.serve(_token(_mint()))
         assert sd._slots().locked() and closed == []
-        body = b"".join([part async for part in response.body_iterator])
-        assert body == b"ab"
+        assert await _send(response) == b"ab"
         assert closed == [True] and not sd._slots().locked()
-        await response.background()  # the safety net is a no-op once finished
-        assert closed == [True]
+
+    @pytest.mark.asyncio
+    async def test_a_send_that_fails_mid_stream_still_releases(
+        self, stores, monkeypatch
+    ):
+        """Starlette skips background tasks and leaves the body generator
+        suspended when send raises; the slot and the client must not wait for
+        garbage collection."""
+        stores.session = {USER: _credentials()}
+        closed = []
+
+        async def chunks():
+            yield b"a"
+            yield b"b"
+
+        async def streaming(claims, credentials):
+            return sd.DownloadResult(
+                filename="f.bin",
+                media_type="application/octet-stream",
+                stream=chunks(),
+                close=lambda: closed.append(True),
+            )
+
+        monkeypatch.setitem(sd._FETCHERS, "gmail", streaming)
+        response = await sd.serve(_token(_mint()))
+
+        async def receive():
+            await asyncio.Event().wait()
+
+        async def send(message):
+            if message.get("body"):
+                raise OSError("client connection reset")
+
+        from starlette.requests import ClientDisconnect
+
+        with pytest.raises((OSError, ClientDisconnect)):
+            await response(
+                {"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send
+            )
+        assert closed == [True] and sd._owner_downloads == {}
 
     @pytest.mark.asyncio
     async def test_a_refreshed_token_is_reused_not_refreshed_again(
@@ -1608,8 +1674,8 @@ class TestToolModuleGate:
         assert not {m for m in imported if m.startswith(("gmail.", "gdrive."))}
 
 
-class TestRoundTwo:
-    """Fixes from the second review of this branch."""
+class TestLimitsLoggingAndStartup:
+    """Per-owner limits, header and log hygiene, and startup refusals."""
 
     @pytest.fixture(autouse=True)
     def _on(self, monkeypatch):
@@ -1650,7 +1716,7 @@ class TestRoundTwo:
         stores.session = {USER: _credentials()}
         response = await sd.serve(_token(_mint()))
         assert sd._owner_downloads == {USER: 1}
-        await response.background()  # what the server runs after the body
+        await _send(response)
         assert sd._owner_downloads == {} and not sd._slots().locked()
 
     @pytest.mark.asyncio
@@ -1666,7 +1732,9 @@ class TestRoundTwo:
             return sd.DownloadResult(filename="f", media_type="a/b", stream=body())
 
         monkeypatch.setitem(sd._FETCHERS, "gmail", streaming)
-        monkeypatch.setattr(sd, "StreamingResponse", Mock(side_effect=ValueError))
+        monkeypatch.setattr(
+            sd, "_GuardedStreamingResponse", Mock(side_effect=ValueError)
+        )
         with pytest.raises(ValueError):
             await sd.serve(_token(_mint()))
         assert sd._owner_downloads == {} and not sd._slots().locked()
@@ -1691,13 +1759,37 @@ class TestRoundTwo:
             __file__,
             1,
             '%s - "%s %s HTTP/%s" %d',
-            ("1.2.3.4", "GET", "/attachments/signed/gAAAAsecret?x=1", "1.1", 200),
+            (
+                "1.2.3.4",
+                "GET",
+                "/attachments/signed/gAAAAABsecretTokenBody?x",
+                "1.1",
+                200,
+            ),
             None,
         )
         sd._RedactSignedTokens().filter(record)
         line = record.getMessage()
-        assert "gAAAAsecret" not in line
+        assert "secretTokenBody" not in line
         assert "/attachments/signed/<redacted>" in line
+
+    def test_the_route_pattern_in_documentation_lines_is_left_alone(self):
+        record = logging.LogRecord(
+            "x",
+            logging.INFO,
+            __file__,
+            1,
+            "/attachments/signed/* must be public",
+            (),
+            None,
+        )
+        sd._RedactSignedTokens().filter(record)
+        assert record.getMessage() == "/attachments/signed/* must be public"
+
+    def test_redaction_reaches_the_middleware_log(self):
+        sd.install_access_log_redaction()
+        middleware = logging.getLogger("auth.mcp_session_middleware")
+        assert any(isinstance(f, sd._RedactSignedTokens) for f in middleware.filters)
 
     def test_startup_installs_the_redaction_once(self):
         sd.validate_startup("streamable-http")
@@ -1735,15 +1827,45 @@ class TestRoundTwo:
         assert caught.value.status == 404
 
     @pytest.mark.asyncio
-    async def test_a_disconnect_waits_for_the_chunk_in_flight(self, monkeypatch):
-        """The slot and the Drive client are released only once the worker
-        thread is done with them, so the limit bounds real Google I/O."""
+    async def test_cleanup_waits_for_a_chunk_still_being_fetched(
+        self, stores, monkeypatch
+    ):
+        """However the response ended, the slot and the client are released only
+        once the worker thread's chunk is done — by callback, not by awaiting,
+        so no cancellation (anyio re-cancels every await) can skip the wait."""
+        stores.session = {USER: _credentials()}
+        chunk_task = asyncio.get_running_loop().create_future()
+        closed = []
+
+        async def chunks():
+            yield b"a"
+
+        async def streaming(claims, credentials):
+            return sd.DownloadResult(
+                filename="f.bin",
+                media_type="application/octet-stream",
+                stream=chunks(),
+                close=lambda: closed.append(True),
+                in_flight=lambda: chunk_task,
+            )
+
+        monkeypatch.setitem(sd._FETCHERS, "gmail", streaming)
+        response = await sd.serve(_token(_mint()))
+        await _send(response)
+        assert closed == [] and sd._owner_downloads == {USER: 1}
+        chunk_task.set_result(None)
+        await asyncio.sleep(0)
+        assert closed == [True] and sd._owner_downloads == {}
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_read_leaves_its_chunk_running(self, monkeypatch):
+        """The Drive stream exposes the chunk its thread is fetching; cancelling
+        the read (a disconnect) must not mark that chunk done early."""
         import threading
 
         import gdrive.drive_tools as drive_tools
 
         release_chunk = threading.Event()
-        closed = []
 
         class Slow(_FakeDownloader):
             def next_chunk(self):
@@ -1752,21 +1874,36 @@ class TestRoundTwo:
                 return super().next_chunk()
 
         files = _FakeFiles([], b"x" * 32)
-        service = Mock(files=lambda: files, close=lambda: closed.append(True))
-        monkeypatch.setattr(sd, "build", lambda *a, **k: service)
+        monkeypatch.setattr(sd, "build", lambda *a, **k: Mock(files=lambda: files))
         monkeypatch.setattr(sd, "MediaIoBaseDownload", Slow)
         monkeypatch.setattr(drive_tools, "DOWNLOAD_CHUNK_SIZE", 8)
 
-        result = await sd._fetch_drive({"fid": "F", "sz": 32}, Mock())
-        stream = result.stream
-        assert await stream.__anext__() == b"x" * 8
-        pending = asyncio.ensure_future(stream.__anext__())
-        await asyncio.sleep(0.05)  # the second chunk is now in a worker thread
-        pending.cancel()  # what a client disconnect does to the body task
+        result = await sd._fetch_drive({"fid": "F"}, Mock())
+        assert await result.stream.__anext__() == b"x" * 8
+        reading = asyncio.ensure_future(result.stream.__anext__())
         await asyncio.sleep(0.05)
-        assert not pending.done()  # cleanup is waiting on the thread
-        release_chunk.set()
+        reading.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await pending
-        result.close()
-        assert closed == [True]
+            await reading
+        chunk = result.in_flight()
+        assert chunk is not None and not chunk.done()
+        release_chunk.set()
+        await chunk
+
+
+class TestCredentialChoice:
+    def test_a_usable_session_is_used_without_the_store(self, stores):
+        stores.session = {USER: _credentials(token="ya29.session")}
+        stores.persistent = {USER: _credentials(token="ya29.store", refresh_token="r")}
+        assert sd._recover_credentials(USER).token == "ya29.session"
+        assert stores.persistent_lookups == []
+
+    def test_a_spent_session_falls_back_to_the_store(self, stores):
+        stores.session = {USER: _credentials(seconds_left=100, token="ya29.session")}
+        stores.persistent = {USER: _credentials(token="ya29.store", refresh_token="r")}
+        assert sd._recover_credentials(USER).token == "ya29.store"
+
+    def test_a_failing_store_keeps_the_session_answer(self, stores, monkeypatch):
+        stores.session = {USER: _credentials(seconds_left=100, token="ya29.session")}
+        monkeypatch.setattr(stores, "get_credential", Mock(side_effect=OSError("db")))
+        assert sd._recover_credentials(USER).token == "ya29.session"

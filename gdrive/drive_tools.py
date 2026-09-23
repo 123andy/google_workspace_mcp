@@ -29,6 +29,7 @@ from core.file_limits import (
     FileTooLargeError,
     download_media_bytes,
     ensure_within_file_size_limit,
+    get_max_file_bytes,
 )
 from core.utils import (
     GOOGLE_API_WRITE_RETRIES,
@@ -586,22 +587,29 @@ async def get_drive_file_download_url(
     # Folders and native types with no export mapping (Forms, Sites, Apps Script,
     # …) have no bytes to stream: they take the normal path, which reports the
     # failure now rather than as an error when the link is fetched.
-    # A stored file's recorded size becomes the link's Content-Length.
+    # A stored file over the size cap would only be refused when fetched; the
+    # normal path handles it as it always has.
     recorded_size = str(file_metadata.get("size") or "")
-    downloadable = mime_type != "application/vnd.google-apps.folder" and (
-        export_mime_type
-        or (
-            not mime_type.startswith("application/vnd.google-apps.")
-            and recorded_size.isdigit()
+    max_file_bytes = get_max_file_bytes()
+    over_cap = (
+        not export_mime_type
+        and max_file_bytes is not None
+        and recorded_size.isdigit()
+        and int(recorded_size) > max_file_bytes
+    )
+    downloadable = (
+        mime_type != "application/vnd.google-apps.folder"
+        and (
+            export_mime_type or not mime_type.startswith("application/vnd.google-apps.")
         )
+        and not over_cap
     )
     offer = signed_downloads.Offer()
     if downloadable:
-        ref = (
-            {"fid": file_id, "emt": export_mime_type}
-            if export_mime_type
-            else {"fid": file_id, "sz": int(recorded_size)}
-        )
+        ref = {
+            "fid": file_id,
+            **({"emt": export_mime_type} if export_mime_type else {}),
+        }
         offer = await signed_downloads.offer_url(
             user_google_email,
             source="drive",

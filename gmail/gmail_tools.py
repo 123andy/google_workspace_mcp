@@ -361,6 +361,10 @@ def _format_message_header_lines(
     return content_lines
 
 
+class EmptyExportError(ValueError):
+    """The message has nothing to export in the requested representation."""
+
+
 async def _render_message_export(
     service, message_id: str, body_format: Literal["text", "html", "raw"]
 ) -> tuple[bytes, str, str, List[str]]:
@@ -378,7 +382,7 @@ async def _render_message_export(
         )
         raw_data = message_raw.get("raw", "")
         if not raw_data:
-            raise ValueError("message has no raw content to export.")
+            raise EmptyExportError("message has no raw content to export.")
         padded_raw = raw_data + "=" * (-len(raw_data) % 4)
         try:
             return base64.urlsafe_b64decode(padded_raw), "message/rfc822", ".eml", notes
@@ -423,7 +427,7 @@ async def _render_message_export(
         extension = ".txt"
 
     if not content_str.strip():
-        raise ValueError("message has no readable body content to export.")
+        raise EmptyExportError("message has no readable body content to export.")
     return content_str.encode("utf-8"), mime_type, extension, notes
 
 
@@ -1002,14 +1006,17 @@ def _attachment_parts(payload: dict) -> List[dict]:
 
 
 def _mask_may_hide_parts(payload: dict) -> bool:
-    """True when a multipart node sits at the fields mask's depth limit, so parts
-    below it — and their places in the attachment order — were not returned."""
+    """True when a container node (multipart or a wrapped message) sits at the
+    fields mask's depth limit, so parts below it — and their places in the
+    attachment order — were not returned."""
     pending = [(payload, 0)]
     while pending:
         part, depth = pending.pop()
         children = part.get("parts") or []
+        mime = (part.get("mimeType") or "").lower()
+        # A wrapped message (message/rfc822) nests its parts too.
         if depth >= _ATTACHMENT_MASK_DEPTH and (
-            (part.get("mimeType") or "").lower().startswith("multipart/")
+            mime.startswith("multipart/") or mime == "message/rfc822"
         ):
             return True
         pending.extend((child, depth + 1) for child in children)
@@ -1090,7 +1097,11 @@ async def _resolve_attachment(
         # "the only attachment" can be trusted to mean the part the caller meant.
         return _ResolvedAttachment(named_count=None)
 
-    if attachment_index is not None and 0 <= attachment_index < len(named):
+    if attachment_index is not None and not 0 <= attachment_index < len(named):
+        # An ordinal that points past the listing names no part; falling back
+        # to "the only attachment" would contradict it.
+        return _ResolvedAttachment(named_count=len(named))
+    if attachment_index is not None:
         matched = named[attachment_index]
         logger.info(
             f"Attachment {attachment_id} not in current metadata (IDs rotate); "
@@ -2486,27 +2497,50 @@ async def get_gmail_attachment_content(
     attachment_id_is_current = False
     max_file_bytes = get_max_file_bytes()
     if max_file_bytes is not None:
-        # The same selection rules the signed path uses, so both agree on which
-        # part the caller means.
-        resolved = await _resolve_attachment(
-            service, message_id, attachment_id, attachment_index=attachment_index
-        )
-        if (
-            resolved.matched_by is None
-            and attachment_index is not None
-            and resolved.named_count is not None
-            and not 0 <= attachment_index < resolved.named_count
-        ):
-            return (
-                f"Error: Invalid attachment_index {attachment_index}. Message "
-                f"has {resolved.named_count} downloadable attachment(s)."
+        try:
+            message_full = await asyncio.to_thread(
+                service.users()
+                .messages()
+                .get(
+                    userId="me",
+                    id=message_id,
+                    format="full",
+                    fields=_ATTACHMENT_METADATA_FIELDS,
+                )
+                .execute
             )
-        if resolved.matched_by:
-            filename = resolved.filename
-            mime_type = resolved.mime_type
-            declared_size = resolved.size
-            download_attachment_id = resolved.attachment_id
-            attachment_id_is_current = True
+            payload = message_full.get("payload", {})
+            attachments = _extract_attachments(payload)
+            matched = _find_attachment_metadata(payload, attachment_id)
+
+            if matched is None and attachment_index is not None:
+                if attachment_index < 0 or attachment_index >= len(attachments):
+                    return (
+                        f"Error: Invalid attachment_index {attachment_index}. Message "
+                        f"has {len(attachments)} downloadable attachment(s)."
+                    )
+                # Gmail can refresh attachment IDs between messages.get calls.
+                # The stable ordinal emitted with the original ID selects the
+                # corresponding current attachment safely.
+                matched = attachments[attachment_index]
+            elif matched is None and len(attachments) == 1:
+                # A single attachment is unambiguous even if Gmail refreshed
+                # its ID since the caller fetched the message.
+                matched = attachments[0]
+
+            if matched is not None:
+                filename = matched.get("filename")
+                mime_type = matched.get("mimeType")
+                declared_size = matched.get("size")
+                download_attachment_id = matched.get("attachmentId", attachment_id)
+                # Only an ID match settles which part is meant for a signed
+                # link; the ordinal and single-attachment picks are re-checked
+                # there against the stricter rules (see _resolve_attachment).
+                attachment_id_is_current = matched.get("attachmentId") is None
+        except Exception:
+            logger.debug(
+                f"Could not fetch attachment metadata for {attachment_id} before download"
+            )
 
         # attachments().get() returns the complete base64 payload in one API
         # response, so there is no opportunity to stop mid-body. If the bounded

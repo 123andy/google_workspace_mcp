@@ -502,22 +502,27 @@ async def test_size_cap_nameless_match_keeps_its_type(enabled, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_size_cap_pass_uses_the_same_rule_as_the_signed_path(
-    enabled, monkeypatch
-):
-    """With the cap on and a rotated ID for the unnamed part, the pre-pass no
-    longer settles on the only *named* attachment: both paths refuse to guess,
-    so no link is minted for someone else's bytes."""
+async def test_size_cap_pass_pick_is_rechecked_before_minting(enabled, monkeypatch):
+    """With the cap on and a rotated ID, upstream's pre-pass still settles on the
+    only *named* attachment for its own download. A link needs more certainty:
+    with an unnamed part also present it cannot tell which was meant, so none is
+    minted and the upstream path answers."""
     monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", "10485760")
+    monkeypatch.setattr("auth.oauth_config.is_stateless_mode", lambda: True)
+    service = _inline_image_and_pdf_service()
+    service.users().messages().attachments().get().execute.return_value = {
+        "size": 5,
+        "data": base64.urlsafe_b64encode(b"bytes").decode(),
+    }
     with patch.object(sd, "offer_url", new_callable=AsyncMock) as offer:
         result = await _unwrap(get_gmail_attachment_content)(
-            service=_inline_image_and_pdf_service(),
+            service=service,
             message_id="msg-1",
             attachment_id="att-ROTATED",
             user_google_email=USER,
         )
     offer.assert_not_called()
-    assert "Could not verify the attachment size" in result
+    assert "not in the message's current metadata" in result
 
 
 @pytest.mark.asyncio
@@ -625,3 +630,40 @@ async def test_stored_copies_keep_upstreams_naming(monkeypatch):
         user_google_email=USER,
     )
     assert saved.get("filename") == "contract.pdf", result
+
+
+@pytest.mark.asyncio
+async def test_a_wrapped_message_at_the_mask_depth_also_blocks_fallbacks():
+    """A forwarded message (message/rfc822) nests parts just like multipart."""
+    from gmail.gmail_tools import _mask_may_hide_parts
+
+    node = {"mimeType": "multipart/mixed", "parts": []}
+    deepest = node
+    for _ in range(5):
+        child = {"mimeType": "multipart/mixed", "parts": []}
+        deepest["parts"].append(child)
+        deepest = child
+    deepest["parts"].append({"mimeType": "message/rfc822", "filename": ""})
+    assert _mask_may_hide_parts(node) is True
+
+
+@pytest.mark.asyncio
+async def test_an_out_of_range_index_is_never_read_as_the_only_attachment(enabled):
+    from gmail.gmail_tools import _resolve_attachment
+
+    service = Mock()
+    service.users().messages().get().execute.return_value = {
+        "payload": {
+            "parts": [
+                {
+                    "filename": "solo.pdf",
+                    "mimeType": "application/pdf",
+                    "body": {"attachmentId": "new-solo", "size": 9},
+                }
+            ]
+        }
+    }
+    resolved = await _resolve_attachment(
+        service, "msg-1", "old-solo", attachment_index=5
+    )
+    assert resolved.matched_by is None and resolved.named_count == 1

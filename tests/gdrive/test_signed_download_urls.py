@@ -69,8 +69,7 @@ async def test_binary_file_has_no_export_claim(download, enabled):
             user_google_email=USER,
             file_id="v-1",
         )
-    # The recorded size rides in the token and becomes the Content-Length.
-    assert offer.call_args.kwargs["ref"] == {"fid": "v-1", "sz": 300}
+    assert offer.call_args.kwargs["ref"] == {"fid": "v-1"}
     assert offer.call_args.kwargs["mime_type"] == "video/mp4"
 
 
@@ -149,12 +148,14 @@ async def test_items_with_no_bytes_get_no_link(download, enabled, mime):
 
 @pytest.mark.asyncio
 @patch("gdrive.drive_tools._download_file_to_temp", new_callable=AsyncMock)
-async def test_a_stored_file_without_a_recorded_size_gets_no_link(download, enabled):
+async def test_a_file_over_the_size_cap_gets_no_link(download, enabled, monkeypatch):
+    """The route would refuse it on fetch; the normal path handles it now."""
+    monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", "100")
     download.side_effect = RuntimeError("normal path")
     with patch.object(sd, "offer_url", new_callable=AsyncMock) as offer:
         with pytest.raises(RuntimeError):
             await _unwrap(get_drive_file_download_url)(
-                service=_service("video/mp4", "clip.mp4", size=None),
+                service=_service("video/mp4", "clip.mp4", size="300"),
                 user_google_email=USER,
                 file_id="v-1",
             )
