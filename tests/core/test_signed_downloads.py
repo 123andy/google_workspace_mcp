@@ -866,7 +866,7 @@ class TestOfferUrl:
         assert not offer and offer.reason == sd.SHORT_LIVED_CREDENTIALS
 
     def test_no_url_when_no_key_can_be_derived(self, monkeypatch):
-        monkeypatch.setattr(sd, "_recover_credentials", lambda email: _credentials())
+        monkeypatch.setattr(sd, "_credential_candidates", lambda e: [_credentials()])
         monkeypatch.setattr(
             sd, "_signing_key", Mock(side_effect=RuntimeError("no key"))
         )
@@ -879,7 +879,7 @@ class TestOfferUrl:
 
     def test_a_long_filename_is_shortened_not_refused(self, monkeypatch):
         """Sender-controlled names must not push the token past the route's cap."""
-        monkeypatch.setattr(sd, "_recover_credentials", lambda email: _credentials())
+        monkeypatch.setattr(sd, "_credential_candidates", lambda e: [_credentials()])
         offer = _run(
             sd.offer_url(
                 USER,
@@ -1006,7 +1006,11 @@ class TestServe:
             return creds if email == USER else None
 
         monkeypatch.setitem(sd._FETCHERS, "gmail", fetcher)
-        monkeypatch.setattr(sd, "_recover_credentials", recover)
+        monkeypatch.setattr(
+            sd,
+            "_credential_candidates",
+            lambda email: [c] if (c := recover(email)) is not None else [],
+        )
         seen["creds"] = creds
         return seen
 
@@ -1231,11 +1235,12 @@ class TestDriveFetcher:
         assert b"".join([c async for c in result.stream]) == self.PAYLOAD
 
     @pytest.mark.asyncio
-    async def test_a_buffered_export_is_size_capped(self, drive, monkeypatch):
+    async def test_an_export_is_not_size_capped(self, drive, monkeypatch):
+        """Google's 10 MB export limit already bounds the buffer, so a link is
+        never minted that the size cap would then refuse."""
         monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", "10")
-        with pytest.raises(sd.SignedDownloadError) as caught:
-            await sd._fetch_drive({"fid": "D", "emt": "application/pdf"}, Mock())
-        assert caught.value.status == 413
+        result = await sd._fetch_drive({"fid": "D", "emt": "application/pdf"}, Mock())
+        assert result.content == self.PAYLOAD
 
     @pytest.mark.asyncio
     async def test_unknown_total_streams_without_a_length(self, monkeypatch):
@@ -1312,7 +1317,7 @@ class TestDriveFetcher:
         from starlette.routing import Route
 
         monkeypatch.setenv(sd.FLAG_ENV, "true")
-        monkeypatch.setattr(sd, "_recover_credentials", lambda email: _credentials())
+        monkeypatch.setattr(sd, "_credential_candidates", lambda e: [_credentials()])
 
         class PassThrough(BaseHTTPMiddleware):
             async def dispatch(self, request, call_next):
@@ -1757,56 +1762,60 @@ class TestLimitsLoggingAndStartup:
     def test_media_types_from_metadata_are_sanitised(self, value, served):
         assert sd._safe_media_type(value) == served
 
-    def test_access_log_lines_never_carry_a_token(self):
-        record = logging.LogRecord(
-            "uvicorn.access",
-            logging.INFO,
-            __file__,
-            1,
-            '%s - "%s %s HTTP/%s" %d',
-            (
-                "1.2.3.4",
-                "GET",
-                "/attachments/signed/gAAAAABsecretTokenBody?x",
-                "1.1",
-                200,
-            ),
-            None,
-        )
-        sd._RedactSignedTokens().filter(record)
-        line = record.getMessage()
-        assert "secretTokenBody" not in line
-        assert "/attachments/signed/<redacted>" in line
-
-    def test_the_route_pattern_in_documentation_lines_is_left_alone(self):
-        record = logging.LogRecord(
-            "x",
-            logging.INFO,
-            __file__,
-            1,
-            "/attachments/signed/* must be public",
-            (),
-            None,
-        )
-        sd._RedactSignedTokens().filter(record)
-        assert record.getMessage() == "/attachments/signed/* must be public"
-
-    def test_every_log_record_is_redacted_once_installed(self):
-        """Through the record factory, so any logger and any handler — even one
-        added after startup — sees the redacted text."""
+    @pytest.fixture
+    def redacting(self):
+        """Install redaction for one test, then put the process's factory back."""
+        previous = logging.getLogRecordFactory()
         sd.install_access_log_redaction()
-        sd.install_access_log_redaction()  # idempotent
+        yield
+        logging.setLogRecordFactory(previous)
+
+    @pytest.mark.parametrize(
+        "msg, args",
+        [
+            (
+                '%s "%s %s"',
+                ("1.2.3.4", "GET", "/attachments/signed/gAAAAABsecretTokenXYZ"),
+            ),
+            ("%(p)s", {"p": "/attachments/signed/gAAAAABsecretTokenXYZ"}),
+            ({"path": "/attachments/signed/gAAAAABsecretTokenXYZ"}, ()),
+            ("/attachments/signed/%s", ("gAAAAABsecretTokenXYZ",)),
+        ],
+        ids=["access-log", "dict-args", "dict-msg", "split-across-msg-and-args"],
+    )
+    def test_no_message_shape_carries_a_token(self, redacting, msg, args):
         seen = []
 
         class Capture(logging.Handler):
             def emit(self, record):
                 seen.append(record.getMessage())
 
-        late = logging.getLogger("some.later.logger")
-        late.addHandler(Capture())
-        late.setLevel(logging.INFO)
-        late.info("GET %s", "/attachments/signed/gAAAAABsecretTokenBodyXYZ")
-        assert seen == ["GET /attachments/signed/<redacted>"]
+        target = logging.getLogger("signed.redaction.test")
+        handler = Capture()
+        target.addHandler(handler)  # added after install: still covered
+        target.setLevel(logging.INFO)
+        try:
+            target.info(msg, *(args if isinstance(args, tuple) else (args,)))
+        finally:
+            target.removeHandler(handler)
+        assert "secretToken" not in seen[0] and "<redacted>" in seen[0]
+
+    def test_the_route_pattern_in_documentation_lines_is_left_alone(self):
+        assert (
+            sd._redact("/attachments/signed/* must be public")
+            == "/attachments/signed/* must be public"
+        )
+
+    def test_startup_installs_redaction_and_survives_a_replaced_factory(self):
+        previous = logging.getLogRecordFactory()
+        try:
+            sd.validate_startup("streamable-http")
+            assert logging.getLogRecordFactory()._redacts_signed_links
+            logging.setLogRecordFactory(logging.LogRecord)  # someone replaced it
+            sd.install_access_log_redaction()
+            assert logging.getLogRecordFactory()._redacts_signed_links
+        finally:
+            logging.setLogRecordFactory(previous)
 
     def test_external_provider_mode_refuses(self, monkeypatch):
         monkeypatch.setattr(
@@ -1998,3 +2007,37 @@ class TestProductionPaths:
         with pytest.raises(ValueError):
             await sd.serve(_token(_mint()))
         assert closed == [True] and sd._owner_downloads == {}
+
+
+class TestCredentialFallback:
+    @pytest.fixture(autouse=True)
+    def _on(self, monkeypatch):
+        monkeypatch.setenv(sd.FLAG_ENV, "true")
+
+    @pytest.mark.asyncio
+    async def test_a_revoked_stored_grant_falls_back_to_the_session_token(
+        self, stores, fetcher, token_endpoint
+    ):
+        """The stored grant ranks first because it can refresh; when its refresh
+        token turns out to be revoked, the working session token serves the link."""
+        _, outcome = token_endpoint
+        outcome.update(status=400, body={"error": "invalid_grant"})
+        stores.session = {USER: _credentials(seconds_left=3000, token="ya29.session")}
+        stores.persistent = {
+            USER: _credentials(seconds_left=100, token="ya29.old", refresh_token="1//x")
+        }
+        offer = await sd.offer_url(USER, source="gmail", ref={"mid": "m", "aid": "a"})
+        response = await _serve(_token(offer.url))
+        assert response.status_code == 200 and fetcher["token"] == "ya29.session"
+
+    @pytest.mark.asyncio
+    async def test_with_nothing_else_to_try_a_failed_refresh_is_401(
+        self, stores, fetcher, token_endpoint
+    ):
+        _, outcome = token_endpoint
+        outcome.update(status=400, body={"error": "invalid_grant"})
+        stores.persistent = {
+            USER: _credentials(seconds_left=100, token="ya29.old", refresh_token="1//x")
+        }
+        response = await _serve(_token(_mint()))
+        assert response.status_code == 401 and "token" not in fetcher

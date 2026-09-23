@@ -1043,8 +1043,6 @@ async def _resolve_attachment(
     attachment_id: str,
     size_bytes: Optional[int] = None,
     attachment_index: Optional[int] = None,
-    *,
-    naming_only: bool = False,
 ) -> _ResolvedAttachment:
     """Best-effort name, MIME type, size and *current* ID for an attachment.
 
@@ -1054,12 +1052,9 @@ async def _resolve_attachment(
     emitted next to the ID, stable across rotation), then the one attachment part
     of ``size_bytes`` when that size is known, then the message's only attachment
     part. No fallback is tried when the metadata mask may have cut off parts, since
-    those would shift the order and could be the part meant. A fallback never picks a named part while an unnamed one
-    could be the one meant, so it cannot swap one part's bytes for another's.
-
-    ``naming_only`` is for bytes already downloaded by the caller's ID: it keeps
-    upstream's looser rules (size and only-attachment among named parts), since
-    it only labels a file and cannot change which bytes were fetched.
+    those would shift the order and could be the part meant. A fallback never
+    picks a named part while an unnamed one could be the one meant, so it cannot
+    swap one part's bytes for another's.
     """
     try:
         message_full = await asyncio.to_thread(
@@ -1092,13 +1087,13 @@ async def _resolve_attachment(
             len(named),
         )
 
-    if not naming_only and _mask_may_hide_parts(payload):
+    if _mask_may_hide_parts(payload):
         # Parts below the mask are invisible here, so neither an ordinal nor
         # "the only attachment" can be trusted to mean the part the caller meant.
         return _ResolvedAttachment(named_count=None)
 
     index_in_range = attachment_index is not None and 0 <= attachment_index < len(named)
-    if attachment_index is not None and not index_in_range and not naming_only:
+    if attachment_index is not None and not index_in_range:
         # An ordinal that points past the listing names no part; falling back
         # to "the only attachment" would contradict it.
         return _ResolvedAttachment(named_count=len(named))
@@ -1111,9 +1106,8 @@ async def _resolve_attachment(
         )
         return _resolved(matched, "index", len(named))
 
-    # naming_only keeps upstream's rules over named parts; otherwise every part
-    # with an attachment ID counts, named or not.
-    parts = named if naming_only else _attachment_parts(payload)
+    # Every part with an attachment ID counts, named or not.
+    parts = _attachment_parts(payload)
 
     def size_of(part):
         return part.get("size", (part.get("body") or {}).get("size"))
@@ -2691,18 +2685,47 @@ async def get_gmail_attachment_content(
         # If the pre-download metadata fetch missed the filename, try again
         # with the full nested MIME tree and size-based fallback heuristics.
         if not filename:
-            # Naming only: the bytes are already in hand from the download above,
-            # so the current ID this may report has nothing left to select.
-            resolved = await _resolve_attachment(
-                service,
-                message_id,
-                attachment_id,
-                size_bytes,
-                attachment_index=attachment_index,
-                naming_only=True,
-            )
-            if resolved.filename or resolved.mime_type:
-                filename, mime_type = resolved.filename, resolved.mime_type
+            try:
+                message_full = await asyncio.to_thread(
+                    service.users()
+                    .messages()
+                    .get(
+                        userId="me",
+                        id=message_id,
+                        format="full",
+                        fields=_ATTACHMENT_METADATA_FIELDS,
+                    )
+                    .execute
+                )
+                payload = message_full.get("payload", {})
+                attachments = _extract_attachments(payload)
+
+                for att in attachments:
+                    if att.get("attachmentId") == attachment_id:
+                        filename = att.get("filename")
+                        mime_type = att.get("mimeType")
+                        break
+
+                if not filename and attachments:
+                    size_matches = [
+                        att
+                        for att in attachments
+                        if att.get("size") and abs(att["size"] - size_bytes) < 100
+                    ]
+                    if len(size_matches) == 1:
+                        filename = size_matches[0].get("filename")
+                        mime_type = size_matches[0].get("mimeType")
+                        logger.warning(
+                            f"Attachment {attachment_id} matched by size fallback as '{filename}'"
+                        )
+
+                if not filename and len(attachments) == 1:
+                    filename = attachments[0].get("filename")
+                    mime_type = attachments[0].get("mimeType")
+            except Exception:
+                logger.debug(
+                    f"Could not fetch attachment metadata for {attachment_id}, using defaults"
+                )
 
         # Save attachment to local disk
         result = storage.save_attachment(

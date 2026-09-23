@@ -19,13 +19,9 @@ def _unwrap(tool):
     return fn
 
 
-def _service(mime="application/vnd.google-apps.document", name="Plan", size="300"):
+def _service(mime="application/vnd.google-apps.document", name="Plan"):
     service = Mock()
-    service.files().get().execute.return_value = {
-        "name": name,
-        "mimeType": mime,
-        **({"size": size} if size is not None else {}),
-    }
+    service.files().get().execute.return_value = {"name": name, "mimeType": mime}
     return service
 
 

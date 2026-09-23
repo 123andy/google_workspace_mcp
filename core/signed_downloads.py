@@ -190,44 +190,51 @@ def validate_startup(
     )
 
 
-class _RedactSignedTokens(logging.Filter):
-    """A link's token is a bearer credential for its lifetime; request logs (the
-    server's access log above all) record the path, so replace the token there."""
-
-    # Tokens are URL-safe base64 and far longer than any placeholder like "*".
-    _TOKEN = re.compile(r"(/attachments/signed/)[A-Za-z0-9_\-]{16,}=*")
-
-    def _redact(self, value):
-        return (
-            self._TOKEN.sub(r"\1<redacted>", value) if isinstance(value, str) else value
-        )
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = self._redact(record.msg)
-        if isinstance(record.args, tuple):
-            record.args = tuple(self._redact(arg) for arg in record.args)
-        return True
+_SIGNED_PATH = "/attachments/signed/"
+# Tokens are URL-safe base64 and far longer than any placeholder like "*".
+_TOKEN = re.compile(r"(/attachments/signed/)[A-Za-z0-9_\-]{16,}=*")
 
 
-_redaction_installed = False
+def _redact(text: str) -> str:
+    return _TOKEN.sub(r"\1<redacted>", text) if _SIGNED_PATH in text else text
 
 
 def install_access_log_redaction() -> None:
-    """Redact link tokens from every log record, whichever logger or handler
-    emits it — including handlers added after startup — by wrapping the record
-    factory. Idempotent; run once the feature is known to be on."""
-    global _redaction_installed
-    if _redaction_installed:
-        return
-    _redaction_installed = True
-    redact = _RedactSignedTokens()
+    """A link's token is a bearer credential for its lifetime, and request logs
+    record the path. Every record's formatted message is redacted — whatever the
+    logger, handler, message type or argument shapes, and for handlers added
+    later — by wrapping the log-record factory. Idempotent; run once the feature
+    is known to be on, and again if something replaced the factory since."""
     previous = logging.getLogRecordFactory()
+    if getattr(previous, "_redacts_signed_links", False):
+        return
 
     def factory(*args, **kwargs):
         record = previous(*args, **kwargs)
-        redact.filter(record)
+        # Formatters that read the raw arguments (uvicorn's access formatter
+        # builds its request line from them) see them redacted...
+        if isinstance(record.msg, str):
+            record.msg = _redact(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                _redact(a) if isinstance(a, str) else a for a in record.args
+            )
+        elif isinstance(record.args, dict):
+            record.args = {
+                k: _redact(v) if isinstance(v, str) else v
+                for k, v in record.args.items()
+            }
+        # ...and every formatted message is redacted whole, which also covers
+        # non-string arguments and a token split across format and arguments.
+        format_message = record.getMessage
+
+        def get_message() -> str:
+            return _redact(format_message())
+
+        record.getMessage = get_message
         return record
 
+    factory._redacts_signed_links = True
     logging.setLogRecordFactory(factory)
 
 
@@ -427,38 +434,45 @@ def verify_token(token: str) -> Optional[dict]:
     return claims
 
 
-def _recover_credentials(user_email: str) -> Optional[Credentials]:
-    """The owner's credentials, preferring ones the route can refresh: the
-    session store's if refreshable, else the persistent store's if refreshable,
-    else whichever access token lasts longer (a session entry built from a bare
-    access token must not hide a refreshable stored grant). The persistent store
-    is skipped in stateless mode, and a failure in one store never discards the
-    other's answer.
+def _credential_candidates(user_email: str) -> list:
+    """The owner's credentials, most preferred first: a refreshable grant (the
+    session's, else the persistent store's) ahead of bare access tokens, and
+    between bare tokens the longer-lived. A session entry built from a bare
+    access token must not hide a refreshable stored grant — but that grant's
+    refresh token may have been revoked, so the others stay available as
+    fallbacks. The persistent store is skipped in stateless mode; a failure in
+    one store never discards the other's answer.
 
     Read-only. Both stores hand back a fresh ``Credentials`` object, so refreshing
-    it later never reaches storage. The tool and the route both use this lookup,
-    so a URL is only offered where the route can recover the owner.
-    """
+    it later never reaches storage."""
     from auth.credential_store import get_credential_store
     from auth.oauth21_session_store import get_oauth21_session_store
     from auth.oauth_config import is_stateless_mode
 
+    found = []
     try:
         session = get_oauth21_session_store().get_credentials(user_email)
+        if session is not None:
+            found.append(session)
     except Exception as exc:
         logger.debug("Session store lookup failed for %s: %s", user_email, exc)
-        session = None
-    if is_stateless_mode() or (session is not None and _refreshable(session)):
-        return session
-    try:
-        stored = get_credential_store().get_credential(user_email)
-    except Exception as exc:
-        logger.debug("Credential store lookup failed for %s: %s", user_email, exc)
-        return session
-    if stored is not None and _refreshable(stored):
-        return stored
-    candidates = [c for c in (session, stored) if c is not None]
-    return max(candidates, key=usable_seconds, default=None)
+    if not is_stateless_mode() and not (found and _refreshable(found[0])):
+        try:
+            stored = get_credential_store().get_credential(user_email)
+            if stored is not None:
+                found.append(stored)
+        except Exception as exc:
+            logger.debug("Credential store lookup failed for %s: %s", user_email, exc)
+    # Stable sort: refreshable first, then by remaining life; the session wins ties.
+    return sorted(found, key=lambda c: (not _refreshable(c), -usable_seconds(c)))
+
+
+def _recover_credentials(user_email: str) -> Optional[Credentials]:
+    """The owner's most preferred credentials (see ``_credential_candidates``).
+    The tool and the route both use this ranking, so a URL is only offered where
+    the route can recover the owner."""
+    candidates = _credential_candidates(user_email)
+    return candidates[0] if candidates else None
 
 
 @dataclass(frozen=True)
@@ -730,10 +744,10 @@ async def _fetch_gmail_message(
 async def _fetch_drive(claims: dict, credentials: Credentials) -> DownloadResult:
     """A Drive file; ``emt`` set means export a native file.
 
-    Exports are buffered: Google caps them at 10 MB, and buffering turns a failure
-    anywhere in the body into an error status (the file size limit applies to
-    them, as to every buffered body). Stored files stream in bounded chunks, one
-    in memory at a time, so no size limit applies, with a ``Content-Length``
+    Exports are buffered: Google caps them at 10 MB, which bounds their memory as
+    the file size limit would, and buffering turns a failure anywhere in the body
+    into an error status. Stored files stream in bounded chunks, one in memory at
+    a time, so no size limit applies either, with a ``Content-Length``
     taken from the first chunk's response (the exact size Google is serving now):
     a stream that fails partway ends short of it and the client sees an
     incomplete transfer rather than a complete-looking file (middleware between
@@ -774,9 +788,7 @@ async def _fetch_drive(claims: dict, credentials: Credentials) -> DownloadResult
         finally:
             _close_service(drive)
         return DownloadResult(
-            filename=filename,
-            media_type=media_type,
-            content=_within_file_limit(b"".join(parts), "export"),
+            filename=filename, media_type=media_type, content=b"".join(parts)
         )
 
     # Pull the first chunk eagerly so auth / not-found errors become an error
@@ -888,33 +900,41 @@ def _slots() -> asyncio.Semaphore:
 async def _usable_credentials(user_email: str) -> Optional[Credentials]:
     """The owner's credentials ready to call Google with, or None.
 
-    A stored access token that has lapsed is refreshed in memory only, and the
-    refreshed copy is reused for later fetches while it stays valid and its
-    refresh token still matches the stored one (a re-consent replaces it)."""
-    credentials = await asyncio.to_thread(_recover_credentials, user_email)
-    if credentials is None or usable_seconds(credentials) <= 0:
-        return None
-    if credentials.valid:
-        return credentials
-    cached = _refreshed.get(user_email)
-    if (
-        cached is not None
-        and cached.valid
-        and cached.refresh_token == credentials.refresh_token
-    ):
+    Candidates are tried in preference order. A lapsed access token is refreshed
+    in memory only, and the refreshed copy is reused for later fetches while it
+    stays valid and its refresh token still matches the stored one (a re-consent
+    replaces it). When a refresh fails — a revoked or rotated refresh token — the
+    next candidate is tried; only if none can be used does this raise."""
+    candidates = await asyncio.to_thread(_credential_candidates, user_email)
+    failure: Optional[Exception] = None
+    for credentials in candidates:
+        if usable_seconds(credentials) <= 0:
+            continue
+        if credentials.valid:
+            return credentials
+        cached = _refreshed.get(user_email)
+        if (
+            cached is not None
+            and cached.valid
+            and cached.refresh_token == credentials.refresh_token
+        ):
+            _refreshed.move_to_end(user_email)
+            return cached
+        # usable_seconds() > 0 with an invalid token means refreshable.
+        try:
+            await asyncio.to_thread(credentials.refresh, Request())
+        except Exception as exc:
+            logger.warning("Signed download: credential refresh failed: %s", exc)
+            failure = exc
+            continue
+        _refreshed[user_email] = credentials
         _refreshed.move_to_end(user_email)
-        return cached
-    # usable_seconds() > 0 with an invalid token means refreshable.
-    try:
-        await asyncio.to_thread(credentials.refresh, Request())
-    except Exception as exc:
-        logger.warning("Signed download: credential refresh failed: %s", exc)
-        raise
-    _refreshed[user_email] = credentials
-    _refreshed.move_to_end(user_email)
-    while len(_refreshed) > _REFRESHED_CACHE_SIZE:
-        _refreshed.popitem(last=False)
-    return credentials
+        while len(_refreshed) > _REFRESHED_CACHE_SIZE:
+            _refreshed.popitem(last=False)
+        return credentials
+    if failure is not None:
+        raise failure
+    return None
 
 
 class _Guarded:
@@ -934,8 +954,8 @@ class _Guarded:
                 body = getattr(self, "body_iterator", None)
                 if body is not None and hasattr(body, "aclose"):
                     await body.aclose()
-            except BaseException:
-                pass
+            except Exception as exc:
+                logger.debug("Signed download: closing the body failed: %s", exc)
             finally:
                 self._on_close()
 

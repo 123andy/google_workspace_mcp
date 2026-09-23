@@ -670,24 +670,53 @@ async def test_an_out_of_range_index_is_never_read_as_the_only_attachment(enable
 
 
 @pytest.mark.asyncio
-async def test_naming_a_stored_copy_ignores_an_out_of_range_index():
-    """Upstream's naming never read the index; an agent passing a 1-based number
-    still gets the file named."""
-    from gmail.gmail_tools import _resolve_attachment
+async def test_a_stored_copy_is_named_by_its_size_not_a_wrong_index(monkeypatch):
+    """The bytes were fetched by the caller's ID; their size names them. An
+    index (here 1-based by mistake) does not override that."""
+    monkeypatch.delenv("WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS", raising=False)
+    monkeypatch.delenv("WORKSPACE_MCP_MAX_FILE_BYTES", raising=False)
+    monkeypatch.setattr("auth.oauth_config.is_stateless_mode", lambda: False)
+    saved = {}
 
+    class Storage:
+        def save_attachment(self, base64_data, filename=None, mime_type=None):
+            saved.update(filename=filename)
+            return type("R", (), {"path": "/tmp/x", "file_id": "f1"})()
+
+    monkeypatch.setattr(
+        "core.attachment_storage.get_attachment_storage", lambda: Storage()
+    )
+    monkeypatch.setattr(
+        "core.attachment_storage.get_attachment_url", lambda fid: f"/a/{fid}"
+    )
+    monkeypatch.setattr("core.config.get_transport_mode", lambda: "streamable-http")
+    photo = b"p" * 5000
     service = Mock()
     service.users().messages().get().execute.return_value = {
         "payload": {
             "parts": [
                 {
-                    "filename": "solo.pdf",
+                    "filename": "photo.jpg",
+                    "mimeType": "image/jpeg",
+                    "body": {"attachmentId": "new-photo", "size": 5000},
+                },
+                {
+                    "filename": "invoice.pdf",
                     "mimeType": "application/pdf",
-                    "body": {"attachmentId": "new-solo", "size": 9},
-                }
+                    "body": {"attachmentId": "new-invoice", "size": 90000},
+                },
             ]
         }
     }
-    resolved = await _resolve_attachment(
-        service, "msg-1", "old-solo", 9, attachment_index=1, naming_only=True
+    service.users().messages().attachments().get().execute.return_value = {
+        "size": len(photo),
+        "data": base64.urlsafe_b64encode(photo).decode(),
+    }
+    await _unwrap(get_gmail_attachment_content)(
+        service=service,
+        message_id="msg-1",
+        attachment_id="old-photo",
+        user_google_email=USER,
+        attachment_index=1,
     )
-    assert resolved.filename == "solo.pdf"
+    assert saved["filename"] == "photo.jpg"
