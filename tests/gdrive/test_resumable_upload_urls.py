@@ -19,6 +19,7 @@ from googleapiclient.errors import HttpError
 from fastmcp import Client, FastMCP
 
 from core.utils import (
+    GOOGLE_API_WRITE_RETRIES,
     UserInputError,
     handle_http_errors,
     hide_local_file_args,
@@ -62,6 +63,12 @@ def _service(status=200, location=UPLOAD_URL):
     return service
 
 
+@pytest.fixture
+def retry_sleep():
+    with patch("googleapiclient.http.time.sleep") as sleep:
+        yield sleep
+
+
 @pytest.fixture(autouse=True)
 def local_files_disabled(monkeypatch):
     """return_upload_url exists for servers that cannot see the caller's disk
@@ -94,10 +101,10 @@ async def test_create_opens_post_session_and_creates_nothing_else(folder):
         return_upload_url=True,
     )
 
-    (url,), kwargs = service._http.request.call_args
+    (url, method), kwargs = service._http.request.call_args
     assert url.startswith("https://www.googleapis.com/upload/drive/v3/files?")
     assert "uploadType=resumable" in url and "supportsAllDrives=true" in url
-    assert kwargs["method"] == "POST"
+    assert method == "POST"
     assert kwargs["headers"]["X-Upload-Content-Type"] == "application/pdf"
     assert json.loads(kwargs["body"]) == {
         "name": "report.pdf",
@@ -192,9 +199,9 @@ async def test_update_session_carries_the_metadata(resolve_item):
         return_upload_url=True,
     )
 
-    (url,), kwargs = service._http.request.call_args
+    (url, method), kwargs = service._http.request.call_args
     assert url.startswith("https://www.googleapis.com/upload/drive/v3/files/file123?")
-    assert kwargs["method"] == "PATCH"
+    assert method == "PATCH"
     assert kwargs["headers"]["X-Upload-Content-Type"] == "text/markdown"
     # No mimeType: Drive rejects a metadata mimeType change on a native file.
     assert json.loads(kwargs["body"]) == {"name": "Renamed"}
@@ -204,7 +211,7 @@ async def test_update_session_carries_the_metadata(resolve_item):
 
 @pytest.mark.asyncio
 @patch("gdrive.drive_tools.resolve_drive_item", new_callable=AsyncMock)
-async def test_update_initiation_failure_applies_no_metadata(resolve_item):
+async def test_update_initiation_failure_applies_no_metadata(resolve_item, retry_sleep):
     resolve_item.return_value = (
         "f1",
         {"name": "notes.md", "mimeType": "text/markdown"},
@@ -333,8 +340,8 @@ async def test_update_without_metadata_sends_an_empty_session_body(resolve_item)
         return_upload_url=True,
     )
 
-    kwargs = service._http.request.call_args.kwargs
-    assert kwargs["method"] == "PATCH"
+    (_, method), kwargs = service._http.request.call_args
+    assert method == "PATCH"
     assert json.loads(kwargs["body"]) == {}
     service.files.return_value.update.assert_not_called()
 
@@ -358,7 +365,7 @@ async def test_update_parent_moves_ride_on_the_session_url(
         return_upload_url=True,
     )
 
-    (url,), kwargs = service._http.request.call_args
+    (url, method), kwargs = service._http.request.call_args
     assert "addParents=resolved-new" in url
     assert "removeParents=resolved-old" in url
     assert json.loads(kwargs["body"]) == {}
@@ -462,8 +469,8 @@ async def test_import_session_converts_source_to_target(
         return_upload_url=True,
     )
 
-    (url,), kwargs = service._http.request.call_args
-    assert kwargs["method"] == "POST" and "uploadType=resumable" in url
+    (url, method), kwargs = service._http.request.call_args
+    assert method == "POST" and "uploadType=resumable" in url
     body = json.loads(kwargs["body"])
     assert body == {"name": "Report", "parents": ["folder123"], "mimeType": target_mime}
     assert kwargs["headers"]["X-Upload-Content-Type"] == source_mime
@@ -565,6 +572,80 @@ async def test_session_initiation_errors_are_reported():
         await initiate_resumable_upload_session(
             _service(location=None), upload_mime_type="text/plain", file_metadata={}
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("file_id", [None, "file123"], ids=["create", "update"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        (httplib2.Response({"status": "503"}), b""),
+        (httplib2.Response({"status": "429"}), b""),
+        (
+            httplib2.Response({"status": "403"}),
+            b'{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}',
+        ),
+        ConnectionResetError("connection reset"),
+    ],
+    ids=["server-error", "throttled", "rate-limit", "connection-reset"],
+)
+async def test_session_initiation_recovers_from_transient_failure(
+    retry_sleep, file_id, failure
+):
+    service = _service()
+    service._http.request.side_effect = [failure, _session_response()]
+
+    result = await initiate_resumable_upload_session(
+        service,
+        upload_mime_type="application/pdf",
+        file_metadata={"name": "report.pdf"},
+        file_id=file_id,
+    )
+
+    assert result == UPLOAD_URL
+    assert service._http.request.call_count == 2
+    first, second = service._http.request.call_args_list
+    assert first == second  # Preserve metadata and method across the retry.
+    assert first.args[1] == ("PATCH" if file_id else "POST")
+    retry_sleep.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_session_initiation_stops_at_retry_limit(retry_sleep):
+    service = _service()
+    error_body = b'{"error":{"message":"still unavailable"}}'
+    service._http.request.return_value = (
+        httplib2.Response({"status": "503"}),
+        error_body,
+    )
+
+    with pytest.raises(HttpError, match="still unavailable") as exc:
+        await initiate_resumable_upload_session(
+            service, upload_mime_type="application/pdf"
+        )
+
+    assert exc.value.resp.status == 503
+    assert exc.value.content == error_body
+    assert service._http.request.call_count == GOOGLE_API_WRITE_RETRIES + 1
+    assert retry_sleep.call_count == GOOGLE_API_WRITE_RETRIES
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 401, 403])
+async def test_session_initiation_does_not_retry_permanent_errors(retry_sleep, status):
+    service = _service()
+    service._http.request.return_value = (
+        httplib2.Response({"status": str(status)}),
+        b'{"error":{"errors":[{"reason":"insufficientPermissions"}]}}',
+    )
+
+    with pytest.raises(HttpError):
+        await initiate_resumable_upload_session(
+            service, upload_mime_type="application/pdf"
+        )
+
+    service._http.request.assert_called_once()
+    retry_sleep.assert_not_called()
 
 
 class TestOfferedOnlyWithoutLocalFiles:

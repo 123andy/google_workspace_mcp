@@ -24,7 +24,7 @@ from weakref import WeakValueDictionary
 
 import httpx
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+from googleapiclient.http import HttpRequest, MediaIoBaseDownload, MediaIoBaseUpload
 
 from auth.service_decorator import require_google_service
 from core.file_limits import download_media_bytes
@@ -792,17 +792,22 @@ async def initiate_resumable_upload_session(
     params = {"uploadType": "resumable", "supportsAllDrives": "true", **(query or {})}
     url = f"{RESUMABLE_UPLOAD_BASE}{path}?{urlencode(params)}"
     # service._http is the discovery Resource's private handle on the user's
-    # AuthorizedHttp; the client library has no public call for a raw resumable
-    # initiation, so this depends on that attribute name.
-    response, content = await asyncio.to_thread(
-        service._http.request,
-        url,
+    # AuthorizedHttp. Use HttpRequest for the same bounded retry policy as other
+    # uploads, keeping the response headers because initiation has an empty body.
+    # Retrying only opens another session; no file is written until the client PUT.
+    request = HttpRequest(
+        service._http,
+        postproc=lambda response, content: (response, content),
+        uri=url,
         method="PATCH" if file_id else "POST",
         body=json.dumps(file_metadata or {}),
         headers={
             "Content-Type": "application/json; charset=UTF-8",
             "X-Upload-Content-Type": upload_mime_type,
         },
+    )
+    response, content = await asyncio.to_thread(
+        request.execute, num_retries=GOOGLE_API_WRITE_RETRIES
     )
     status = int(response.status)
     if status not in (200, 201):
@@ -845,7 +850,7 @@ def resumable_upload_result(summary: str, upload_url: str, mime_type: str) -> st
         f"{summary}\n\n"
         f"Upload URL (no Authorization header required):\n{upload_url}\n\n"
         "Send the bytes with a single PUT, e.g.:\n"
-        f"  curl -X PUT -H 'Content-Type: {mime_type}' --data-binary @<file> '{upload_url}'\n\n"
+        f"  curl -H 'Content-Type: {mime_type}' --upload-file \"/path/to/file\" '{upload_url}'\n\n"
         "The session takes one upload; an interrupted PUT can be resumed with "
         "Content-Range until Google expires the session (about a week). The file "
         "is created or updated only when the upload completes, and "
