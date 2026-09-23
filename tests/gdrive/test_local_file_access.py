@@ -251,7 +251,7 @@ class TestGuidanceWhenDisabled:
 
     @pytest.mark.asyncio
     @DISABLED
-    @patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+    @patch("gdrive.drive_helpers.resolve_folder_id", new_callable=AsyncMock)
     async def test_inline_content_still_works(self, mock_folder, _enabled):
         mock_folder.return_value = "root"
         service = Mock()
@@ -277,7 +277,7 @@ class TestGuidanceWhenDisabled:
 class TestFilePathWorksByDefault:
     @pytest.mark.asyncio
     @patch("core.utils.get_transport_mode", return_value="streamable-http")
-    @patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+    @patch("gdrive.drive_helpers.resolve_folder_id", new_callable=AsyncMock)
     async def test_localhost_http_keeps_file_path(
         self, mock_folder, _mode, tmp_path, monkeypatch
     ):

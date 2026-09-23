@@ -24,8 +24,8 @@ from core.utils import (
     hide_local_file_args,
     hide_remote_only_args,
 )
+from gdrive.drive_helpers import initiate_resumable_upload_session
 from gdrive.drive_tools import (
-    _initiate_resumable_upload_session,
     create_drive_file,
     import_to_google_doc,
     import_to_google_sheets,
@@ -72,10 +72,12 @@ def local_files_disabled(monkeypatch):
 
 @pytest.fixture
 def folder():
-    with patch(
-        "gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock
-    ) as resolve:
-        resolve.return_value = "folder123"
+    """create_drive_file resolves folders in drive_tools, the imports in drive_helpers."""
+    resolve = AsyncMock(return_value="folder123")
+    with (
+        patch("gdrive.drive_tools.resolve_folder_id", resolve),
+        patch("gdrive.drive_helpers.resolve_folder_id", resolve),
+    ):
         yield resolve
 
 
@@ -556,11 +558,11 @@ async def test_session_initiation_http_error_keeps_googles_reason(folder):
 @pytest.mark.asyncio
 async def test_session_initiation_errors_are_reported():
     with pytest.raises(HttpError, match="403"):
-        await _initiate_resumable_upload_session(
+        await initiate_resumable_upload_session(
             _service(status=403), upload_mime_type="text/plain", file_metadata={}
         )
     with pytest.raises(Exception, match="no session URL"):
-        await _initiate_resumable_upload_session(
+        await initiate_resumable_upload_session(
             _service(location=None), upload_mime_type="text/plain", file_metadata={}
         )
 
@@ -571,7 +573,6 @@ class TestOfferedOnlyWithoutLocalFiles:
     before the tool runs; the in-tool refusal is defense in depth for direct
     callers, and fires before any Drive I/O."""
 
-    ENABLED = patch("gdrive.drive_tools.local_file_access_enabled", return_value=True)
     TOOLS = [
         create_drive_file,
         import_to_google_doc,
@@ -662,10 +663,9 @@ class TestOfferedOnlyWithoutLocalFiles:
             assert "Unexpected keyword argument" in stale.content[0].text
 
     @pytest.mark.asyncio
-    @ENABLED
     @pytest.mark.parametrize("tool", TOOLS, ids=lambda t: _unwrap(t).__name__)
     async def test_refused_before_any_drive_call_when_local_files_work(
-        self, _enabled, tool
+        self, monkeypatch, tool
     ):
         """The refusal names only the local-disk and inline routes the tool
         really has, read from its signature, and nothing reaches Drive: no
@@ -675,6 +675,7 @@ class TestOfferedOnlyWithoutLocalFiles:
             inspect.signature(fn).parameters
         )
         service = _service()
+        monkeypatch.delenv("WORKSPACE_MCP_DISABLE_LOCAL_FILES")
 
         with pytest.raises(UserInputError) as exc:
             await fn(

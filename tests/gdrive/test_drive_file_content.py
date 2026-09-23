@@ -7,7 +7,8 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tests.helpers import _make_minimal_pdf
-from gdrive.drive_tools import _download_file_bytes, get_drive_file_content
+from gdrive.drive_helpers import _download_file_bytes
+from gdrive.drive_tools import get_drive_file_content
 
 
 @pytest.fixture(autouse=True)

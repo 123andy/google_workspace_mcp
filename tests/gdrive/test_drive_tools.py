@@ -19,6 +19,8 @@ import zipfile
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 from gdrive.drive_helpers import (
+    SHARED_DRIVE_ORGANIZER_CONCURRENCY_LIMIT,
+    _create_drive_folder_impl,
     build_drive_list_params,
     has_explicit_trashed_clause,
     resolve_drive_item,
@@ -840,8 +842,6 @@ def _make_file(
 @pytest.mark.asyncio
 async def test_create_drive_folder():
     """Test create_drive_folder returns success message with folder id, name, and link."""
-    from gdrive.drive_tools import _create_drive_folder_impl
-
     mock_service = Mock()
     mock_response = {
         "id": "folder123",
@@ -853,7 +853,7 @@ async def test_create_drive_folder():
     mock_service.files.return_value.create.return_value = mock_request
 
     with patch(
-        "gdrive.drive_tools.resolve_folder_id",
+        "gdrive.drive_helpers.resolve_folder_id",
         new_callable=AsyncMock,
         return_value="root",
     ):
@@ -943,7 +943,7 @@ def test_build_params_order_by_omits_whitespace_only_values():
 
 
 @pytest.mark.asyncio
-@patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+@patch("gdrive.drive_helpers.resolve_folder_id", new_callable=AsyncMock)
 async def test_import_to_google_doc_upload_uses_google_api_retries(mock_resolve_folder):
     """Drive uploads use googleapiclient's built-in retry handling."""
     mock_resolve_folder.return_value = "resolved_root"
@@ -1903,8 +1903,6 @@ async def test_list_drive_items_shared_drive_organizer_requests_do_not_overlap(
     monkeypatch,
 ):
     """Organizer requests on one service must finish before the next starts."""
-    from gdrive.drive_tools import SHARED_DRIVE_ORGANIZER_CONCURRENCY_LIMIT
-
     mock_service = Mock()
     mock_service.drives().list().execute.return_value = {
         "drives": [
@@ -2045,7 +2043,7 @@ def test_resolve_file_type_mime_empty_raises():
 
 @pytest.mark.asyncio
 @patch("gdrive.drive_helpers._download_url_to_bytes", new_callable=AsyncMock)
-@patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+@patch("gdrive.drive_helpers.resolve_folder_id", new_callable=AsyncMock)
 async def test_import_to_google_slides_converts_pptx(
     mock_resolve_folder, mock_download
 ):
@@ -2082,7 +2080,7 @@ async def test_import_to_google_slides_converts_pptx(
 
 @pytest.mark.asyncio
 @patch("gdrive.drive_helpers._download_url_to_bytes", new_callable=AsyncMock)
-@patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+@patch("gdrive.drive_helpers.resolve_folder_id", new_callable=AsyncMock)
 async def test_import_to_google_slides_detects_extension_before_url_query(
     mock_resolve_folder, mock_download
 ):
@@ -2127,7 +2125,7 @@ async def test_import_to_google_slides_rejects_unsupported_format():
 
 
 @pytest.mark.asyncio
-@patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+@patch("gdrive.drive_helpers.resolve_folder_id", new_callable=AsyncMock)
 async def test_import_to_google_sheets_converts_csv_content(mock_resolve_folder):
     """CSV content uploads as text/csv while the body targets Sheets."""
     mock_resolve_folder.return_value = "resolved_root"
@@ -2157,7 +2155,7 @@ async def test_import_to_google_sheets_converts_csv_content(mock_resolve_folder)
 
 
 @pytest.mark.asyncio
-@patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+@patch("gdrive.drive_helpers.resolve_folder_id", new_callable=AsyncMock)
 async def test_import_to_google_sheets_accepts_validated_inline_xlsx(
     mock_resolve_folder,
 ):
@@ -2213,7 +2211,7 @@ async def test_import_to_google_sheets_rejects_corrupt_inline_xlsx():
 
 
 @pytest.mark.asyncio
-@patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+@patch("gdrive.drive_helpers.resolve_folder_id", new_callable=AsyncMock)
 async def test_import_to_google_sheets_uses_google_api_retries(mock_resolve_folder):
     """Sheets conversion upload uses googleapiclient's built-in write retries."""
     mock_resolve_folder.return_value = "resolved_root"
@@ -2295,7 +2293,7 @@ async def test_import_to_google_slides_rejects_unsupported_source_via_allowlist(
 
 
 @pytest.mark.asyncio
-@patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+@patch("gdrive.drive_helpers.resolve_folder_id", new_callable=AsyncMock)
 async def test_import_to_google_sheets_accepts_csv_content(mock_resolve_folder):
     """csv is text-based AND in the Sheets allowlist: content still succeeds."""
     mock_resolve_folder.return_value = "resolved_root"
@@ -2322,7 +2320,7 @@ async def test_import_to_google_sheets_accepts_csv_content(mock_resolve_folder):
 
 
 @pytest.mark.asyncio
-@patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+@patch("gdrive.drive_helpers.resolve_folder_id", new_callable=AsyncMock)
 async def test_import_to_google_doc_accepts_markdown_content(mock_resolve_folder):
     """Backward-compat: markdown content into Docs still succeeds."""
     mock_resolve_folder.return_value = "resolved_root"

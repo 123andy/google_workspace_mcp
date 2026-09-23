@@ -21,7 +21,8 @@ from starlette.responses import FileResponse, JSONResponse
 import core.attachment_storage as attachment_storage
 from core.attachment_storage import AttachmentStorage
 from core.server import serve_attachment
-from gdrive.drive_tools import _download_file_to_temp, get_drive_file_download_url
+from gdrive.drive_helpers import _download_file_to_temp
+from gdrive.drive_tools import get_drive_file_download_url
 
 
 def _unwrap(tool):
@@ -61,7 +62,7 @@ class _FakeDownloader:
 def _patch_downloader(content_bytes):
     _FakeDownloader.data = content_bytes
     _FakeDownloader.handles = []
-    return patch("gdrive.drive_tools.MediaIoBaseDownload", _FakeDownloader)
+    return patch("gdrive.drive_helpers.MediaIoBaseDownload", _FakeDownloader)
 
 
 @pytest.fixture
@@ -114,7 +115,7 @@ async def test_download_to_temp_removes_temp_file_on_failure():
         def next_chunk(self):
             raise RuntimeError("network died")
 
-    with patch("gdrive.drive_tools.MediaIoBaseDownload", _Boom):
+    with patch("gdrive.drive_helpers.MediaIoBaseDownload", _Boom):
         _FakeDownloader.handles = []
         with pytest.raises(RuntimeError):
             await _download_file_to_temp(mock_service, "file123")
