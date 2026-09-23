@@ -77,6 +77,7 @@ Create a new Google Spreadsheet.
 | user_google_email | string | yes | | |
 | title | string | yes | | Spreadsheet title |
 | sheet_names | array of strings | no | | Sheet names to create. Defaults to one sheet with the default name |
+| folder_id | string | no | root | Parent folder. Accepts a folder ID or shortcut; for shared drives, a folder inside that drive. If the move fails, the spreadsheet is still created in My Drive root and the reply reports why |
 
 ### create_sheet
 Add a new sheet (tab) to an existing spreadsheet.

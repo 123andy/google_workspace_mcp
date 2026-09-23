@@ -4033,7 +4033,9 @@ async def manage_gmail_label(
     action: Literal["create", "update", "delete"],
     name: Optional[str] = None,
     label_id: Optional[str] = None,
-    label_list_visibility: Optional[Literal["labelShow", "labelHide"]] = None,
+    label_list_visibility: Optional[
+        Literal["labelShow", "labelShowIfUnread", "labelHide"]
+    ] = None,
     message_list_visibility: Optional[Literal["show", "hide"]] = None,
     background_color: Optional[str] = None,
     text_color: Optional[str] = None,
@@ -4047,7 +4049,7 @@ async def manage_gmail_label(
         action (Literal["create", "update", "delete"]): Action to perform on the label.
         name (Optional[str]): Label name. Required for create, optional for update.
         label_id (Optional[str]): Label ID. Required for update and delete operations.
-        label_list_visibility (Optional[Literal["labelShow", "labelHide"]]): Whether the label is shown in the label list. Defaults to "labelShow" on create. On update, omitting it keeps the label's current setting.
+        label_list_visibility (Optional[Literal["labelShow", "labelShowIfUnread", "labelHide"]]): Whether the label is shown in the label list. Defaults to "labelShow" on create. On update, omitting it keeps the label's current setting.
         message_list_visibility (Optional[Literal["show", "hide"]]): Whether the label's messages are shown in the message list. Defaults to "show" on create. On update, omitting it keeps the label's current setting.
         background_color (Optional[str]): Label background color as a hex string, e.g. "#fb4c2f". Set together with text_color; Gmail requires both. Gmail accepts only its own palette, and an unsupported value is rejected before the request. Colors apply to user labels, not system labels.
         text_color (Optional[str]): Label text color as a hex string, e.g. "#ffffff". Set together with background_color. Same palette. On update, omitting both keeps the label's current color.

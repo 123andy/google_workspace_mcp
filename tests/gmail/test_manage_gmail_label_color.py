@@ -7,10 +7,12 @@ proving a call that omits them sends the exact body it sent before.
 from __future__ import annotations
 
 import hashlib
+from typing import get_type_hints
 from unittest.mock import MagicMock
 
 import pytest
 from fastmcp.exceptions import ToolError as ToolExecutionError
+from pydantic import TypeAdapter
 
 from gmail.gmail_helpers import GMAIL_LABEL_COLORS, build_label_color
 from gmail.gmail_tools import manage_gmail_label
@@ -263,6 +265,7 @@ def test_palette_exactly_matches_the_discovery_document_snapshot():
         {"labelListVisibility": "labelHide", "messageListVisibility": "hide"},
         {"labelListVisibility": "labelHide", "messageListVisibility": "show"},
         {"labelListVisibility": "labelShow", "messageListVisibility": "hide"},
+        {"labelListVisibility": "labelShowIfUnread", "messageListVisibility": "hide"},
     ],
 )
 async def test_update_without_visibility_keeps_the_stored_visibility(stored):
@@ -278,7 +281,8 @@ async def test_update_without_visibility_keeps_the_stored_visibility(stored):
 
 
 @pytest.mark.asyncio
-async def test_update_still_applies_visibility_when_asked():
+@pytest.mark.parametrize("requested", ["labelShow", "labelShowIfUnread"])
+async def test_update_still_applies_visibility_when_asked(requested):
     service = _build_mock_service(
         {
             "id": "Label_1",
@@ -289,32 +293,21 @@ async def test_update_still_applies_visibility_when_asked():
     )
 
     await _update(
-        service, label_list_visibility="labelShow", message_list_visibility="show"
+        service, label_list_visibility=requested, message_list_visibility="show"
     )
 
     body = _sent_body(service, "update")
-    assert body["labelListVisibility"] == "labelShow"
+    assert body["labelListVisibility"] == requested
     assert body["messageListVisibility"] == "show"
 
 
-@pytest.mark.asyncio
-async def test_update_keeps_a_visibility_the_parameter_cannot_express():
-    """Gmail also stores "labelShowIfUnread", which the tool cannot be asked
-    for. Carrying the stored value over is the only thing that preserves it."""
-    service = _build_mock_service(
-        {
-            "id": "Label_1",
-            "name": "Urgent",
-            "labelListVisibility": "labelShowIfUnread",
-            "messageListVisibility": "hide",
-        }
-    )
-
-    await _update(service, name="Renamed")
-
-    body = _sent_body(service, "update")
-    assert body["labelListVisibility"] == "labelShowIfUnread"
-    assert body["messageListVisibility"] == "hide"
+def test_label_list_visibility_accepts_all_three_gmail_values():
+    """Gmail's labelListVisibility enum has three values. The annotation is what
+    the tool schema exposes, so a value missing here cannot be requested."""
+    hint = get_type_hints(manage_gmail_label)["label_list_visibility"]
+    adapter = TypeAdapter(hint)
+    for value in ("labelShow", "labelShowIfUnread", "labelHide"):
+        assert adapter.validate_python(value) == value
 
 
 @pytest.mark.asyncio

@@ -135,7 +135,7 @@ Create, update, or delete a label.
 | action | string | yes | | "create", "update", or "delete" |
 | name | string | conditional | | Required for create, optional for update |
 | label_id | string | conditional | | Required for update and delete |
-| label_list_visibility | string | no | "labelShow" on create | "labelShow" or "labelHide". On update, omitting it keeps the label's current setting |
+| label_list_visibility | string | no | "labelShow" on create | "labelShow", "labelShowIfUnread" or "labelHide". On update, omitting it keeps the label's current setting |
 | message_list_visibility | string | no | "show" on create | "show" or "hide". On update, omitting it keeps the label's current setting |
 | background_color | string | no | | Hex color, e.g. "#fb4c2f". Set with text_color. Gmail accepts only its own [palette](https://developers.google.com/gmail/api/reference/rest/v1/users.labels#Label); other values are rejected before the request. User labels only |
 | text_color | string | no | | Hex color, e.g. "#ffffff". Set with background_color. Same palette |

@@ -11,6 +11,7 @@ import zipfile
 import ssl
 import asyncio
 import functools
+import inspect
 
 from pathlib import Path
 from typing import Annotated, Any, List, Optional
@@ -22,7 +23,12 @@ from fastmcp.exceptions import ToolError
 from googleapiclient.errors import HttpError
 from .api_enablement import get_api_enablement_message
 from auth.google_auth import GoogleAuthenticationError
-from auth.oauth_config import is_oauth21_enabled, is_external_oauth21_provider
+from auth.oauth_config import (
+    get_transport_mode,
+    is_external_oauth21_provider,
+    is_oauth21_enabled,
+    is_stateless_mode,
+)
 from .file_limits import get_max_office_xml_bytes
 
 logger = logging.getLogger(__name__)
@@ -52,7 +58,10 @@ _DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.doc
 _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 _PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 _OFFICE_XML_MIME_TYPES = {_DOCX_MIME, _XLSX_MIME, _PPTX_MIME}
-_EXCEL_MAIN_NAMESPACE = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_SPREADSHEETML_NAMESPACES = {
+    "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+    "http://purl.oclc.org/ooxml/spreadsheetml/main",
+}
 _WORD_TEXT_RELATIONSHIP_KINDS = {"header", "footer", "footnotes", "endnotes"}
 _WORD_TEXT_RELATIONSHIP_TYPES = {
     f"{base}/{kind}": kind
@@ -150,6 +159,46 @@ that send ``'{"key":"val"}'`` instead of ``{"key": "val"}``.
 # Override via ALLOWED_FILE_DIRS env var (os.pathsep-separated paths).
 _ALLOWED_FILE_DIRS_ENV = "ALLOWED_FILE_DIRS"
 
+# Operators of hosted deployments, where the server cannot see the caller's
+# disk, set this to stop tools reading server-side paths. Transport alone is not
+# a reliable signal: streamable-http on localhost shares the caller's filesystem.
+_DISABLE_LOCAL_FILES_ENV = "WORKSPACE_MCP_DISABLE_LOCAL_FILES"
+
+
+def local_file_access_enabled() -> bool:
+    """Return whether tools may read files from the server's filesystem.
+
+    Disabled by ``WORKSPACE_MCP_DISABLE_LOCAL_FILES=true``, and implied by
+    stateless mode, which already denotes a diskless hosted deployment.
+    """
+    if is_stateless_mode():
+        return False
+    # Stray whitespace from YAML or .env files must not leave local files enabled.
+    return os.environ.get(_DISABLE_LOCAL_FILES_ENV, "").strip().lower() != "true"
+
+
+def hide_local_file_args(*names: str):
+    """Tool decorator: drop server-side path parameters when local files are off.
+
+    Rewrites ``__signature__``, as ``require_google_service`` does, so apply it
+    directly under ``@server.tool``. FastMCP then omits the parameters from the
+    schema and rejects them if a client with a cached schema sends them anyway.
+    Names are checked either way, so a stale one fails at import.
+    """
+
+    def decorator(func):
+        sig = inspect.signature(func)
+        missing = [name for name in names if name not in sig.parameters]
+        if missing:
+            raise ValueError(f"{func.__name__} has no parameter(s) {missing} to hide.")
+        if not local_file_access_enabled():
+            func.__signature__ = sig.replace(
+                parameters=[p for p in sig.parameters.values() if p.name not in names]
+            )
+        return func
+
+    return decorator
+
 
 def _get_allowed_file_dirs() -> list[Path]:
     """Return the list of directories from which local file access is permitted."""
@@ -189,13 +238,31 @@ def validate_file_path(file_path: str) -> Path:
         Path: The resolved, validated Path object.
 
     Raises:
+        UserInputError: If local file access is disabled on this server.
+        FileNotFoundError: If the path does not exist on the server.
         ValueError: If the path is outside allowed directories or targets
                     a sensitive location.
     """
+    if not local_file_access_enabled():
+        raise UserInputError(
+            "Local file access is disabled on this server: file paths resolve "
+            "on the server's filesystem, not the caller's. Provide the file by "
+            "URL or as inline content instead."
+        )
+
     resolved = Path(file_path).resolve()
 
     if not resolved.exists():
-        raise FileNotFoundError(f"Path does not exist: {resolved}")
+        # Over HTTP the server may be on another machine, where a caller-side
+        # path can never exist, so say so rather than imply a typo.
+        hint = (
+            " Paths resolve on the MCP server's filesystem; if the server runs "
+            "on a different machine than the client, provide the file by URL "
+            "or as inline content instead."
+            if get_transport_mode() == "streamable-http"
+            else ""
+        )
+        raise FileNotFoundError(f"Path does not exist: {resolved}.{hint}")
 
     # Block sensitive file patterns regardless of allowlist
     resolved_str = str(resolved)
@@ -689,6 +756,34 @@ def _read_part(zf: zipfile.ZipFile, name: str, budget: _ExpansionBudget) -> byte
         raise OfficeXmlExtractionError(f"missing required part: {name}") from e
 
 
+def _sheet_children(node: Any, local_name: str) -> List[Any]:
+    """Direct children of ``node`` named ``local_name`` in any SpreadsheetML namespace."""
+    return [
+        child
+        for child in node
+        if _xml_name(child.tag)[0] in _SPREADSHEETML_NAMESPACES
+        and _xml_name(child.tag)[1] == local_name
+    ]
+
+
+def _rich_text(node: Any) -> str:
+    """Text of a rich-text container: a shared-string ``<si>`` or an inline ``<is>``.
+
+    Both hold a single ``<t>`` or runs ``<r><t>...</t></r>``. Phonetic guides
+    ``<rPh>`` also carry ``<t>`` but are annotations, so they are skipped.
+    """
+    parts: List[str] = []
+    for child in node:
+        namespace, local_name = _xml_name(child.tag)
+        if namespace not in _SPREADSHEETML_NAMESPACES:
+            continue
+        if local_name == "t":
+            parts.append(child.text or "")
+        elif local_name == "r":
+            parts.extend(t.text or "" for t in _sheet_children(child, "t"))
+    return "".join(parts)
+
+
 def _read_shared_strings(
     zf: zipfile.ZipFile, budget: _ExpansionBudget
 ) -> Optional[List[str]]:
@@ -698,10 +793,7 @@ def _read_shared_strings(
     except KeyError:
         return None
     root = ET.fromstring(shared_strings_xml)
-    return [
-        "".join(t.text or "" for t in si.findall(f".//{{{_EXCEL_MAIN_NAMESPACE}}}t"))
-        for si in root.findall(f"{{{_EXCEL_MAIN_NAMESPACE}}}si")
-    ]
+    return [_rich_text(si) for si in _sheet_children(root, "si")]
 
 
 def _shared_string(shared_strings: Optional[List[str]], value: str, member: str) -> str:
@@ -727,12 +819,22 @@ def _spreadsheet_texts(
     xml_root: Any, shared_strings: Optional[List[str]], member: str
 ) -> List[str]:
     """Return cell values from one worksheet in document order."""
+    namespace = _xml_name(xml_root.tag)[0]
+    if namespace not in _SPREADSHEETML_NAMESPACES:
+        return []
+    ns = f"{{{namespace}}}"
     texts: List[str] = []
-    for cell in xml_root.iter(f"{{{_EXCEL_MAIN_NAMESPACE}}}c"):
-        value = cell.find(f"{{{_EXCEL_MAIN_NAMESPACE}}}v")
+    for cell in xml_root.iter(f"{ns}c"):
+        cell_type = cell.get("t")
+        inline = cell.find(f"{ns}is")
+        if cell_type == "inlineStr" and inline is not None:
+            if text := _rich_text(inline):
+                texts.append(text)
+            continue
+        value = cell.find(f"{ns}v")
         if value is None or value.text is None:
             continue
-        if cell.get("t") == "s":
+        if cell_type == "s":
             texts.append(_shared_string(shared_strings, value.text, member))
         else:
             texts.append(value.text)
