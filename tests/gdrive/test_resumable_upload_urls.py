@@ -671,18 +671,6 @@ class TestOfferedOnlyWithoutLocalFiles:
         service._http.request.assert_not_called()
         service.files.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_disabled_file_path_error_offers_the_upload_url(self):
-        """#1036's file_path refusal lists the routes that remain; on a server
-        that hides file_path, return_upload_url is one of them."""
-        with pytest.raises(UserInputError, match="'return_upload_url'"):
-            await _unwrap(import_to_google_slides)(
-                service=_service(),
-                user_google_email="user@example.com",
-                file_name="deck",
-                file_path="/Users/someone/deck.pptx",
-            )
-
 
 class TestSchemaThroughFastMCP:
     """The signature is rewritten at decoration time, from the setting in force

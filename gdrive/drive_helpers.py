@@ -23,11 +23,12 @@ from urllib.request import url2pathname
 import httpx
 from googleapiclient.http import MediaIoBaseUpload
 
+from auth.service_decorator import require_google_service
 from core.http_utils import (
     redact_url as _redact_url,
     ssrf_safe_stream as _ssrf_safe_stream,
 )
-from core.utils import validate_file_path
+from core.utils import local_file_access_enabled, validate_file_path
 
 logger = logging.getLogger(__name__)
 
@@ -499,6 +500,97 @@ async def resolve_folder_id(
     return resolved_id
 
 
+async def place_file_in_folder(
+    drive_service: Any,
+    file_id: str,
+    folder_id: str,
+    *,
+    tool_name: str = "place_file_in_folder",
+) -> str:
+    """
+    Move ``file_id`` into ``folder_id`` (ID or shortcut), removing its other parents.
+
+    The Docs and Sheets create endpoints accept no parent, so new files land in
+    My Drive root and must be re-parented afterwards. Returns the resolved folder ID.
+    """
+    resolved_folder_id = await resolve_folder_id(drive_service, folder_id)
+    existing = await asyncio.to_thread(
+        drive_service.files()
+        .get(fileId=file_id, fields="parents", supportsAllDrives=True)
+        .execute
+    )
+    # Skip the destination so a file already there is not both added and removed.
+    remove_parents = ",".join(
+        parent for parent in existing.get("parents", []) if parent != resolved_folder_id
+    )
+    await asyncio.to_thread(
+        drive_service.files()
+        .update(
+            fileId=file_id,
+            addParents=resolved_folder_id,
+            removeParents=remove_parents,
+            fields="id, parents",
+            supportsAllDrives=True,
+        )
+        .execute
+    )
+    logger.info(
+        f"[{tool_name}] Moved file {file_id} into folder {resolved_folder_id} "
+        f"(removed parents: '{remove_parents}')"
+    )
+    return resolved_folder_id
+
+
+@require_google_service("drive", "drive_file")
+async def place_created_file_in_folder(
+    service,
+    user_google_email: str,
+    file_id: str,
+    folder_id: str,
+    tool_name: str = "place_created_file_in_folder",
+) -> str:
+    """
+    Authenticate Drive on demand, then run ``place_file_in_folder``.
+
+    Kept off the calling tool's decorator so the ``folder_id="root"`` default
+    needs no Drive scope (and no full-Drive scope under domain-wide delegation).
+    """
+    return await place_file_in_folder(service, file_id, folder_id, tool_name=tool_name)
+
+
+async def move_new_file_to_folder(
+    user_google_email: str,
+    file_id: str,
+    folder_id: Optional[str],
+    tool_name: str,
+) -> str:
+    """
+    Move a just-created file into ``folder_id`` and return a note for the reply.
+
+    A failed move is reported, not raised: the file already exists in My Drive
+    root, so the caller still needs its ID.
+    """
+    if not folder_id or folder_id == "root":
+        return ""
+    try:
+        await place_created_file_in_folder(
+            user_google_email=user_google_email,
+            file_id=file_id,
+            folder_id=folder_id,
+            tool_name=tool_name,
+        )
+    except Exception as e:
+        logger.warning(
+            f"[{tool_name}] Created file {file_id} but could not move it into "
+            f"folder '{folder_id}': {e}"
+        )
+        return (
+            f" WARNING: left in My Drive root - could not move it into folder "
+            f"'{folder_id}': {e}"
+        )
+    return f" Placed in folder '{folder_id}'."
+
+
 DOWNLOAD_CHUNK_SIZE_BYTES = 256 * 1024  # 256 KB
 UPLOAD_CHUNK_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB (Google recommended minimum)
 MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB safety limit for URL downloads
@@ -797,17 +889,19 @@ async def _resolve_import_media(
     Returns ``(media, source_mime_type, closeable)``; when the source is a remote URL,
     ``closeable`` is the download stream the caller must close after upload (else None).
     """
+    # Name file_path only where the tool schema advertises it.
+    path_source = "'file_path', " if local_file_access_enabled() else ""
     source_count = sum(
         1 for x in (content, file_path, file_url, base64_content) if x is not None
     )
     if source_count == 0:
         raise ValueError(
-            "You must provide one of: 'content', 'file_path', 'file_url', or "
+            f"You must provide one of: 'content', {path_source}'file_url', or "
             "'base64_content'."
         )
     if source_count > 1:
         raise ValueError(
-            "Provide only one of: 'content', 'file_path', 'file_url', or "
+            f"Provide only one of: 'content', {path_source}'file_url', or "
             "'base64_content'."
         )
     if base64_sha256 is not None and base64_content is None:
@@ -837,10 +931,13 @@ async def _resolve_import_media(
 
     if content is not None:
         if not _is_text_like_mime_type(source_mime_type):
+            binary_sources = (
+                "'file_path' or 'file_url'" if path_source else "'file_url'"
+            )
             raise ValueError(
                 f"[{tool_name}] 'content' is only valid for text-based source formats, "
                 f"but the source resolves to '{source_mime_type}' (a binary format). "
-                f"Provide a 'file_path' or 'file_url' for binary formats instead."
+                f"Provide {binary_sources} for binary formats instead."
             )
         file_data = content.encode("utf-8")
         logger.info(f"[{tool_name}] Using content: {len(file_data)} bytes")

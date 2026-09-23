@@ -4,11 +4,12 @@
 for streamable-http on localhost, but not for a hosted deployment with no view of
 the caller's disk. Operators of such deployments set
 WORKSPACE_MCP_DISABLE_LOCAL_FILES=true (stateless mode implies it), which hides
-file_path from tool schemas and rejects it at runtime with tool-specific advice.
+file_path from tool schemas and refuses server-side paths at runtime.
 Transport alone never disables it.
 """
 
 import inspect
+import json
 import os
 import re
 import subprocess
@@ -27,15 +28,17 @@ from core.utils import (  # noqa: E402
     local_file_access_enabled,
     validate_file_path,
 )
+from gdrive.drive_helpers import (  # noqa: E402
+    GOOGLE_DOCS_IMPORT_FORMATS,
+    _resolve_import_media,
+)
 from gdrive.drive_tools import (  # noqa: E402
     import_to_google_doc,
-    import_to_google_sheets,
-    import_to_google_slides,
     update_drive_file,
 )
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-DISABLED = patch("gdrive.drive_tools.local_file_access_enabled", return_value=False)
+DISABLED = patch("gdrive.drive_helpers.local_file_access_enabled", return_value=False)
 
 
 def _unwrap(tool):
@@ -187,73 +190,64 @@ class TestHideLocalFileArgs:
             assert "Unexpected keyword argument" in stale.content[0].text
 
 
-class TestFilePathRejectedWhenDisabled:
-    """Guarded tools reject file_path BEFORE touching the Drive API, with an
-    error that names only the routes that tool really has."""
+class TestGuidanceWhenDisabled:
+    """Runtime advice must not send a model after a parameter the schema hides."""
 
     @pytest.mark.asyncio
-    @DISABLED
-    @pytest.mark.parametrize(
-        "tool, kwargs",
-        [
-            (import_to_google_doc, {"file_name": "n"}),
-            (import_to_google_slides, {"file_name": "n"}),
-            (import_to_google_sheets, {"file_name": "n"}),
-            (update_drive_file, {"file_id": "abc123"}),
-        ],
-        ids=["doc", "slides", "sheets", "update"],
-    )
-    async def test_error_names_exactly_the_routes_the_tool_has(
-        self, _enabled, tool, kwargs
+    @pytest.mark.parametrize("enabled", [True, False])
+    async def test_binary_content_error_names_file_path_only_when_enabled(
+        self, enabled
     ):
-        """Routes are read from each tool's real signature, so adding or
-        removing one of these parameters fails here instead of leaving the
-        guidance quietly wrong."""
-        fn = _unwrap(tool)
-        has = {"content", "base64_content", "file_url", "return_upload_url"} & set(
-            inspect.signature(fn).parameters
-        )
-        service = Mock()
-
-        with pytest.raises(UserInputError) as exc:
-            await fn(
-                service=service,
-                user_google_email="user@example.com",
-                file_path="/Users/someone/file.bin",
-                **kwargs,
-            )
+        with patch(
+            "gdrive.drive_helpers.local_file_access_enabled", return_value=enabled
+        ):
+            with pytest.raises(ValueError) as exc:
+                await _resolve_import_media(
+                    tool_name="t",
+                    file_name="r.docx",
+                    content="x",
+                    file_path=None,
+                    file_url=None,
+                    source_format=None,
+                    format_map=GOOGLE_DOCS_IMPORT_FORMATS,
+                )
         msg = str(exc.value)
-        assert "local file access is disabled" in msg
-        advice = msg.split("Instead,", 1)[1]
-        assert set(re.findall(r"'(\w+)'", advice)) == has
-        service.files.assert_not_called()
+        assert "'file_url'" in msg
+        assert ("file_path" in msg) is enabled
 
     @pytest.mark.asyncio
-    @DISABLED
-    async def test_update_offers_content_for_text_formats_only(self, _enabled):
-        """update_drive_file has no base64_content, and its 'content' rejects
-        binary formats, so a .docx caller must not be sent round in a circle."""
-        with pytest.raises(UserInputError) as exc:
+    @pytest.mark.parametrize("enabled", [True, False])
+    async def test_missing_source_error_names_file_path_only_when_enabled(
+        self, enabled
+    ):
+        with patch(
+            "gdrive.drive_helpers.local_file_access_enabled", return_value=enabled
+        ):
+            with pytest.raises(ValueError) as exc:
+                await _resolve_import_media(
+                    tool_name="t",
+                    file_name="r.md",
+                    content=None,
+                    file_path=None,
+                    file_url=None,
+                    source_format=None,
+                    format_map=GOOGLE_DOCS_IMPORT_FORMATS,
+                )
+        msg = str(exc.value)
+        assert "'content'" in msg and "'base64_content'" in msg
+        assert ("file_path" in msg) is enabled
+
+    @pytest.mark.asyncio
+    async def test_update_append_error_does_not_name_file_path(self):
+        with pytest.raises(ValueError, match="requires 'content'") as exc:
             await _unwrap(update_drive_file)(
                 service=Mock(),
                 user_google_email="user@example.com",
                 file_id="abc123",
-                file_path="/Users/someone/report.docx",
-            )
-        assert "for text formats, send it inline via 'content'" in str(exc.value)
-
-    @pytest.mark.asyncio
-    @DISABLED
-    async def test_update_guard_answers_before_the_mode_check(self, _enabled):
-        """The mode check's own advice names file_path, so the guard runs first."""
-        with pytest.raises(UserInputError, match="local file access is disabled"):
-            await _unwrap(update_drive_file)(
-                service=Mock(),
-                user_google_email="user@example.com",
-                file_id="abc123",
-                file_path="/Users/someone/notes.md",
+                file_url="https://example.com/notes.md",
                 mode="append",
             )
+        assert "file_path" not in str(exc.value)
 
     @pytest.mark.asyncio
     @DISABLED
@@ -399,3 +393,69 @@ asyncio.run(main())
         out = _run_subprocess(self.CODE, {})
         for name in self.TOOLS:
             assert f"ADVERTISED:{name}=True" in out
+
+
+class TestShippedTextNeverNamesAHiddenParameter:
+    """FastMCP ships the docstring body above ``Args:`` as the tool description
+    and each ``Args:`` line as its property's description. Hiding ``file_path``
+    from the signature drops its own line, but prose elsewhere that names it
+    would send a model after a parameter the schema does not have. One static
+    text serves both settings, so it must not enumerate the local-only route."""
+
+    CODE = """
+import asyncio, json
+from core.server import server, set_transport_mode
+set_transport_mode('streamable-http')
+import gdrive.drive_tools
+from fastmcp import Client
+
+async def main():
+    async with Client(server) as client:
+        shipped = {
+            t.name: {
+                "description": t.description or "",
+                "properties": {
+                    name: prop.get("description", "")
+                    for name, prop in t.inputSchema["properties"].items()
+                },
+            }
+            for t in await client.list_tools()
+            if t.name in %r
+        }
+        print("SHIPPED:" + json.dumps(shipped, sort_keys=True))
+
+asyncio.run(main())
+""" % (TestSchemaThroughFastMCP.TOOLS,)
+
+    def _shipped(self, env):
+        out = _run_subprocess(self.CODE, env)
+        return json.loads(out.split("SHIPPED:", 1)[1])
+
+    def test_disabled_ships_no_text_naming_file_path(self):
+        shipped = self._shipped({"WORKSPACE_MCP_DISABLE_LOCAL_FILES": "true"})
+        assert set(shipped) == set(TestSchemaThroughFastMCP.TOOLS)
+        offenders = [
+            (name, where)
+            for name, tool in shipped.items()
+            for where, text in [("description", tool["description"])]
+            + list(tool["properties"].items())
+            if "file_path" in text
+        ]
+        assert offenders == []
+
+    def test_enabled_ships_the_same_text_plus_the_parameter(self):
+        """The wording is not switched per setting: each setting swaps file_path
+        for return_upload_url, and the description and every other property
+        read the same. The description names neither, since each is hidden
+        under one setting."""
+        swapped = {"file_path", "return_upload_url"}
+        on = self._shipped({"WORKSPACE_MCP_DISABLE_LOCAL_FILES": "true"})
+        off = self._shipped({})
+        for name in TestSchemaThroughFastMCP.TOOLS:
+            assert off[name]["description"] == on[name]["description"]
+            assert "return_upload_url" not in off[name]["description"]
+            assert swapped & set(off[name]["properties"]) == {"file_path"}
+            assert swapped & set(on[name]["properties"]) == {"return_upload_url"}
+            assert {
+                k: v for k, v in off[name]["properties"].items() if k not in swapped
+            } == {k: v for k, v in on[name]["properties"].items() if k not in swapped}

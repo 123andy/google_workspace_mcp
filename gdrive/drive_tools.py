@@ -1457,28 +1457,6 @@ async def create_drive_file(
     return confirmation_message
 
 
-def _file_path_disabled_error(inline_params: tuple[str, ...]) -> UserInputError:
-    """Build the error for ``file_path`` sent while local file access is disabled.
-
-    Over MCP the parameter is hidden from the signature and FastMCP rejects it
-    before the tool runs, so this only reaches direct callers, or a setting
-    flipped after import. ``inline_params`` are the inline-source parameters
-    the calling tool really has, so the message only ever names routes that
-    exist on that tool.
-    """
-    inline = " or ".join(f"'{name}'" for name in inline_params)
-    # 'content' carries text only. A tool without 'base64_content' has no inline
-    # route for a binary file, and must not send a .docx caller towards one.
-    qualifier = "" if "base64_content" in inline_params else "for text formats, "
-    return UserInputError(
-        "'file_path' is unavailable: local file access is disabled on this "
-        "server, since paths resolve on its filesystem, not the caller's. "
-        "Instead, pass 'file_url' if the file is already at a URL the server "
-        f"can reach, or, {qualifier}send it inline via {inline}, or set "
-        "'return_upload_url' to PUT the bytes to Google directly."
-    )
-
-
 def _upload_url_not_offered_error(routes: tuple[str, ...]) -> UserInputError:
     """Build the error for ``return_upload_url`` sent while local file access is enabled.
 
@@ -1531,7 +1509,9 @@ async def _import_with_conversion(
         format_map: Extension -> source MIME type allowlist for this destination.
         inline_params: The inline-source parameters the calling tool exposes
             (Slides takes binary formats only, so it has no ``content``), so the
-            disabled-file-access error names only routes that exist on that tool.
+            return_upload_url refusal names only routes that exist on that tool.
+        return_upload_url: Open a resumable upload session and return its URL
+            instead of uploading a source from this server.
     """
     logger.info(
         f"[{tool_name}] Invoked. Email: '{user_google_email}', "
@@ -1539,12 +1519,6 @@ async def _import_with_conversion(
         f"Source Format: '{source_format}', Folder ID: '{folder_id}'"
     )
     logger.debug(f"[{tool_name}] File Name: '{file_name}'")
-
-    # Defense in depth for direct callers (see _file_path_disabled_error):
-    # answer with this tool's own alternatives rather than the generic
-    # validate_file_path() refusal.
-    if file_path is not None and not local_file_access_enabled():
-        raise _file_path_disabled_error(inline_params)
 
     if return_upload_url:
         if local_file_access_enabled():
@@ -1688,9 +1662,9 @@ async def import_to_google_doc(
 
     Google Drive automatically converts the source file to native Google Docs format,
     preserving formatting like headings, lists, bold, italic, etc.
-    Binary sources may be passed directly as base64_content. For batch operations,
-    prefer file_path for files on disk so callers do not need
-    to load full file contents into their context.
+    Binary sources may be passed directly as base64_content. On a local server a
+    file on disk can also be passed by path (preferred for batch operations, so
+    callers do not need to load full file contents into their context).
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -1774,9 +1748,9 @@ async def import_to_google_slides(
 
     Google Drive automatically converts the source presentation to native Google Slides format,
     preserving slides, layouts, text, and images.
-    Binary sources may be passed directly as base64_content. For batch operations,
-    prefer file_path for files on disk so callers do not need
-    to load full file contents into their context.
+    Binary sources may be passed directly as base64_content. On a local server a
+    file on disk can also be passed by path (preferred for batch operations, so
+    callers do not need to load full file contents into their context).
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -1855,9 +1829,9 @@ async def import_to_google_sheets(
 
     Google Drive automatically converts the source spreadsheet to native Google Sheets format,
     preserving rows, columns, sheets, and values.
-    Binary sources may be passed directly as base64_content. For batch operations,
-    prefer file_path for files on disk so callers do not need
-    to load full file contents into their context.
+    Binary sources may be passed directly as base64_content. On a local server a
+    file on disk can also be passed by path (preferred for batch operations, so
+    callers do not need to load full file contents into their context).
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -2228,8 +2202,9 @@ async def update_drive_file(
     """
     Updates metadata, properties, and/or content of a Google Drive file.
 
-    Providing one of ``content``, ``file_path``, or ``file_url`` replaces the file's
-    content in place, preserving the existing file ID, sharing, comments, and links.
+    Providing new content (inline as ``content``, fetched from ``file_url``, or on a
+    local server read from a file path) replaces the file's content in place,
+    preserving the existing file ID, sharing, comments, and links.
     For native Google Docs/Sheets/Slides the source is uploaded with its source MIME
     type so the Drive API applies the same format conversion as import_to_google_doc
     (markdown headings, tables, bold, etc.). For any other file (.md, .txt, .pdf, ...)
@@ -2271,7 +2246,7 @@ async def update_drive_file(
         source_format (Optional[str]): Source format hint for conversion
             (md, markdown, docx, txt, html, rtf, odt). Auto-detected when omitted, and
             ignored for non-Google files, which are uploaded without conversion.
-            Provide at most one of content/file_path/file_url.
+            Provide at most one content source.
         mode (str): How to apply the new content — 'replace' (default), 'append', or
             'prepend'. Append/prepend require 'content' and a UTF-8 text file such as
             .md or .txt; a newline is inserted at the seam if neither side has one.
@@ -2280,7 +2255,7 @@ async def update_drive_file(
         return_upload_url (bool): Return a Google resumable-upload session URL to
             PUT the replacement bytes to directly (no Authorization header); any
             metadata changes are applied once the session is open. Only with
-            mode='replace'; not combinable with content/file_path/file_url. Here
+            mode='replace'; not combinable with another content source. Here
             mime_type names the MIME type of the bytes to be uploaded; on a native
             Google file it is required, names only that, and leaves the file's type
             untouched. Offered only where local file access is disabled.
@@ -2290,12 +2265,6 @@ async def update_drive_file(
             resumable upload URL.
     """
     logger.info(f"[update_drive_file] Updating file {file_id} for {user_google_email}")
-
-    # Same guard as _import_with_conversion, run first so no earlier check
-    # answers with advice that names file_path. update_drive_file has no
-    # base64_content parameter.
-    if file_path is not None and not local_file_access_enabled():
-        raise _file_path_disabled_error(("content",))
 
     if mode not in CONTENT_UPDATE_MODES:
         raise ValueError(
@@ -2322,8 +2291,8 @@ async def update_drive_file(
         raise ValueError(f"mime_type cannot be set when mode='{mode}'.")
     if mode != "replace" and content is None:
         raise ValueError(
-            f"mode='{mode}' requires 'content' (the text to add). "
-            "'file_path' and 'file_url' are only supported with mode='replace'."
+            f"mode='{mode}' requires 'content' (the text to add); other content "
+            "sources are only supported with mode='replace'."
         )
 
     replacing_content = return_upload_url or any(

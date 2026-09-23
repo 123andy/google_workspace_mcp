@@ -16,6 +16,7 @@ from auth.service_decorator import require_google_service
 from core.server import server
 from core.utils import handle_http_errors, UserInputError, StringList
 from core.comments import create_comment_tools
+from gdrive.drive_helpers import move_new_file_to_folder
 from gsheets.sheets_helpers import (
     CONDITION_TYPES,
     MAX_READ_SHEET_ROWS,
@@ -1215,6 +1216,7 @@ async def create_spreadsheet(
     user_google_email: str,
     title: str,
     sheet_names: Optional[StringList] = None,
+    folder_id: str = "root",
 ) -> str:
     """
     Creates a new Google Spreadsheet.
@@ -1223,12 +1225,15 @@ async def create_spreadsheet(
         user_google_email (str): The user's Google email address. Required.
         title (str): The title of the new spreadsheet. Required.
         sheet_names (Optional[List[str]]): List of sheet names to create. If not provided, creates one sheet with default name.
+        folder_id (str): The ID of the parent folder. Defaults to 'root'. For shared
+            drives, this must be a folder ID within the shared drive.
 
     Returns:
         str: Information about the newly created spreadsheet including ID, URL, and locale.
     """
     logger.info(
-        f"[create_spreadsheet] Invoked. Email: '{user_google_email}', title_len={len(title)}"
+        f"[create_spreadsheet] Invoked. Email: '{user_google_email}', "
+        f"title_len={len(title)}, folder_id='{folder_id}'"
     )
 
     spreadsheet_body = {"properties": {"title": title}}
@@ -1252,8 +1257,13 @@ async def create_spreadsheet(
     spreadsheet_url = spreadsheet.get("spreadsheetUrl")
     locale = properties.get("locale", "Unknown")
 
+    placement_note = await move_new_file_to_folder(
+        user_google_email, spreadsheet_id, folder_id, "create_spreadsheet"
+    )
+
     text_output = (
-        f"Successfully created spreadsheet '{title}' for {user_google_email}. "
+        f"Successfully created spreadsheet '{title}' for {user_google_email}."
+        f"{placement_note} "
         f"ID: {spreadsheet_id} | URL: {spreadsheet_url} | Locale: {locale}"
     )
 
