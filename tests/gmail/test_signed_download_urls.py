@@ -2,7 +2,7 @@
 so loudly when they cannot."""
 
 import base64
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -51,7 +51,9 @@ def enabled(monkeypatch):
 @pytest.mark.asyncio
 async def test_attachment_returns_signed_url_without_downloading(enabled):
     service = _service()
-    with patch.object(sd, "offer_url", return_value=(URL, 540)) as offer:
+    with patch.object(
+        sd, "offer_url", new_callable=AsyncMock, return_value=sd.Offer(URL, 540)
+    ) as offer:
         result = await _unwrap(get_gmail_attachment_content)(
             service=service,
             message_id="msg-1",
@@ -72,7 +74,7 @@ async def test_attachment_returns_signed_url_without_downloading(enabled):
 async def test_return_base64_bypasses_signed_url(enabled, monkeypatch):
     """Callers who ask for inline bytes cannot reach a URL; give them the bytes."""
     monkeypatch.setattr("auth.oauth_config.is_stateless_mode", lambda: True)
-    with patch.object(sd, "offer_url") as offer:
+    with patch.object(sd, "offer_url", new_callable=AsyncMock) as offer:
         result = await _unwrap(get_gmail_attachment_content)(
             service=_service(b"hello"),
             message_id="msg-1",
@@ -90,7 +92,12 @@ async def test_stateless_fallback_is_loud_when_url_cannot_be_minted(
     enabled, monkeypatch
 ):
     monkeypatch.setattr("auth.oauth_config.is_stateless_mode", lambda: True)
-    with patch.object(sd, "offer_url", return_value=None):
+    with patch.object(
+        sd,
+        "offer_url",
+        new_callable=AsyncMock,
+        return_value=sd.Offer(reason=sd.NO_CREDENTIALS),
+    ):
         result = await _unwrap(get_gmail_attachment_content)(
             service=_service(),
             message_id="msg-1",
@@ -99,7 +106,7 @@ async def test_stateless_fallback_is_loud_when_url_cannot_be_minted(
         )
     assert "downloaded successfully" not in result
     assert "NO download URL could be issued" in result
-    assert "could not recover usable credentials" in result
+    assert sd.NO_CREDENTIALS in result
 
 
 @pytest.mark.asyncio
@@ -126,7 +133,9 @@ async def test_full_export_offers_signed_url_and_skips_fetch(
     enabled, body_format, extension
 ):
     service = Mock()
-    with patch.object(sd, "offer_url", return_value=(URL, 900)) as offer:
+    with patch.object(
+        sd, "offer_url", new_callable=AsyncMock, return_value=sd.Offer(URL, 900)
+    ) as offer:
         result = await _export_full_message(
             service, "msg-1", HEADERS, body_format, user_google_email=USER
         )
@@ -137,7 +146,11 @@ async def test_full_export_offers_signed_url_and_skips_fetch(
     kwargs = offer.call_args.kwargs
     assert kwargs["source"] == "gmail_message"
     assert kwargs["ref"] == {"mid": "msg-1", "fmt": body_format}
-    assert kwargs["filename"] == f"Quarterly numbers{extension}"
+    # The route adds the extension of what it actually rendered.
+    assert kwargs["filename"] == "Quarterly numbers"
+    assert extension  # kept in the parametrization for the id
+    if body_format == "html":
+        assert "plain text if the message has no HTML part" in result
 
 
 @pytest.mark.asyncio
@@ -149,7 +162,12 @@ async def test_full_export_falls_back_to_upstream_path(enabled, monkeypatch):
     service = Mock()
     service.users().messages().get().execute.return_value = {"raw": "SGVsbG8gd29ybGQ="}
 
-    with patch.object(sd, "offer_url", return_value=None):
+    with patch.object(
+        sd,
+        "offer_url",
+        new_callable=AsyncMock,
+        return_value=sd.Offer(reason=sd.NO_CREDENTIALS),
+    ):
         result = await _export_full_message(
             service, "msg-3", HEADERS, "raw", user_google_email=USER
         )
@@ -180,13 +198,18 @@ async def test_full_export_fallback_is_loud_when_url_cannot_be_minted(
     service = Mock()
     service.users().messages().get().execute.return_value = {"raw": "SGVsbG8gd29ybGQ="}
 
-    with patch.object(sd, "offer_url", return_value=None):
+    with patch.object(
+        sd,
+        "offer_url",
+        new_callable=AsyncMock,
+        return_value=sd.Offer(reason=sd.NO_CREDENTIALS),
+    ):
         result = await _export_full_message(
             service, "msg-4", HEADERS, "raw", user_google_email=USER
         )
 
     assert "Error" not in result
-    assert sd.UNAVAILABLE_NOTE in result
+    assert sd.NO_CREDENTIALS in result
 
 
 @pytest.mark.asyncio
@@ -204,7 +227,7 @@ async def test_full_export_fallback_has_no_note_when_feature_off(monkeypatch):
     )
 
     assert "Hello world" in result
-    assert sd.UNAVAILABLE_NOTE not in result
+    assert "No signed download URL" not in result
 
 
 PDF_NAME = "BRN94DDF87494B4_006201.pdf"
@@ -259,7 +282,9 @@ async def test_signed_url_names_the_attachment_after_gmail_rotated_ids(enabled):
     'unknown'. With no size cap there is no pre-download metadata pass, and the
     name resolver was handed neither the index nor a size, so a rotated ID left
     it with nothing to match on among the four named parts."""
-    with patch.object(sd, "offer_url", return_value=(URL, 540)) as offer:
+    with patch.object(
+        sd, "offer_url", new_callable=AsyncMock, return_value=sd.Offer(URL, 540)
+    ) as offer:
         result = await _unwrap(get_gmail_attachment_content)(
             service=_scanner_mail_service(),
             message_id="msg-1",
@@ -285,7 +310,9 @@ async def test_signed_url_says_when_gmail_gave_no_name(enabled):
             "body": {"attachmentId": "new-1", "size": 10},
         }
     }
-    with patch.object(sd, "offer_url", return_value=(URL, 540)) as offer:
+    with patch.object(
+        sd, "offer_url", new_callable=AsyncMock, return_value=sd.Offer(URL, 540)
+    ) as offer:
         result = await _unwrap(get_gmail_attachment_content)(
             service=service,
             message_id="msg-1",
@@ -296,9 +323,9 @@ async def test_signed_url_says_when_gmail_gave_no_name(enabled):
     assert "unknown" not in result
     assert "Filename: attachment (Gmail gave this part no name" in result
     assert offer.call_args.kwargs["filename"] is None
-    # No fallback can identify an unnamed part, so there is no current ID to
-    # carry: the caller's is minted, as before.
-    assert offer.call_args.kwargs["ref"] == {"mid": "msg-1", "aid": "old-1"}
+    # The message's only attachment part is unambiguous even unnamed, so the
+    # link names it by its current ID rather than the caller's rotated one.
+    assert offer.call_args.kwargs["ref"] == {"mid": "msg-1", "aid": "new-1"}
 
 
 @pytest.mark.asyncio
@@ -307,7 +334,9 @@ async def test_signed_url_mints_against_the_id_the_index_selected(enabled):
     for. The route hands the token's ``aid`` straight to Gmail; minting the
     caller's rotated ID produces a link that resolves a name correctly and then
     502s on fetch, minutes after the tool reported success."""
-    with patch.object(sd, "offer_url", return_value=(URL, 540)) as offer:
+    with patch.object(
+        sd, "offer_url", new_callable=AsyncMock, return_value=sd.Offer(URL, 540)
+    ) as offer:
         await _unwrap(get_gmail_attachment_content)(
             service=_scanner_mail_service(),
             message_id="msg-1",
@@ -335,7 +364,9 @@ async def test_signed_url_mints_against_the_only_attachment_after_rotation(enabl
             ]
         }
     }
-    with patch.object(sd, "offer_url", return_value=(URL, 540)) as offer:
+    with patch.object(
+        sd, "offer_url", new_callable=AsyncMock, return_value=sd.Offer(URL, 540)
+    ) as offer:
         result = await _unwrap(get_gmail_attachment_content)(
             service=service,
             message_id="msg-1",
@@ -373,7 +404,9 @@ async def test_signed_url_keeps_the_id_the_size_cap_pass_already_confirmed(
             ]
         }
     }
-    with patch.object(sd, "offer_url", return_value=(URL, 540)) as offer:
+    with patch.object(
+        sd, "offer_url", new_callable=AsyncMock, return_value=sd.Offer(URL, 540)
+    ) as offer:
         await _unwrap(get_gmail_attachment_content)(
             service=service,
             message_id="msg-1",
@@ -382,3 +415,87 @@ async def test_signed_url_keeps_the_id_the_size_cap_pass_already_confirmed(
         )
 
     assert offer.call_args.kwargs["ref"] == {"mid": "msg-1", "aid": "asked-for"}
+
+
+def _inline_image_and_pdf_service():
+    """An unnamed inline image and one named PDF: the shape that made the old
+    only-named-attachment fallback swap one part's bytes for the other's."""
+    service = Mock()
+    service.users().messages().get().execute.return_value = {
+        "payload": {
+            "parts": [
+                {
+                    "filename": "",
+                    "mimeType": "image/png",
+                    "body": {"attachmentId": "att-NAMELESS", "size": 2048},
+                },
+                {
+                    "filename": "contract.pdf",
+                    "mimeType": "application/pdf",
+                    "body": {"attachmentId": "att-PDF", "size": 9000},
+                },
+            ]
+        }
+    }
+    return service
+
+
+@pytest.mark.asyncio
+async def test_a_nameless_part_asked_for_by_id_keeps_its_own_bytes(enabled):
+    with patch.object(
+        sd, "offer_url", new_callable=AsyncMock, return_value=sd.Offer(URL, 540)
+    ) as offer:
+        result = await _unwrap(get_gmail_attachment_content)(
+            service=_inline_image_and_pdf_service(),
+            message_id="msg-1",
+            attachment_id="att-NAMELESS",
+            user_google_email=USER,
+        )
+    kwargs = offer.call_args.kwargs
+    assert kwargs["ref"] == {"mid": "msg-1", "aid": "att-NAMELESS"}
+    assert kwargs["filename"] is None and kwargs["mime_type"] == "image/png"
+    assert "contract.pdf" not in result
+
+
+@pytest.mark.asyncio
+async def test_an_unmatched_id_with_several_parts_gets_no_link(enabled, monkeypatch):
+    """With the caller's ID gone and nothing safe to select it by, a link would
+    have to guess: none is minted, and the normal path answers now instead."""
+    monkeypatch.setattr("auth.oauth_config.is_stateless_mode", lambda: True)
+    service = _inline_image_and_pdf_service()
+    service.users().messages().attachments().get().execute.return_value = {
+        "size": 5,
+        "data": base64.urlsafe_b64encode(b"bytes").decode(),
+    }
+    with patch.object(sd, "offer_url", new_callable=AsyncMock) as offer:
+        result = await _unwrap(get_gmail_attachment_content)(
+            service=service,
+            message_id="msg-1",
+            attachment_id="att-GONE",
+            user_google_email=USER,
+        )
+    offer.assert_not_called()
+    assert "not in the message's current metadata" in result
+
+
+@pytest.mark.asyncio
+async def test_size_cap_nameless_match_keeps_its_type(enabled, monkeypatch):
+    """With the cap on, the pre-download pass matched a nameless part by ID. Its
+    name stays empty and its type stays its own: no second resolution borrows the
+    only named attachment's name, or blanks the type."""
+    monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", "10485760")
+    service = _inline_image_and_pdf_service()
+    with patch.object(
+        sd, "offer_url", new_callable=AsyncMock, return_value=sd.Offer(URL, 540)
+    ) as offer:
+        await _unwrap(get_gmail_attachment_content)(
+            service=service,
+            message_id="msg-1",
+            attachment_id="att-NAMELESS",
+            user_google_email=USER,
+        )
+    kwargs = offer.call_args.kwargs
+    assert kwargs["filename"] is None and kwargs["mime_type"] == "image/png"
+    assert kwargs["ref"]["aid"] == "att-NAMELESS"
+    # One metadata fetch (the cap pass), not a second identical one.
+    assert service.users().messages().get.call_count == 2  # Mock() setup call + 1

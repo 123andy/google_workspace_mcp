@@ -34,7 +34,9 @@ def enabled(monkeypatch):
 @pytest.mark.asyncio
 @patch("gdrive.drive_tools._download_file_to_temp", new_callable=AsyncMock)
 async def test_native_file_signs_export_type_and_skips_download(download, enabled):
-    with patch.object(sd, "offer_url", return_value=(URL, 900)) as offer:
+    with patch.object(
+        sd, "offer_url", new_callable=AsyncMock, return_value=sd.Offer(URL, 900)
+    ) as offer:
         result = await _unwrap(get_drive_file_download_url)(
             service=_service(),
             user_google_email=USER,
@@ -55,7 +57,9 @@ async def test_native_file_signs_export_type_and_skips_download(download, enable
 @pytest.mark.asyncio
 @patch("gdrive.drive_tools._download_file_to_temp", new_callable=AsyncMock)
 async def test_binary_file_has_no_export_claim(download, enabled):
-    with patch.object(sd, "offer_url", return_value=(URL, 900)) as offer:
+    with patch.object(
+        sd, "offer_url", new_callable=AsyncMock, return_value=sd.Offer(URL, 900)
+    ) as offer:
         await _unwrap(get_drive_file_download_url)(
             service=_service("video/mp4", "clip.mp4"),
             user_google_email=USER,
@@ -77,7 +81,12 @@ async def test_stateless_fallback_is_loud_when_url_cannot_be_minted(
     blob.write_bytes(b"x" * 300)
     download.return_value = blob
 
-    with patch.object(sd, "offer_url", return_value=None):
+    with patch.object(
+        sd,
+        "offer_url",
+        new_callable=AsyncMock,
+        return_value=sd.Offer(reason=sd.NO_CREDENTIALS),
+    ):
         result = await _unwrap(get_drive_file_download_url)(
             service=_service("video/mp4", "clip.mp4"),
             user_google_email=USER,
@@ -86,7 +95,7 @@ async def test_stateless_fallback_is_loud_when_url_cannot_be_minted(
 
     assert "downloaded successfully" not in result
     assert "NO download URL could be issued" in result
-    assert "could not recover usable credentials" in result
+    assert sd.NO_CREDENTIALS in result
     assert not blob.exists()
 
 
@@ -109,3 +118,25 @@ async def test_stateless_wording_unchanged_when_feature_off(
 
     assert result.startswith("File downloaded successfully!")
     assert "signed" not in result.lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mime",
+    [
+        "application/vnd.google-apps.folder",
+        "application/vnd.google-apps.form",
+        "application/vnd.google-apps.script",
+    ],
+)
+@patch("gdrive.drive_tools._download_file_to_temp", new_callable=AsyncMock)
+async def test_items_with_no_bytes_get_no_link(download, enabled, mime):
+    """A folder or an unexportable native type would only fail when the link is
+    fetched; the normal path reports it now instead."""
+    download.side_effect = RuntimeError("fileNotDownloadable")
+    with patch.object(sd, "offer_url", new_callable=AsyncMock) as offer:
+        with pytest.raises(RuntimeError):
+            await _unwrap(get_drive_file_download_url)(
+                service=_service(mime, "thing"), user_google_email=USER, file_id="x"
+            )
+    offer.assert_not_called()

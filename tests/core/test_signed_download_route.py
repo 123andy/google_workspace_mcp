@@ -275,7 +275,7 @@ NAMELESS_PART = {
             "BRN94DDF87494B4_006201.pdf",
             "new-pdf",
         ),
-        (NAMELESS_PART, {"attachment_id": "old-1"}, "attachment", "old-1"),
+        (NAMELESS_PART, {"attachment_id": "old-1"}, "attachment", "new-1"),
     ],
     ids=["rotated-ids-named-by-index", "nameless-part"],
 )
@@ -285,9 +285,9 @@ async def test_content_disposition_carries_the_resolved_name(
     """The name the tool prints is the name the route serves, and the link is
     minted against the ID of the part that name came from: the index picks the
     PDF out of the rotated listing, and the route fetches ``new-pdf`` — Gmail
-    refuses the ``old-pdf`` the caller was holding. An unnamed part is not in
-    the listing at all, so nothing better than the caller's ID is known for it;
-    it keeps that ID and is served under the documented 'attachment' name."""
+    refuses the ``old-pdf`` the caller was holding. A message whose only
+    attachment part is unnamed is still unambiguous: the link names that part by
+    its current ID and serves it under the documented 'attachment' name."""
     monkeypatch.setattr("core.attachment_storage.STORAGE_DIR", tmp_path)  # never $HOME
     monkeypatch.setenv("WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS", "true")
     monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "e2e-client-secret-material")

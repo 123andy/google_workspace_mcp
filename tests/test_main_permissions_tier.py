@@ -266,7 +266,6 @@ def test_main_skips_gcs_store_initialization_in_service_account_mode(monkeypatch
 def test_main_logs_once_when_signed_download_urls_are_set_on_stdio(monkeypatch, caplog):
     """The flag only takes effect over streamable-http; a stdio operator who sets
     it gets exactly one startup line saying so instead of silence."""
-    import logging
 
     def fake_run(*args, **kwargs):  # noqa: ARG001
         raise SystemExit(0)
@@ -301,12 +300,13 @@ def test_main_logs_once_when_signed_download_urls_are_set_on_stdio(monkeypatch, 
     monkeypatch.setenv("USER_GOOGLE_EMAIL", "user@example.com")
     monkeypatch.setenv("WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS", "true")
 
-    with caplog.at_level(logging.WARNING, logger="core.signed_downloads"):
-        with pytest.raises(SystemExit) as exc:
-            main.main()
+    main.STARTUP_NOTICES.clear()
+    with pytest.raises(SystemExit) as exc:
+        main.main()
 
     assert exc.value.code == 0
-    notes = [r.getMessage() for r in caplog.records if "ignored" in r.getMessage()]
+    # Queued for the startup screen with the other configuration advisories.
+    notes = [n for n in main.STARTUP_NOTICES if "ignored" in n]
     assert len(notes) == 1 and "WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS" in notes[0]
 
 
@@ -346,10 +346,15 @@ def signed_startup(monkeypatch):
 
     for name in _SIGNED_ENV_TO_CLEAN:
         monkeypatch.delenv(name, raising=False)
+    main.STARTUP_NOTICES.clear()
     # No key material unless a test sets it: the client-secret fallback reads the
     # OAuth config, which a developer's .env or client-secrets file could fill.
     monkeypatch.setattr(
-        oauth_config, "get_oauth_config", lambda: SimpleNamespace(client_secret=None)
+        oauth_config,
+        "get_oauth_config",
+        lambda: SimpleNamespace(
+            client_secret=None, is_service_account_enabled=lambda: False
+        ),
     )
     monkeypatch.setenv("PORT", "0")
     monkeypatch.setenv("WORKSPACE_MCP_PORT", "0")
@@ -402,8 +407,9 @@ def signed_startup(monkeypatch):
     return run
 
 
-def _base_url_notes(caplog):
-    return [r.getMessage() for r in caplog.records if _BASE_URL_NOTE in r.getMessage()]
+def _base_url_notes(caplog):  # noqa: ARG001
+    """The base-URL line joins the startup screen's notices, not the log."""
+    return [n for n in main.STARTUP_NOTICES if _BASE_URL_NOTE in n]
 
 
 def test_signed_downloads_refuse_to_start_without_external_url(signed_startup, capsys):
@@ -492,7 +498,7 @@ def test_signed_downloads_flag_on_stdio_starts_and_only_notes_it_is_ignored(
     with caplog.at_level(logging.INFO, logger="core.signed_downloads"):
         code = signed_startup("stdio", **{_SIGNED_FLAG: "true"})
     assert code == 0
-    notes = [r.getMessage() for r in caplog.records if "ignored" in r.getMessage()]
+    notes = [n for n in main.STARTUP_NOTICES if "ignored" in n]
     assert len(notes) == 1 and _SIGNED_FLAG in notes[0]
     assert _base_url_notes(caplog) == []
 
@@ -515,3 +521,27 @@ def test_fastmcp_entrypoint_refuses_signed_downloads_without_external_url():
 
     assert result.returncode != 0
     assert _SIGNED_FLAG in result.stderr and "WORKSPACE_EXTERNAL_URL" in result.stderr
+
+
+def test_signed_downloads_loads_inside_the_stdout_capture():
+    """main.py captures stdout at import so stray output cannot corrupt the stdio
+    JSON-RPC stream; signed_downloads (Google and HTTP stacks) must load after
+    that capture, alongside the other deferred startup imports."""
+    import ast
+    import pathlib
+
+    tree = ast.parse(pathlib.Path(main.__file__).read_text())
+    top_level = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        and any("signed_downloads" in alias.name for alias in node.names)
+    ]
+    assert top_level == []
+    loader = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_load_startup_dependencies"
+    )
+    assert "signed_downloads" in ast.unparse(loader)

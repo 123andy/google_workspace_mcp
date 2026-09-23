@@ -453,7 +453,8 @@ UNNAMED_ONLY = {
         (ROTATED_TWO, {"attachment_index": 1}, ("b.pdf", "application/pdf", "new-b")),
         (ROTATED_TWO, {"size_bytes": 900}, ("b.pdf", "application/pdf", "new-b")),
         (ROTATED_ONE, {}, ("solo.pdf", "application/pdf", "new-solo")),
-        (UNNAMED_ONLY, {}, (None, None, None)),
+        # The only attachment part is unambiguous even without a name.
+        (UNNAMED_ONLY, {}, (None, "application/octet-stream", "new-x")),
     ],
     ids=["exact-id", "by-index", "by-size", "only-attachment", "unnamed-part"],
 )

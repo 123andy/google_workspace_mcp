@@ -9,7 +9,6 @@ from functools import partial
 from importlib import metadata, import_module
 from typing import NoReturn
 from dotenv import load_dotenv
-from core import signed_downloads
 from core.startup_ui import StartupDisplay, collapse_home, wordmark_lines
 
 # Prevent any stray startup output on macOS (e.g. platform identifiers) from
@@ -44,6 +43,7 @@ def _load_startup_dependencies():
         wrap_server_tool_method,
         filter_server_tools,
     )
+    from core import signed_downloads
 
     return (
         get_selected_backend,
@@ -65,6 +65,7 @@ def _load_startup_dependencies():
         set_disabled_tools,
         wrap_server_tool_method,
         filter_server_tools,
+        signed_downloads,
     )
 
 
@@ -88,6 +89,7 @@ def _load_startup_dependencies():
     set_disabled_tools,
     wrap_server_tool_method,
     filter_server_tools,
+    signed_downloads,
 ) = _load_startup_dependencies()
 
 dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -631,9 +633,9 @@ def main():
         sys.exit(1)
 
     validate_streamable_http_auth(args.transport)
-    signed_downloads.log_if_ignored(args.transport)
+    signed_downloads.log_if_ignored(args.transport, notice=add_startup_notice)
     try:
-        signed_downloads.validate_startup(args.transport)
+        signed_downloads.validate_startup(args.transport, notice=add_startup_notice)
     except ValueError as exc:
         parser.error(str(exc))
     resolve_callback_port_for_transport(args.transport)
