@@ -1097,11 +1097,12 @@ async def _resolve_attachment(
         # "the only attachment" can be trusted to mean the part the caller meant.
         return _ResolvedAttachment(named_count=None)
 
-    if attachment_index is not None and not 0 <= attachment_index < len(named):
+    index_in_range = attachment_index is not None and 0 <= attachment_index < len(named)
+    if attachment_index is not None and not index_in_range and not naming_only:
         # An ordinal that points past the listing names no part; falling back
         # to "the only attachment" would contradict it.
         return _ResolvedAttachment(named_count=len(named))
-    if attachment_index is not None:
+    if index_in_range:
         matched = named[attachment_index]
         logger.info(
             f"Attachment {attachment_id} not in current metadata (IDs rotate); "
@@ -2512,6 +2513,7 @@ async def get_gmail_attachment_content(
             payload = message_full.get("payload", {})
             attachments = _extract_attachments(payload)
             matched = _find_attachment_metadata(payload, attachment_id)
+            matched_by_id = matched is not None
 
             if matched is None and attachment_index is not None:
                 if attachment_index < 0 or attachment_index >= len(attachments):
@@ -2536,7 +2538,7 @@ async def get_gmail_attachment_content(
                 # Only an ID match settles which part is meant for a signed
                 # link; the ordinal and single-attachment picks are re-checked
                 # there against the stricter rules (see _resolve_attachment).
-                attachment_id_is_current = matched.get("attachmentId") is None
+                attachment_id_is_current = matched_by_id
         except Exception:
             logger.debug(
                 f"Could not fetch attachment metadata for {attachment_id} before download"

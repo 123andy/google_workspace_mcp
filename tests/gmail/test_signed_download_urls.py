@@ -667,3 +667,27 @@ async def test_an_out_of_range_index_is_never_read_as_the_only_attachment(enable
         service, "msg-1", "old-solo", attachment_index=5
     )
     assert resolved.matched_by is None and resolved.named_count == 1
+
+
+@pytest.mark.asyncio
+async def test_naming_a_stored_copy_ignores_an_out_of_range_index():
+    """Upstream's naming never read the index; an agent passing a 1-based number
+    still gets the file named."""
+    from gmail.gmail_tools import _resolve_attachment
+
+    service = Mock()
+    service.users().messages().get().execute.return_value = {
+        "payload": {
+            "parts": [
+                {
+                    "filename": "solo.pdf",
+                    "mimeType": "application/pdf",
+                    "body": {"attachmentId": "new-solo", "size": 9},
+                }
+            ]
+        }
+    }
+    resolved = await _resolve_attachment(
+        service, "msg-1", "old-solo", 9, attachment_index=1, naming_only=True
+    )
+    assert resolved.filename == "solo.pdf"

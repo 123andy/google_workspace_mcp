@@ -29,7 +29,6 @@ from core.file_limits import (
     FileTooLargeError,
     download_media_bytes,
     ensure_within_file_size_limit,
-    get_max_file_bytes,
 )
 from core.utils import (
     GOOGLE_API_WRITE_RETRIES,
@@ -522,7 +521,7 @@ async def get_drive_file_download_url(
     resolved_file_id, file_metadata = await resolve_drive_item(
         service,
         file_id,
-        extra_fields="name, webViewLink, mimeType, size",
+        extra_fields="name, webViewLink, mimeType",
     )
     file_id = resolved_file_id
     mime_type = file_metadata.get("mimeType", "")
@@ -587,22 +586,8 @@ async def get_drive_file_download_url(
     # Folders and native types with no export mapping (Forms, Sites, Apps Script,
     # …) have no bytes to stream: they take the normal path, which reports the
     # failure now rather than as an error when the link is fetched.
-    # A stored file over the size cap would only be refused when fetched; the
-    # normal path handles it as it always has.
-    recorded_size = str(file_metadata.get("size") or "")
-    max_file_bytes = get_max_file_bytes()
-    over_cap = (
-        not export_mime_type
-        and max_file_bytes is not None
-        and recorded_size.isdigit()
-        and int(recorded_size) > max_file_bytes
-    )
-    downloadable = (
-        mime_type != "application/vnd.google-apps.folder"
-        and (
-            export_mime_type or not mime_type.startswith("application/vnd.google-apps.")
-        )
-        and not over_cap
+    downloadable = mime_type != "application/vnd.google-apps.folder" and (
+        export_mime_type or not mime_type.startswith("application/vnd.google-apps.")
     )
     offer = signed_downloads.Offer()
     if downloadable:

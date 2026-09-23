@@ -26,9 +26,10 @@ from google.oauth2.credentials import Credentials
 import core.signed_downloads as sd
 
 
-async def _send(response):
-    """Run a response the way the server does (ASGI, spec 2.4) and return the
-    body it sent. Its cleanup runs exactly as it would in production."""
+async def _send(response, spec="2.3"):
+    """Run a response the way the server does and return the body it sent. The
+    default is ASGI spec 2.3, what uvicorn reports, which takes Starlette's
+    disconnect-watching branch; its cleanup runs exactly as in production."""
     sent = []
 
     async def receive():
@@ -37,7 +38,7 @@ async def _send(response):
     async def send(message):
         sent.append(message)
 
-    scope = {"type": "http", "asgi": {"spec_version": "2.4"}, "method": "GET"}
+    scope = {"type": "http", "asgi": {"spec_version": spec}, "method": "GET"}
     await response(scope, receive, send)
     return b"".join(
         m.get("body", b"") for m in sent if m["type"] == "http.response.body"
@@ -1222,14 +1223,18 @@ class TestDriveFetcher:
         assert result.media_type == "application/pdf"
 
     @pytest.mark.asyncio
-    async def test_the_served_size_is_checked_against_the_file_limit(
-        self, drive, monkeypatch
-    ):
-        """The size Google reports on the first chunk is the one checked: it is
-        what would be sent, even if the file changed since the link was minted."""
-        monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", str(len(self.PAYLOAD) - 1))
+    async def test_a_streamed_file_is_not_size_capped(self, drive, monkeypatch):
+        """One chunk is in memory at a time, so the cap (which bounds buffered
+        bodies) does not apply, as on the stored-copy path."""
+        monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", "10")
+        result = await sd._fetch_drive({"fid": "F"}, Mock())
+        assert b"".join([c async for c in result.stream]) == self.PAYLOAD
+
+    @pytest.mark.asyncio
+    async def test_a_buffered_export_is_size_capped(self, drive, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", "10")
         with pytest.raises(sd.SignedDownloadError) as caught:
-            await sd._fetch_drive({"fid": "F"}, Mock())
+            await sd._fetch_drive({"fid": "D", "emt": "application/pdf"}, Mock())
         assert caught.value.status == 413
 
     @pytest.mark.asyncio
@@ -1558,7 +1563,7 @@ class TestRouteResources:
                 filename="f.bin",
                 media_type="application/octet-stream",
                 stream=chunks(),
-                close=lambda: closed.append(True),
+                close=lambda done: (closed.append(True), done()),
             )
 
         monkeypatch.setitem(sd._FETCHERS, "gmail", streaming)
@@ -1587,7 +1592,7 @@ class TestRouteResources:
                 filename="f.bin",
                 media_type="application/octet-stream",
                 stream=chunks(),
-                close=lambda: closed.append(True),
+                close=lambda done: (closed.append(True), done()),
             )
 
         monkeypatch.setitem(sd._FETCHERS, "gmail", streaming)
@@ -1786,16 +1791,22 @@ class TestLimitsLoggingAndStartup:
         sd._RedactSignedTokens().filter(record)
         assert record.getMessage() == "/attachments/signed/* must be public"
 
-    def test_redaction_reaches_the_middleware_log(self):
+    def test_every_log_record_is_redacted_once_installed(self):
+        """Through the record factory, so any logger and any handler — even one
+        added after startup — sees the redacted text."""
         sd.install_access_log_redaction()
-        middleware = logging.getLogger("auth.mcp_session_middleware")
-        assert any(isinstance(f, sd._RedactSignedTokens) for f in middleware.filters)
+        sd.install_access_log_redaction()  # idempotent
+        seen = []
 
-    def test_startup_installs_the_redaction_once(self):
-        sd.validate_startup("streamable-http")
-        sd.validate_startup("streamable-http")
-        access = logging.getLogger("uvicorn.access")
-        assert sum(isinstance(f, sd._RedactSignedTokens) for f in access.filters) == 1
+        class Capture(logging.Handler):
+            def emit(self, record):
+                seen.append(record.getMessage())
+
+        late = logging.getLogger("some.later.logger")
+        late.addHandler(Capture())
+        late.setLevel(logging.INFO)
+        late.info("GET %s", "/attachments/signed/gAAAAABsecretTokenBodyXYZ")
+        assert seen == ["GET /attachments/signed/<redacted>"]
 
     def test_external_provider_mode_refuses(self, monkeypatch):
         monkeypatch.setattr(
@@ -1845,8 +1856,10 @@ class TestLimitsLoggingAndStartup:
                 filename="f.bin",
                 media_type="application/octet-stream",
                 stream=chunks(),
-                close=lambda: closed.append(True),
-                in_flight=lambda: chunk_task,
+                # Like Drive: finish closing only once the pending chunk is done.
+                close=lambda done: chunk_task.add_done_callback(
+                    lambda _: (closed.append(True), done())
+                ),
             )
 
         monkeypatch.setitem(sd._FETCHERS, "gmail", streaming)
@@ -1877,6 +1890,7 @@ class TestLimitsLoggingAndStartup:
         monkeypatch.setattr(sd, "build", lambda *a, **k: Mock(files=lambda: files))
         monkeypatch.setattr(sd, "MediaIoBaseDownload", Slow)
         monkeypatch.setattr(drive_tools, "DOWNLOAD_CHUNK_SIZE", 8)
+        monkeypatch.setattr(sd, "_close_service", lambda service: None)
 
         result = await sd._fetch_drive({"fid": "F"}, Mock())
         assert await result.stream.__anext__() == b"x" * 8
@@ -1885,18 +1899,26 @@ class TestLimitsLoggingAndStartup:
         reading.cancel()
         with pytest.raises(asyncio.CancelledError):
             await reading
-        chunk = result.in_flight()
-        assert chunk is not None and not chunk.done()
+        done = asyncio.Event()
+        result.close(done.set)
+        await asyncio.sleep(0.05)
+        assert not done.is_set()  # the worker thread still has the client
         release_chunk.set()
-        await chunk
+        await asyncio.wait_for(done.wait(), 5)
 
 
 class TestCredentialChoice:
-    def test_a_usable_session_is_used_without_the_store(self, stores):
-        stores.session = {USER: _credentials(token="ya29.session")}
+    def test_a_refreshable_store_entry_beats_a_bare_session_token(self, stores):
+        """Even with minutes left on it: the bare token would fail mid-download
+        once it expires, and would shorten or block links meanwhile."""
+        stores.session = {USER: _credentials(seconds_left=300, token="ya29.session")}
         stores.persistent = {USER: _credentials(token="ya29.store", refresh_token="r")}
-        assert sd._recover_credentials(USER).token == "ya29.session"
-        assert stores.persistent_lookups == []
+        assert sd._recover_credentials(USER).token == "ya29.store"
+
+    def test_between_bare_tokens_the_longer_lived_wins(self, stores):
+        stores.session = {USER: _credentials(seconds_left=600, token="ya29.session")}
+        stores.persistent = {USER: _credentials(seconds_left=3000, token="ya29.store")}
+        assert sd._recover_credentials(USER).token == "ya29.store"
 
     def test_a_spent_session_falls_back_to_the_store(self, stores):
         stores.session = {USER: _credentials(seconds_left=100, token="ya29.session")}
@@ -1907,3 +1929,72 @@ class TestCredentialChoice:
         stores.session = {USER: _credentials(seconds_left=100, token="ya29.session")}
         monkeypatch.setattr(stores, "get_credential", Mock(side_effect=OSError("db")))
         assert sd._recover_credentials(USER).token == "ya29.session"
+
+
+class TestProductionPaths:
+    @pytest.fixture(autouse=True)
+    def _on(self, monkeypatch):
+        monkeypatch.setenv(sd.FLAG_ENV, "true")
+
+    @pytest.mark.asyncio
+    async def test_a_disconnect_on_spec_2_3_releases_everything(
+        self, stores, monkeypatch
+    ):
+        """uvicorn reports ASGI 2.3: Starlette watches receive() for a
+        disconnect and cancels the body. Cleanup must still run."""
+        stores.session = {USER: _credentials()}
+        closed = []
+
+        async def endless():
+            while True:
+                yield b"x"
+                await asyncio.sleep(0.01)
+
+        async def streaming(claims, credentials):
+            return sd.DownloadResult(
+                filename="f",
+                media_type="a/b",
+                stream=endless(),
+                close=lambda done: (closed.append(True), done()),
+            )
+
+        monkeypatch.setitem(sd._FETCHERS, "gmail", streaming)
+        response = await sd.serve(_token(_mint()))
+        bodies = 0
+
+        async def receive():
+            while bodies < 2:
+                await asyncio.sleep(0.01)
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            nonlocal bodies
+            if message["type"] == "http.response.body":
+                bodies += 1
+
+        await response({"type": "http", "asgi": {"spec_version": "2.3"}}, receive, send)
+        assert closed == [True] and sd._owner_downloads == {}
+
+    @pytest.mark.asyncio
+    async def test_a_failed_hand_off_closes_the_client_too(self, stores, monkeypatch):
+        stores.session = {USER: _credentials()}
+        closed = []
+
+        async def body():
+            yield b"x"
+
+        async def streaming(claims, credentials):
+            return sd.DownloadResult(
+                filename="f",
+                media_type="a/b",
+                stream=body(),
+                close=lambda done: (closed.append(True), done()),
+            )
+
+        monkeypatch.setitem(sd._FETCHERS, "gmail", streaming)
+        monkeypatch.setattr(
+            sd, "_GuardedStreamingResponse", Mock(side_effect=ValueError)
+        )
+        with pytest.raises(ValueError):
+            await sd.serve(_token(_mint()))
+        assert closed == [True] and sd._owner_downloads == {}

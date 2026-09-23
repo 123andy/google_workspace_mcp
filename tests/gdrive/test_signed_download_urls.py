@@ -144,19 +144,3 @@ async def test_items_with_no_bytes_get_no_link(download, enabled, mime):
                 service=_service(mime, "thing"), user_google_email=USER, file_id="x"
             )
     offer.assert_not_called()
-
-
-@pytest.mark.asyncio
-@patch("gdrive.drive_tools._download_file_to_temp", new_callable=AsyncMock)
-async def test_a_file_over_the_size_cap_gets_no_link(download, enabled, monkeypatch):
-    """The route would refuse it on fetch; the normal path handles it now."""
-    monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", "100")
-    download.side_effect = RuntimeError("normal path")
-    with patch.object(sd, "offer_url", new_callable=AsyncMock) as offer:
-        with pytest.raises(RuntimeError):
-            await _unwrap(get_drive_file_download_url)(
-                service=_service("video/mp4", "clip.mp4", size="300"),
-                user_google_email=USER,
-                file_id="v-1",
-            )
-    offer.assert_not_called()
