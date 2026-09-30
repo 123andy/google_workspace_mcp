@@ -87,12 +87,16 @@ async def test_stateless_fallback_is_loud_when_url_cannot_be_minted(
     download.return_value = blob
 
     with patch.object(sd, "offer_url", return_value=None):
-        result = await _unwrap(get_drive_file_download_url)(
+        tool_result = await _unwrap(get_drive_file_download_url)(
             service=_service("video/mp4", "clip.mp4"),
             user_google_email=USER,
             file_id="v-1",
         )
 
+    # Stateless mode returns the file inline as an embedded resource (upstream
+    # v1.30); the summary text is the first content block.
+    assert tool_result.content[1].resource.blob
+    result = tool_result.content[0].text
     assert "downloaded successfully" not in result
     assert "NO download URL could be issued" in result
     assert "could not recover usable credentials" in result
@@ -112,9 +116,10 @@ async def test_stateless_wording_unchanged_when_feature_off(
     blob.write_bytes(b"x" * 300)
     download.return_value = blob
 
-    result = await _unwrap(get_drive_file_download_url)(
+    tool_result = await _unwrap(get_drive_file_download_url)(
         service=_service("video/mp4", "clip.mp4"), user_google_email=USER, file_id="v-1"
     )
 
+    result = tool_result.content[0].text
     assert result.startswith("File downloaded successfully!")
     assert "signed" not in result.lower()
