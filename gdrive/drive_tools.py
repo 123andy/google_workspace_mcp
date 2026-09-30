@@ -645,7 +645,9 @@ async def get_drive_file_download_url(
             tmp_path.unlink(missing_ok=True)
         summary = "\n".join(
             [
-                "File downloaded successfully!",
+                "File fetched, but NO download URL could be issued."
+                if no_url
+                else "File downloaded successfully!",
                 f"File: {file_name}",
                 f"File ID: {file_id}",
                 f"Size: {size_kb:.1f} KB ({size_bytes} bytes)",
