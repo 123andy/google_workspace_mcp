@@ -484,7 +484,7 @@ async def _fetch_gmail_message(
 
 async def _fetch_drive(claims: dict, credentials: Credentials) -> DownloadResult:
     """Stream a Drive file in bounded chunks; ``emt`` set means export a native file."""
-    from gdrive.drive_tools import DOWNLOAD_CHUNK_SIZE, _media_request
+    from gdrive.drive_helpers import STREAMED_DOWNLOAD_CHUNK_SIZE_BYTES, _media_request
 
     file_id = claims.get("fid")
     if not file_id:
@@ -495,7 +495,7 @@ async def _fetch_drive(claims: dict, credentials: Credentials) -> DownloadResult
     downloader = MediaIoBaseDownload(
         buffer,
         _media_request(drive, file_id, export_mime),
-        chunksize=DOWNLOAD_CHUNK_SIZE,
+        chunksize=STREAMED_DOWNLOAD_CHUNK_SIZE_BYTES,
     )
 
     def next_chunk() -> tuple[bytes, bool]:

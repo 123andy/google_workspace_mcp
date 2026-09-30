@@ -1021,13 +1021,15 @@ class TestDriveFetcher:
 
     @pytest.fixture
     def drive(self, monkeypatch):
-        import gdrive.drive_tools as drive_tools
+        import gdrive.drive_helpers as drive_helpers
 
         calls = []
         files = _FakeFiles(calls, self.PAYLOAD)
         monkeypatch.setattr(sd, "build", lambda *a, **k: Mock(files=lambda: files))
         monkeypatch.setattr(sd, "MediaIoBaseDownload", _FakeDownloader)
-        monkeypatch.setattr(drive_tools, "DOWNLOAD_CHUNK_SIZE", self.CHUNK)
+        monkeypatch.setattr(
+            drive_helpers, "STREAMED_DOWNLOAD_CHUNK_SIZE_BYTES", self.CHUNK
+        )
         return calls
 
     @pytest.mark.asyncio
@@ -1075,7 +1077,7 @@ class TestDriveFetcher:
     @pytest.fixture
     def fails_on_second_chunk(self, monkeypatch):
         """Drive answers the first chunk, then the connection to Google drops."""
-        import gdrive.drive_tools as drive_tools
+        import gdrive.drive_helpers as drive_helpers
 
         class Flaky(_FakeDownloader):
             def next_chunk(self):
@@ -1086,7 +1088,9 @@ class TestDriveFetcher:
         files = _FakeFiles([], self.PAYLOAD)
         monkeypatch.setattr(sd, "build", lambda *a, **k: Mock(files=lambda: files))
         monkeypatch.setattr(sd, "MediaIoBaseDownload", Flaky)
-        monkeypatch.setattr(drive_tools, "DOWNLOAD_CHUNK_SIZE", self.CHUNK)
+        monkeypatch.setattr(
+            drive_helpers, "STREAMED_DOWNLOAD_CHUNK_SIZE_BYTES", self.CHUNK
+        )
 
     @pytest.mark.asyncio
     async def test_mid_stream_failure_raises_instead_of_ending_cleanly(
