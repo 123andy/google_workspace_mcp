@@ -459,3 +459,48 @@ raise SystemExit("main() was not stopped by the sentinel")
         assert payload["scopes"] == sorted(
             set(BASE_SCOPES) | {GMAIL_SEND_SCOPE, GMAIL_COMPOSE_SCOPE, DRIVE_FILE_SCOPE}
         )
+
+    def test_unselected_tool_surviving_removal_fails_startup(self):
+        """Tool removal only warns when it fails, so an unselected tool could
+        stay registered. --only-tools must refuse to start rather than serve a
+        wider surface than the one requested (CodeRabbit finding on #1207).
+        """
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        code = """
+import os, sys
+import main
+
+provider = main.server.local_provider
+real_remove = provider.remove_tool
+
+def _remove(name, *a, **k):
+    if name == "list_gmail_labels":
+        raise RuntimeError("simulated removal failure")
+    return real_remove(name, *a, **k)
+
+provider.remove_tool = _remove
+# Next hook after the surface check; hard-exit so no server binds (main()
+# swallows ordinary exceptions).
+main.set_transport_mode = lambda *_a, **_k: os._exit(0)
+sys.argv = ["main.py", "--only-tools", "send_gmail_message"]
+main.main()
+"""
+        env = {
+            **os.environ,
+            "MCP_ENABLE_OAUTH21": "false",
+            "WORKSPACE_MCP_STATELESS_MODE": "false",
+        }
+        for var in SELECTION_ENV_VARS:
+            env.pop(var, None)
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        assert result.returncode == 1, (
+            f"expected startup failure:\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        assert "left unselected tool(s) registered: list_gmail_labels" in result.stderr

@@ -870,6 +870,17 @@ def main():
                 file=sys.stderr,
             )
             sys.exit(1)
+        # Tool removal only warns on failure, so an unselected tool could
+        # survive filtering; the exact surface is the point of this flag.
+        extra = sorted(set(components) - set(requested))
+        if extra:
+            print(
+                f"Error: --only-tools left unselected tool(s) registered: "
+                f"{', '.join(extra)}. Refusing to start with a wider surface "
+                f"than requested.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         if scopeless:
             # A selected tool declaring no scopes usually means the decorator
             # metadata moved out from under us — the derived grant would then be
