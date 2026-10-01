@@ -1,0 +1,61 @@
+# Scientist.com image build. A `sci-v<base>-<n>` tag on `sci-prod` builds
+# deploy/scientist/Dockerfile and pushes ECR google-workspace-mcp-server:<base>-<n>, via the org
+# reusable workflow scientist-hq/build-image (native dual-arch, stitched into one tag). A PR to
+# `sci-prod` runs a proof build that writes nothing to the registry.
+#
+# This file and deploy/scientist/ are this repo's only Scientist-specific commits; they are
+# cherry-picked last whenever `sci-prod` is reset onto a new upstream base. Release procedure and
+# deploy: mcp-gateway docs/releasing-and-gitops.md.
+#
+# AWS roles (infra terraform/gha-aws-service-accounts/): gha-google-workspace-mcp-image (push; trusts
+# sci-v* tags only) and gha-google-workspace-mcp-image-read-only (PR proof builds; build-image logs
+# into ECR on every leg). Both role branches carry the full ARN: in `a && b || c`, an empty b falls
+# through to c. `ecr_repo` must be passed: build-image defaults it to this repo's name.
+name: "Docker: google-workspace-mcp-server"
+
+on:
+  push:
+    tags: ["sci-v*"]
+  pull_request:
+    branches: [sci-prod]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  tag:
+    runs-on: amd64-2x4
+    outputs:
+      tag: ${{ steps.compute.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        if: github.ref_type == 'tag'
+        with:
+          fetch-depth: 0
+      - id: compute
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            # Tags are immutable in ECR, so refuse anything that isn't a release cut from sci-prod.
+            if ! [[ "$GITHUB_REF_NAME" =~ ^sci-v[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]]; then
+              echo "::error::tag must look like sci-v1.29.0-1"; exit 1
+            fi
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/sci-prod; then
+              echo "::error::tagged commit is not on sci-prod"; exit 1
+            fi
+            # sci-v1.29.0-1 -> 1.29.0-1
+            echo "tag=${GITHUB_REF_NAME#sci-v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=pr-proof" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: tag
+    uses: scientist-hq/build-image/.github/workflows/build-image.yml@70975cde974491b1d7ed10730e4e823a8750516a # 0.4.0
+    with:
+      image_tag: ${{ needs.tag.outputs.tag }}
+      ecr_repo: google-workspace-mcp-server
+      context: .
+      dockerfile: deploy/scientist/Dockerfile
+      push: ${{ github.ref_type == 'tag' }}
+      iam_role_arn: ${{ github.ref_type == 'tag' && 'arn:aws:iam::554546661178:role/gha-google-workspace-mcp-image' || 'arn:aws:iam::554546661178:role/gha-google-workspace-mcp-image-read-only' }}
