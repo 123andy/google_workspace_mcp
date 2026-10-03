@@ -28,6 +28,7 @@ from core.file_limits import (
 from core.utils import (
     GOOGLE_API_WRITE_RETRIES,
     OfficeXmlExtractionError,
+    OfficeXmlTooLargeError,
     extract_office_xml_text,
     handle_http_errors,
     UserInputError,
@@ -81,6 +82,7 @@ from gdocs.managers import (
     ValidationManager,
     BatchOperationManager,
 )
+from gdrive.drive_helpers import flag_incomplete_search, move_new_file_to_folder
 import json
 
 logger = logging.getLogger(__name__)
@@ -142,12 +144,26 @@ async def search_docs(
     user_google_email: str,
     query: str,
     page_size: int = 10,
+    page_token: Optional[str] = None,
+    corpora: Optional[str] = None,
+    drive_id: Optional[str] = None,
 ) -> str:
     """
     Searches for Google Docs by name using Drive API (mimeType filter).
 
+    Args:
+        user_google_email: The user's Google email address.
+        query: Text to search for in document names.
+        page_size: Maximum number of documents to return. Defaults to 10.
+        page_token: Page token from a previous response's nextPageToken to
+            retrieve the next page of results.
+        corpora: Corpus to search ('user', 'domain', 'drive', 'allDrives').
+            Defaults to 'drive' when drive_id is set, otherwise 'allDrives'.
+        drive_id: Optional shared drive ID to search.
+
     Returns:
         str: A formatted list of Google Docs matching the search query.
+            Includes a nextPageToken line when more results are available.
     """
     logger.info(f"[search_docs] Email={user_google_email}, query_len={len(query)}")
     logger.debug(f"[search_docs] Query='{query}'")
@@ -159,22 +175,30 @@ async def search_docs(
         .list(
             q=f"name contains '{escaped_query}' and mimeType='application/vnd.google-apps.document' and trashed=false",
             pageSize=page_size,
-            fields="files(id, name, createdTime, modifiedTime, webViewLink)",
+            pageToken=page_token,
+            fields="nextPageToken, incompleteSearch, files(id, name, createdTime, modifiedTime, webViewLink)",
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
+            corpora=corpora or ("drive" if drive_id else "allDrives"),
+            driveId=drive_id,
         )
         .execute
     )
     files = response.get("files", [])
-    if not files:
-        return f"No Google Docs found matching '{query}'."
+    next_token = response.get("nextPageToken")
+    if not files and not next_token:
+        return flag_incomplete_search(
+            f"No Google Docs found matching '{query}'.", response
+        )
 
     output = [f"Found {len(files)} Google Docs matching '{query}':"]
     for f in files:
         output.append(
             f"- {f['name']} (ID: {f['id']}) Modified: {f.get('modifiedTime')} Link: {f.get('webViewLink')}"
         )
-    return "\n".join(output)
+    if next_token:
+        output.append(f"nextPageToken: {next_token}")
+    return flag_incomplete_search("\n".join(output), response)
 
 
 @server.tool(
@@ -365,6 +389,9 @@ async def get_doc_content(
 
         try:
             office_text = extract_office_xml_text(file_content_bytes, mime_type)
+        except OfficeXmlTooLargeError as e:
+            # Not damaged, and not to be retried as raw text: say what happened.
+            office_text = f"[Could not read '{mime_type}' file - {e}]"
         except OfficeXmlExtractionError as e:
             office_text = (
                 f"[Could not read '{mime_type}' file - it appears damaged or is "
@@ -400,13 +427,25 @@ async def get_doc_content(
 @handle_http_errors("list_docs_in_folder", is_read_only=True, service_type="docs")
 @require_google_service("drive", "drive_read")
 async def list_docs_in_folder(
-    service: Any, user_google_email: str, folder_id: str = "root", page_size: int = 100
+    service: Any,
+    user_google_email: str,
+    folder_id: str = "root",
+    page_size: int = 100,
+    page_token: Optional[str] = None,
 ) -> str:
     """
     Lists Google Docs within a specific Drive folder.
 
+    Args:
+        user_google_email: The user's Google email address.
+        folder_id: ID of the Drive folder to list. Defaults to 'root'.
+        page_size: Maximum number of documents to return. Defaults to 100.
+        page_token: Page token from a previous response's nextPageToken to
+            retrieve the next page of results.
+
     Returns:
         str: A formatted list of Google Docs in the specified folder.
+            Includes a nextPageToken line when more results are available.
     """
     logger.info(
         f"[list_docs_in_folder] Invoked. Email: '{user_google_email}', Folder ID: '{folder_id}'"
@@ -417,20 +456,24 @@ async def list_docs_in_folder(
         .list(
             q=f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.document' and trashed=false",
             pageSize=page_size,
-            fields="files(id, name, modifiedTime, webViewLink)",
+            pageToken=page_token,
+            fields="nextPageToken, files(id, name, modifiedTime, webViewLink)",
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
         )
         .execute
     )
     items = rsp.get("files", [])
-    if not items:
+    next_token = rsp.get("nextPageToken")
+    if not items and not next_token:
         return f"No Google Docs found in folder '{folder_id}'."
     out = [f"Found {len(items)} Docs in folder '{folder_id}':"]
     for f in items:
         out.append(
             f"- {f['name']} (ID: {f['id']}) Modified: {f.get('modifiedTime')} Link: {f.get('webViewLink')}"
         )
+    if next_token:
+        out.append(f"nextPageToken: {next_token}")
     return "\n".join(out)
 
 
@@ -450,6 +493,7 @@ async def create_doc(
     user_google_email: str,
     title: str,
     content: str = "",
+    folder_id: str = "root",
 ) -> str:
     """
     Creates a new Google Doc and optionally inserts initial content.
@@ -466,18 +510,26 @@ async def create_doc(
         user_google_email: User's Google email address
         title: Title of the new document
         content: Optional initial plain text content to insert
+        folder_id: The ID of the parent folder. Defaults to 'root'. For shared
+            drives, this must be a folder ID within the shared drive.
 
     Returns:
         str: Confirmation message with document ID, link, and initial document state.
     """
     logger.info(
-        f"[create_doc] Invoked. Email: '{user_google_email}', title_len={len(title)}"
+        f"[create_doc] Invoked. Email: '{user_google_email}', title_len={len(title)}, "
+        f"folder_id='{folder_id}'"
     )
 
     doc = await asyncio.to_thread(
         service.documents().create(body={"title": title}).execute
     )
     doc_id = doc.get("documentId")
+
+    placement_note = await move_new_file_to_folder(
+        user_google_email, doc_id, folder_id, "create_doc"
+    )
+
     if content:
         requests = [{"insertText": {"location": {"index": 1}, "text": content}}]
         await asyncio.to_thread(
@@ -491,7 +543,8 @@ async def create_doc(
     else:
         content_note = "Document is empty (body starts at index 1, total length 2)."
     msg = (
-        f"Created Google Doc '{title}' (ID: {doc_id}) for {user_google_email}. "
+        f"Created Google Doc '{title}' (ID: {doc_id}) for {user_google_email}."
+        f"{placement_note} "
         f"{content_note} "
         f"Use batch_update_doc with end_of_segment=true to append content. "
         f"Link: {link}"

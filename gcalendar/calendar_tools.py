@@ -18,7 +18,7 @@ from googleapiclient.errors import HttpError
 from googleapiclient.discovery import build
 
 from auth.service_decorator import require_google_service
-from core.utils import handle_http_errors, StringList
+from core.utils import handle_http_errors, StringList, StringOrDictList, UserInputError
 from gcalendar.calendar_helpers import (
     _format_event_detail_lines,
     _format_event_time,
@@ -828,7 +828,7 @@ async def _create_event_impl(
     calendar_id: str = "primary",
     description: Optional[str] = None,
     location: Optional[str] = None,
-    attendees: Optional[List[str]] = None,
+    attendees: Optional[List[Union[str, Dict[str, Any]]]] = None,
     timezone: Optional[str] = None,
     attachments: Optional[List[str]] = None,
     add_google_meet: bool = False,
@@ -873,8 +873,9 @@ async def _create_event_impl(
         event_body["location"] = location
     if description:
         event_body["description"] = description
-    if attendees:
-        event_body["attendees"] = [{"email": email} for email in attendees]
+    normalized_attendees = _normalize_attendees(attendees)
+    if normalized_attendees is not None:
+        event_body["attendees"] = normalized_attendees
 
     # Handle reminders
     if reminders is not None or not use_default_reminders:
@@ -986,8 +987,12 @@ async def _create_event_impl(
     return confirmation_message
 
 
+class AttendeeValidationError(ValueError, UserInputError):
+    """Invalid attendee input, preserving ValueError compatibility for callers."""
+
+
 def _normalize_attendees(
-    attendees: Optional[Union[List[str], List[Dict[str, Any]]]],
+    attendees: Optional[List[Union[str, Dict[str, Any]]]],
 ) -> Optional[List[Dict[str, Any]]]:
     """
     Normalize attendees input to list of attendee objects.
@@ -998,6 +1003,10 @@ def _normalize_attendees(
     - Mixed list of both formats
 
     Returns list of attendee dicts with at minimum 'email' key.
+
+    Raises:
+        AttendeeValidationError: If an attendee is neither an email string nor a
+            dict with an 'email' key, so it is never silently left off the event.
     """
     if attendees is None:
         return None
@@ -1009,8 +1018,9 @@ def _normalize_attendees(
         elif isinstance(att, dict) and "email" in att:
             normalized.append(att)
         else:
-            logger.warning(
-                f"[_normalize_attendees] Invalid attendee format (type={type(att).__name__}), skipping"
+            raise AttendeeValidationError(
+                "Each attendee must be an email string or an object with an "
+                f"'email' key; got {type(att).__name__}"
             )
     return normalized if normalized else None
 
@@ -1025,7 +1035,7 @@ async def _modify_event_impl(
     end_time: Optional[str] = None,
     description: Optional[str] = None,
     location: Optional[str] = None,
-    attendees: Optional[Union[List[str], List[Dict[str, Any]]]] = None,
+    attendees: Optional[List[Union[str, Dict[str, Any]]]] = None,
     timezone: Optional[str] = None,
     add_google_meet: Optional[bool] = None,
     conference_data: Optional[Dict[str, Any]] = None,
@@ -1084,10 +1094,10 @@ async def _modify_event_impl(
         else:
             # Preserve existing event's useDefault value if not explicitly specified
             try:
-                existing_event = (
+                existing_event = await asyncio.to_thread(
                     service.events()
                     .get(calendarId=calendar_id, eventId=event_id)
-                    .execute()
+                    .execute
                 )
                 reminder_data["useDefault"] = existing_event.get("reminders", {}).get(
                     "useDefault", True
@@ -1412,7 +1422,7 @@ async def manage_event(
     calendar_id: str = "primary",
     description: Optional[str] = None,
     location: Optional[str] = None,
-    attendees: Optional[Union[StringList, List[Dict[str, Any]]]] = None,
+    attendees: Optional[StringOrDictList] = None,
     timezone: Optional[str] = None,
     attachments: Optional[StringList] = None,
     add_google_meet: Optional[bool] = None,
@@ -1450,7 +1460,7 @@ async def manage_event(
         calendar_id (str): Calendar ID (default: 'primary').
         description (Optional[str]): Event description.
         location (Optional[str]): Event location.
-        attendees (Optional[Union[List[str], List[Dict[str, Any]]]]): Attendee email addresses or objects.
+        attendees (Optional[List[Union[str, Dict[str, Any]]]]): Attendee email addresses, attendee objects (e.g. {"email": ..., "responseStatus": "accepted"}), or a mix of both.
         timezone (Optional[str]): IANA timezone applied to both boundaries (e.g.,
             "America/New_York"). Converts offset-bearing timestamps without changing their
             instant; interprets offset-free timestamps as local times in this zone.

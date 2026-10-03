@@ -71,6 +71,11 @@ class TestSheetsScopes:
         scopes = get_scopes_for_tools(["sheets"])
         assert DRIVE_READONLY_SCOPE in scopes
 
+    def test_sheets_includes_drive_file(self):
+        """create_spreadsheet needs drive.file to move the new file into a folder."""
+        scopes = get_scopes_for_tools(["sheets"])
+        assert DRIVE_FILE_SCOPE in scopes
+
     def test_sheets_does_not_include_full_drive(self):
         """sheets should NOT request full drive access."""
         scopes = get_scopes_for_tools(["sheets"])
@@ -117,6 +122,12 @@ class TestReadOnlyScopes:
         set_read_only(True)
         scopes = get_scopes_for_tools(["sheets"])
         assert DRIVE_READONLY_SCOPE in scopes
+
+    def test_sheets_readonly_excludes_drive_file(self):
+        """In read-only mode, sheets should NOT request drive.file."""
+        set_read_only(True)
+        scopes = get_scopes_for_tools(["sheets"])
+        assert DRIVE_FILE_SCOPE not in scopes
 
 
 def _chat_readonly_permission():

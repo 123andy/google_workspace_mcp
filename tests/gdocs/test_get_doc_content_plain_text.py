@@ -7,6 +7,12 @@ import pytest
 from gdocs import docs_tools
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_office_xml_limit(monkeypatch):
+    """The expansion limit is read from the environment on every extraction."""
+    monkeypatch.delenv("WORKSPACE_MCP_MAX_OFFICE_XML_BYTES", raising=False)
+
+
 def _unwrap(tool):
     """Unwrap the MCP tool and decorators to exercise its implementation directly."""
     fn = tool.fn if hasattr(tool, "fn") else tool
@@ -147,3 +153,27 @@ async def test_office_extraction_is_unaffected(monkeypatch, preserve_context):
     download.assert_awaited_once()
     extract.assert_called_once()
     docs.documents.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_office_file_over_the_expansion_limit_is_reported_as_such(monkeypatch):
+    drive, docs = _services(
+        {}, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+    monkeypatch.setattr(
+        docs_tools, "download_media_bytes", AsyncMock(return_value=b"office bytes")
+    )
+    monkeypatch.setattr(
+        docs_tools,
+        "extract_office_xml_text",
+        Mock(side_effect=docs_tools.OfficeXmlTooLargeError("part expands beyond")),
+    )
+    result = await _unwrap(docs_tools.get_doc_content)(
+        drive_service=drive,
+        docs_service=docs,
+        user_google_email="reader@example.com",
+        document_id="file-1",
+    )
+    assert "part expands beyond" in result
+    assert "appears damaged" not in result
+    assert "office bytes" not in result

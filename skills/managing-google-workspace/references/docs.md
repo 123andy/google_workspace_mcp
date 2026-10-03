@@ -74,6 +74,7 @@ Creates a new Google Doc with optional initial content.
 | user_google_email | string | yes | | |
 | title | string | yes | | Document title |
 | content | string | no | (empty) | Initial text content |
+| folder_id | string | no | root | Parent folder. Accepts a folder ID or shortcut; for shared drives, a folder inside that drive. If the move fails, the doc is still created in My Drive root and the reply reports why |
 
 ---
 

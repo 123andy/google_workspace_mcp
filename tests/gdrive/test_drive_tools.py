@@ -19,6 +19,9 @@ import zipfile
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 from gdrive.drive_helpers import (
+    INCOMPLETE_SEARCH_WARNING,
+    SHARED_DRIVE_ORGANIZER_CONCURRENCY_LIMIT,
+    _create_drive_folder_impl,
     build_drive_list_params,
     has_explicit_trashed_clause,
     resolve_drive_item,
@@ -31,6 +34,7 @@ from gdrive.drive_tools import (
     import_to_google_slides,
     list_drive_items,
     search_drive_files,
+    set_drive_file_permissions,
     update_drive_file,
 )
 
@@ -439,6 +443,51 @@ async def test_create_drive_file_normalizes_mixed_case_odt_mime_for_zip_validati
 
 
 # ---------------------------------------------------------------------------
+# set_drive_file_permissions - link sharing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@patch("gdrive.drive_tools.resolve_drive_item", new_callable=AsyncMock)
+async def test_link_sharing_off_finds_anyone_permission_on_a_later_page(
+    mock_resolve_item,
+):
+    """A public link past the first page of permissions is still removed."""
+    mock_resolve_item.return_value = ("file123", {"name": "Budget"})
+    mock_service = Mock()
+    pages = {
+        None: {
+            "permissions": [
+                {"id": f"u{i}", "type": "user", "role": "reader"} for i in range(100)
+            ],
+            "nextPageToken": "page2",
+        },
+        "page2": {
+            "permissions": [{"id": "anyone1", "type": "anyone", "role": "reader"}]
+        },
+    }
+
+    def list_permissions(**kwargs):
+        request = Mock()
+        request.execute.return_value = pages[kwargs.get("pageToken")]
+        return request
+
+    mock_service.permissions().list.side_effect = list_permissions
+
+    result = await _unwrap(set_drive_file_permissions)(
+        service=mock_service,
+        user_google_email="user@example.com",
+        file_id="file123",
+        link_sharing="off",
+    )
+
+    mock_service.permissions().delete.assert_called_once_with(
+        fileId="file123", permissionId="anyone1", supportsAllDrives=True
+    )
+    assert "Link sharing: disabled" in result
+
+
+# ---------------------------------------------------------------------------
 # get_drive_file_permissions - owners
 # ---------------------------------------------------------------------------
 
@@ -840,8 +889,6 @@ def _make_file(
 @pytest.mark.asyncio
 async def test_create_drive_folder():
     """Test create_drive_folder returns success message with folder id, name, and link."""
-    from gdrive.drive_tools import _create_drive_folder_impl
-
     mock_service = Mock()
     mock_response = {
         "id": "folder123",
@@ -853,7 +900,7 @@ async def test_create_drive_folder():
     mock_service.files.return_value.create.return_value = mock_request
 
     with patch(
-        "gdrive.drive_tools.resolve_folder_id",
+        "gdrive.drive_helpers.resolve_folder_id",
         new_callable=AsyncMock,
         return_value="root",
     ):
@@ -937,13 +984,111 @@ def test_build_params_order_by_omits_whitespace_only_values():
     assert "orderBy" not in params
 
 
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        ({}, "allDrives"),
+        ({"corpora": "user"}, "user"),
+        ({"drive_id": "d1"}, "drive"),
+        ({"drive_id": "d1", "corpora": "allDrives"}, "allDrives"),
+    ],
+)
+def test_build_params_corpora_defaults(kwargs, expected):
+    """Shared drives are searched by default instead of the API's 'user' corpus."""
+    params = build_drive_list_params(query="q", page_size=5, **kwargs)
+    assert params["corpora"] == expected
+
+
+def test_build_params_omits_corpora_when_excluding_shared_drives():
+    """'allDrives' requires includeItemsFromAllDrives, so it is not defaulted without it."""
+    params = build_drive_list_params(
+        query="q", page_size=5, include_items_from_all_drives=False
+    )
+    assert "corpora" not in params
+
+
+@pytest.mark.parametrize("detailed", [True, False])
+def test_build_params_requests_incomplete_search(detailed):
+    """incompleteSearch is requested so partial allDrives results can be flagged."""
+    params = build_drive_list_params(query="q", page_size=5, detailed=detailed)
+    assert "incompleteSearch" in params["fields"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("files", [[], [{"id": "f1", "name": "A", "mimeType": "x"}]])
+@patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+async def test_drive_listings_warn_on_incomplete_search(mock_resolve_folder, files):
+    """Both listing tools flag incompleteSearch, including when nothing matched."""
+    mock_resolve_folder.return_value = "root"
+    mock_service = Mock()
+    mock_service.files().list().execute.return_value = {
+        "files": files,
+        "incompleteSearch": True,
+    }
+
+    search_result = await _unwrap(search_drive_files)(
+        service=mock_service, user_google_email="user@example.com", query="a"
+    )
+    list_result = await _unwrap(list_drive_items)(
+        service=mock_service, user_google_email="user@example.com"
+    )
+
+    assert search_result.endswith(INCOMPLETE_SEARCH_WARNING)
+    assert list_result.endswith(INCOMPLETE_SEARCH_WARNING)
+
+
+@pytest.mark.asyncio
+async def test_search_drive_files_no_warning_when_search_complete():
+    """No incompleteSearch warning is added when Drive searched every corpus."""
+    mock_service = Mock()
+    mock_service.files().list().execute.return_value = {
+        "files": [{"id": "f1", "name": "A", "mimeType": "x"}],
+        "incompleteSearch": False,
+    }
+
+    result = await _unwrap(search_drive_files)(
+        service=mock_service, user_google_email="user@example.com", query="a"
+    )
+
+    assert INCOMPLETE_SEARCH_WARNING not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("incomplete", [False, True])
+@pytest.mark.parametrize("detailed", [False, True])
+@patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+async def test_drive_listings_keep_empty_page_token(
+    mock_resolve_folder, incomplete, detailed
+):
+    """An empty page may have more results; preserve its token and warning."""
+    mock_resolve_folder.return_value = "root"
+    service = Mock()
+    service.files().list().execute.return_value = {
+        "files": [],
+        "nextPageToken": "next-page",
+        "incompleteSearch": incomplete,
+    }
+
+    for tool, kwargs in [(search_drive_files, {"query": "a"}), (list_drive_items, {})]:
+        result = await _unwrap(tool)(
+            service=service,
+            user_google_email="user@example.com",
+            detailed=detailed,
+            **kwargs,
+        )
+        assert "nextPageToken: next-page" in result
+        assert "Found 0" in result
+        assert (INCOMPLETE_SEARCH_WARNING in result) is incomplete
+        assert "incompleteSearch" in service.files().list.call_args.kwargs["fields"]
+
+
 # ---------------------------------------------------------------------------
 # import_to_google_doc — upload retries
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-@patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+@patch("gdrive.drive_helpers.resolve_folder_id", new_callable=AsyncMock)
 async def test_import_to_google_doc_upload_uses_google_api_retries(mock_resolve_folder):
     """Drive uploads use googleapiclient's built-in retry handling."""
     mock_resolve_folder.return_value = "resolved_root"
@@ -1903,8 +2048,6 @@ async def test_list_drive_items_shared_drive_organizer_requests_do_not_overlap(
     monkeypatch,
 ):
     """Organizer requests on one service must finish before the next starts."""
-    from gdrive.drive_tools import SHARED_DRIVE_ORGANIZER_CONCURRENCY_LIMIT
-
     mock_service = Mock()
     mock_service.drives().list().execute.return_value = {
         "drives": [
@@ -2045,7 +2188,7 @@ def test_resolve_file_type_mime_empty_raises():
 
 @pytest.mark.asyncio
 @patch("gdrive.drive_helpers._download_url_to_bytes", new_callable=AsyncMock)
-@patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+@patch("gdrive.drive_helpers.resolve_folder_id", new_callable=AsyncMock)
 async def test_import_to_google_slides_converts_pptx(
     mock_resolve_folder, mock_download
 ):
@@ -2082,7 +2225,7 @@ async def test_import_to_google_slides_converts_pptx(
 
 @pytest.mark.asyncio
 @patch("gdrive.drive_helpers._download_url_to_bytes", new_callable=AsyncMock)
-@patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+@patch("gdrive.drive_helpers.resolve_folder_id", new_callable=AsyncMock)
 async def test_import_to_google_slides_detects_extension_before_url_query(
     mock_resolve_folder, mock_download
 ):
@@ -2127,7 +2270,7 @@ async def test_import_to_google_slides_rejects_unsupported_format():
 
 
 @pytest.mark.asyncio
-@patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+@patch("gdrive.drive_helpers.resolve_folder_id", new_callable=AsyncMock)
 async def test_import_to_google_sheets_converts_csv_content(mock_resolve_folder):
     """CSV content uploads as text/csv while the body targets Sheets."""
     mock_resolve_folder.return_value = "resolved_root"
@@ -2157,7 +2300,7 @@ async def test_import_to_google_sheets_converts_csv_content(mock_resolve_folder)
 
 
 @pytest.mark.asyncio
-@patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+@patch("gdrive.drive_helpers.resolve_folder_id", new_callable=AsyncMock)
 async def test_import_to_google_sheets_accepts_validated_inline_xlsx(
     mock_resolve_folder,
 ):
@@ -2213,7 +2356,7 @@ async def test_import_to_google_sheets_rejects_corrupt_inline_xlsx():
 
 
 @pytest.mark.asyncio
-@patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+@patch("gdrive.drive_helpers.resolve_folder_id", new_callable=AsyncMock)
 async def test_import_to_google_sheets_uses_google_api_retries(mock_resolve_folder):
     """Sheets conversion upload uses googleapiclient's built-in write retries."""
     mock_resolve_folder.return_value = "resolved_root"
@@ -2295,7 +2438,7 @@ async def test_import_to_google_slides_rejects_unsupported_source_via_allowlist(
 
 
 @pytest.mark.asyncio
-@patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+@patch("gdrive.drive_helpers.resolve_folder_id", new_callable=AsyncMock)
 async def test_import_to_google_sheets_accepts_csv_content(mock_resolve_folder):
     """csv is text-based AND in the Sheets allowlist: content still succeeds."""
     mock_resolve_folder.return_value = "resolved_root"
@@ -2322,7 +2465,7 @@ async def test_import_to_google_sheets_accepts_csv_content(mock_resolve_folder):
 
 
 @pytest.mark.asyncio
-@patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+@patch("gdrive.drive_helpers.resolve_folder_id", new_callable=AsyncMock)
 async def test_import_to_google_doc_accepts_markdown_content(mock_resolve_folder):
     """Backward-compat: markdown content into Docs still succeeds."""
     mock_resolve_folder.return_value = "resolved_root"
