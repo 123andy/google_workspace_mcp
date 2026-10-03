@@ -269,7 +269,7 @@ class TestUpdate:
         # (the fixture itself calls .get() bare to install a return value, so
         # filter to the real, argument-bearing invocation)
         real_gets = [c for c in service.users().drafts().get.call_args_list if c.kwargs]
-        assert real_gets == [call(userId="me", id="r-1", format="metadata")]
+        assert real_gets == [call(userId="me", id="r-1", format="full")]
 
     @pytest.mark.asyncio
     async def test_update_of_unthreaded_draft_stays_unthreaded(self):
@@ -297,11 +297,7 @@ class TestUpdate:
 
     @pytest.mark.asyncio
     async def test_explicit_thread_id_wins_over_the_stored_one(self):
-        """Inheriting must not block a deliberate re-thread.
-
-        Also pins the read-skip: cc/bcc are passed as "" rather than omitted so
-        that nothing is left to inherit, which is the only case where the
-        stored draft does not need reading at all."""
+        """Inheriting must not block a deliberate re-thread."""
         service = _mock_service(draft_headers=_THREADED_DRAFT_HEADERS)
         service.users().drafts().update().execute.return_value = {
             "id": "r-1",
@@ -317,8 +313,6 @@ class TestUpdate:
             subject="Re: Elsewhere",
             body="B",
             to="rcpt@example.com",
-            cc="",
-            bcc="",
             thread_id="t-9",
             in_reply_to="<other@example.com>",
             references="<other@example.com>",
@@ -326,9 +320,6 @@ class TestUpdate:
 
         body = service.users().drafts().update.call_args.kwargs["body"]
         assert body["message"]["threadId"] == "t-9"
-        # Every field the draft could supply was given explicitly, so there was
-        # nothing to read back.
-        service.users().drafts().get.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_unreadable_draft_fails_loudly_rather_than_detaching(self):
@@ -457,7 +448,8 @@ class TestUpdatePreservesAddressing:
     Gmail's drafts.update has no partial-update mode: the supplied MIME becomes
     the draft, so anything omitted is destroyed. A model revising a draft passes
     the new body and nothing else, which used to silently strip the recipients.
-    Omitted now means keep, "" means clear, a value means replace.
+    Omitted or blank means keep, clear_fields means clear, a value means
+    replace.
 
     Every assertion reads the REQUEST — the MIME actually handed to
     drafts().update — never the fixture. A fixture that returns a Cc proves
@@ -485,12 +477,16 @@ class TestUpdatePreservesAddressing:
         assert "Cc: watcher@example.com" in self._sent_raw(service)
 
     @pytest.mark.asyncio
-    async def test_empty_string_cc_clears_it(self):
+    async def test_clear_fields_cc_clears_it(self):
         """The explicit-clear half. Without it, preserving would be a one-way
         door: a caller could add a Cc but never remove one."""
         service = self._service()
         await _call(
-            service, action="update", draft_id="r-1", body="New wording.", cc=""
+            service,
+            action="update",
+            draft_id="r-1",
+            body="New wording.",
+            clear_fields=["cc"],
         )
         assert "Cc:" not in self._sent_raw(service)
 
@@ -521,10 +517,14 @@ class TestUpdatePreservesAddressing:
         assert "Bcc: archive@example.com" in self._sent_raw(service)
 
     @pytest.mark.asyncio
-    async def test_empty_string_bcc_clears_it(self):
+    async def test_clear_fields_bcc_clears_it(self):
         service = self._service()
         await _call(
-            service, action="update", draft_id="r-1", body="New wording.", bcc=""
+            service,
+            action="update",
+            draft_id="r-1",
+            body="New wording.",
+            clear_fields=["bcc"],
         )
         assert "Bcc:" not in self._sent_raw(service)
 
@@ -545,10 +545,14 @@ class TestUpdatePreservesAddressing:
         assert "Subject: Quarterly numbers" in self._sent_raw(service)
 
     @pytest.mark.asyncio
-    async def test_empty_string_subject_clears_it(self):
+    async def test_clear_fields_subject_clears_it(self):
         service = self._service()
         await _call(
-            service, action="update", draft_id="r-1", body="New wording.", subject=""
+            service,
+            action="update",
+            draft_id="r-1",
+            body="New wording.",
+            clear_fields=["subject"],
         )
         assert "Quarterly numbers" not in self._sent_raw(service)
 
@@ -565,6 +569,22 @@ class TestUpdatePreservesAddressing:
         assert "Subject: Quarterly numbers" in raw
         body = service.users().drafts().update.call_args.kwargs["body"]
         assert "threadId" not in body["message"]
+
+    @pytest.mark.asyncio
+    async def test_send_as_alias_from_is_preserved(self):
+        """A body-only rebuild must not move an alias draft onto the default
+        sender."""
+        service = _mock_service(
+            draft_headers=_ADDRESSED_DRAFT_HEADERS
+            + [{"name": "From", "value": "Biz Desk <biz@alias.example.com>"}]
+        )
+        service.users().drafts().update().execute.return_value = {
+            "id": "r-1",
+            "message": {"id": "m-2"},
+        }
+        service.users().drafts().update.reset_mock()
+        await _call(service, action="update", draft_id="r-1", body="New wording.")
+        assert "From: Biz Desk <biz@alias.example.com>" in self._sent_raw(service)
 
     @pytest.mark.asyncio
     async def test_create_does_not_inherit_anything(self):
@@ -605,7 +625,7 @@ def _stub_thread(service, subject: str = "Thread subject") -> None:
 
 
 class TestUpdateClearBeatsReplyDerivation:
-    """An explicit "" must not be quietly refilled from the thread.
+    """A cleared field must not be quietly refilled from the thread.
 
     The create path derives a missing subject/recipient from the message being
     replied to. That is a feature, and it stays — but on update it must not
@@ -632,22 +652,30 @@ class TestUpdateClearBeatsReplyDerivation:
     ]
 
     @pytest.mark.asyncio
-    async def test_explicit_empty_subject_is_not_refilled_from_the_thread(self):
+    async def test_cleared_subject_is_not_refilled_from_the_thread(self):
         service = self._service(self._HEADERS)
         await _call(
-            service, action="update", draft_id="r-1", body="New wording.", subject=""
+            service,
+            action="update",
+            draft_id="r-1",
+            body="New wording.",
+            clear_fields=["subject"],
         )
         raw = _decoded_raw(service.users().drafts().update.call_args.kwargs["body"])
         assert "Thread subject" not in raw
         assert "Stored subject" not in raw
 
     @pytest.mark.asyncio
-    async def test_explicit_empty_to_is_not_refilled_from_the_thread(self):
+    async def test_cleared_to_is_not_refilled_from_the_thread(self):
         """Same guard, recipient side: the reply target's From/Reply-To must
         not resurrect a recipient the caller just cleared."""
         service = self._service(self._HEADERS)
         await _call(
-            service, action="update", draft_id="r-1", body="New wording.", to=""
+            service,
+            action="update",
+            draft_id="r-1",
+            body="New wording.",
+            clear_fields=["to"],
         )
         raw = _decoded_raw(service.users().drafts().update.call_args.kwargs["body"])
         assert "sender@example.com" not in raw
@@ -852,9 +880,9 @@ class TestAddressingOnlyUpdatePatchesInPlace:
         assert after["attachments"][0][2] == _ATTACHMENT_BYTES
 
     @pytest.mark.asyncio
-    async def test_empty_cc_removes_the_header(self):
+    async def test_clearing_cc_removes_the_header(self):
         service = _patch_service()
-        await _call(service, action="update", draft_id="r-1", cc="")
+        await _call(service, action="update", draft_id="r-1", clear_fields=["cc"])
         sent = _sent_message_bytes(service).decode("utf-8", "replace")
         assert "Cc:" not in sent
         assert "watcher@example.com" not in sent
@@ -911,7 +939,7 @@ class TestAddressingOnlyUpdatePatchesInPlace:
     @pytest.mark.asyncio
     async def test_passing_a_body_takes_the_rebuild_path(self):
         """The boundary. A body means content was supplied, so the message is
-        rebuilt — and the rebuild says so, because attachments are lost there."""
+        rebuilt, and the response says so."""
         service = _mock_service(draft_headers=_ADDRESSED_DRAFT_HEADERS)
         service.users().drafts().update().execute.return_value = {
             "id": "r-1",
@@ -928,9 +956,9 @@ class TestAddressingOnlyUpdatePatchesInPlace:
             cc="new@example.com",
         )
 
-        # Metadata read, not raw — the rebuild path's inheritance.
+        # Full read, not raw: the rebuild path's inheritance.
         real_gets = [c for c in service.users().drafts().get.call_args_list if c.kwargs]
-        assert real_gets == [call(userId="me", id="r-1", format="metadata")]
+        assert real_gets == [call(userId="me", id="r-1", format="full")]
         raw = _decoded_raw(service.users().drafts().update.call_args.kwargs["body"])
         assert "Rewritten." in raw
         assert "Cc: new@example.com" in raw
@@ -1076,9 +1104,7 @@ class TestUpdateMustChangeSomething:
 
     It passed every gate: the addressing-only path needs an addressing field,
     so it fell through to the rebuild path and reconstructed the message from
-    empty arguments. The guard has to test for ABSENCE rather than falsiness —
-    cc="" and subject="" are real updates that clear a field, and rejecting
-    those would break the clear half of the contract.
+    empty arguments. A clear_fields entry is a real update on its own.
     """
 
     @pytest.mark.asyncio
@@ -1100,9 +1126,8 @@ class TestUpdateMustChangeSomething:
 
     @pytest.mark.asyncio
     async def test_clearing_the_cc_alone_is_a_real_update(self):
-        """The falsiness trap: "" is not "unspecified"."""
         service = _patch_service()
-        await _call(service, action="update", draft_id="r-1", cc="")
+        await _call(service, action="update", draft_id="r-1", clear_fields=["cc"])
         sent = _sent_message_bytes(service).decode("utf-8", "replace")
         assert "Cc:" not in sent
         assert "watcher@example.com" not in sent
@@ -1110,7 +1135,7 @@ class TestUpdateMustChangeSomething:
     @pytest.mark.asyncio
     async def test_clearing_the_subject_alone_is_a_real_update(self):
         service = _patch_service()
-        await _call(service, action="update", draft_id="r-1", subject="")
+        await _call(service, action="update", draft_id="r-1", clear_fields=["subject"])
         sent = _sent_message_bytes(service).decode("utf-8", "replace")
         assert "Quarterly numbers" not in sent
 
@@ -1486,11 +1511,37 @@ class TestClearFields:
         service.users().drafts().list.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_whitespace_only_clears(self):
+    async def test_blank_values_mean_not_provided(self):
+        """Some clients fill every unset argument with "" or []. Adding a Cc
+        from such a client must keep the stored To, Subject, body and
+        attachment, not clear them or force a rebuild."""
         service = _patch_service()
-        await _call(service, action="update", draft_id="r-1", cc="   ")
-        text = _sent_message_bytes(service).decode("utf-8", "replace")
-        assert "Cc:" not in text
+        original = _semantic_parts(base64.urlsafe_b64decode(_stored_draft_raw()))
+        result = await _call(
+            service,
+            action="update",
+            draft_id="r-1",
+            cc="new@example.com",
+            to="",
+            bcc="   ",
+            subject="",
+            body="",
+            from_name="",
+            from_email="",
+            thread_id="",
+            in_reply_to="",
+            references="",
+            attachments=[],
+        )
+        assert "addressing only" in result
+        sent = _sent_message_bytes(service)
+        text = sent.decode("utf-8", "replace")
+        assert "Cc: new@example.com" in text
+        assert "To: rcpt@example.com" in text
+        assert "Subject: Quarterly numbers" in text
+        after = _semantic_parts(sent)
+        assert after["body"] == original["body"]
+        assert after["attachments"] == original["attachments"]
 
     @pytest.mark.asyncio
     async def test_a_padded_real_value_is_a_value_not_a_clear(self):
@@ -1744,6 +1795,101 @@ class TestPatchDoesNotRefoldSourceHeaders:
         assert "=?utf-8?" in text.split("Subject:")[1].split("\r\n")[0]
 
 
+class TestRebuildCarriesAttachments:
+    """A rebuild keeps the stored attachments unless told otherwise."""
+
+    @staticmethod
+    def _service():
+        service = _mock_service(draft_headers=_ADDRESSED_DRAFT_HEADERS)
+        stored = service.users().drafts().get().execute.return_value
+        stored["message"]["payload"]["parts"] = [
+            {"mimeType": "text/plain", "body": {"data": "aGk="}},
+            {
+                "mimeType": "image/png",
+                "filename": "chart.png",
+                "body": {"attachmentId": "att-1", "size": 3},
+            },
+        ]
+        service.users().messages().attachments().get().execute.return_value = {
+            "data": base64.urlsafe_b64encode(b"PNG").decode(),
+            "size": 3,
+        }
+        service.users().messages().attachments().get.reset_mock()
+        service.users().drafts().update().execute.return_value = {
+            "id": "r-1",
+            "message": {"id": "m-2"},
+        }
+        service.users().drafts().update.reset_mock()
+        return service
+
+    @staticmethod
+    def _sent_raw(service) -> str:
+        return _decoded_raw(service.users().drafts().update.call_args.kwargs["body"])
+
+    @pytest.mark.asyncio
+    async def test_body_only_update_keeps_the_stored_attachment(self):
+        service = self._service()
+        await _call(service, action="update", draft_id="r-1", body="New wording.")
+        service.users().messages().attachments().get.assert_called_once_with(
+            userId="me", messageId="m-1", id="att-1"
+        )
+        raw = self._sent_raw(service)
+        assert "New wording." in raw
+        assert 'filename="chart.png"' in raw
+        assert base64.b64encode(b"PNG").decode() in raw
+
+    @pytest.mark.asyncio
+    async def test_passed_attachments_replace_the_stored_ones(self):
+        service = self._service()
+        await _call(
+            service,
+            action="update",
+            draft_id="r-1",
+            body="New wording.",
+            attachments=[{"filename": "new.txt", "content": "aGk="}],
+        )
+        service.users().messages().attachments().get.assert_not_called()
+        raw = self._sent_raw(service)
+        assert "new.txt" in raw
+        assert "chart.png" not in raw
+
+    @pytest.mark.asyncio
+    async def test_clear_fields_drops_the_stored_attachments(self):
+        service = self._service()
+        await _call(
+            service,
+            action="update",
+            draft_id="r-1",
+            body="New wording.",
+            clear_fields=["attachments"],
+        )
+        service.users().messages().attachments().get.assert_not_called()
+        assert "chart.png" not in self._sent_raw(service)
+
+    @pytest.mark.asyncio
+    async def test_clearing_attachments_still_requires_a_body(self):
+        service = self._service()
+        with pytest.raises(UserInputError, match="does not keep the existing body"):
+            await _call(
+                service, action="update", draft_id="r-1", clear_fields=["attachments"]
+            )
+        service.users().drafts().update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_clearing_and_passing_attachments_is_an_error(self):
+        service = self._service()
+        with pytest.raises(UserInputError, match="not both"):
+            await _call(
+                service,
+                action="update",
+                draft_id="r-1",
+                body="B",
+                attachments=[{"filename": "new.txt", "content": "aGk="}],
+                clear_fields=["attachments"],
+            )
+        service.users().drafts().update.assert_not_called()
+
+
 class TestRebuildRequiresABody:
     """The rebuild path composes a NEW message, so a missing body is an empty
     body. Every call here used to clear the no-op guard, miss the
@@ -1756,7 +1902,6 @@ class TestRebuildRequiresABody:
                 {"attachments": [{"filename": "a.txt", "content": "aGk="}]},
                 "attachments",
             ),
-            ({"attachments": []}, "attachments"),
             ({"from_name": "Andy"}, "from_name"),
             ({"thread_id": "t-NEW"}, "thread_id"),
             ({"body_format": "html", "cc": "x@example.com"}, "body_format"),
@@ -1805,33 +1950,22 @@ class TestRebuildRequiresABody:
         assert body["message"]["threadId"] == "t-NEW"
 
     @pytest.mark.asyncio
-    async def test_an_explicit_empty_body_is_a_real_request(self):
-        """body="" is supplied, not absent — the caller asked for an empty body."""
-        service = _mock_service(draft_headers=_ADDRESSED_DRAFT_HEADERS)
-        service.users().drafts().update().execute.return_value = {
-            "id": "r-1",
-            "message": {"id": "m-2"},
-        }
-        service.users().drafts().update.reset_mock()
-        result = await _call(service, action="update", draft_id="r-1", body="")
-        assert "message rebuilt" in result
+    async def test_a_blank_body_alone_is_nothing_to_change(self):
+        """body="" is how blank-filling clients say "unset"; it must not wipe
+        the draft."""
+        service = _patch_service()
+        with pytest.raises(UserInputError, match="nothing to change"):
+            await _call(service, action="update", draft_id="r-1", body="")
+        service.users().drafts().update.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_an_explicit_empty_body_satisfies_the_body_required_guard(self):
-        """The guard is `body is None`, not `not body`. With a rebuild reason
-        present, body="" must still rebuild — a truthiness "cleanup" here would
-        reject a caller who deliberately asked for an empty body."""
-        service = _mock_service(draft_headers=_ADDRESSED_DRAFT_HEADERS)
-        service.users().drafts().update().execute.return_value = {
-            "id": "r-1",
-            "message": {"id": "m-2"},
-        }
-        service.users().drafts().update.reset_mock()
-        result = await _call(
-            service, action="update", draft_id="r-1", body="", from_name="X"
-        )
-        assert "message rebuilt" in result
-        service.users().drafts().update.assert_called_once()
+    async def test_a_blank_body_does_not_satisfy_the_body_required_guard(self):
+        service = _patch_service()
+        with pytest.raises(UserInputError, match="does not keep the existing body"):
+            await _call(
+                service, action="update", draft_id="r-1", body="", from_name="X"
+            )
+        service.users().drafts().update.assert_not_called()
 
 
 class TestPatchPathEdges:

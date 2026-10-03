@@ -26,7 +26,7 @@ from email.errors import (
 )
 from email.message import EmailMessage
 from email.policy import SMTP
-from email.utils import formataddr
+from email.utils import formataddr, parseaddr
 
 import httpx
 from googleapiclient.errors import HttpError
@@ -976,7 +976,7 @@ def _extract_headers(payload: dict, header_names: List[str]) -> Dict[str, str]:
     return headers
 
 
-async def _fetch_draft_metadata(service, draft_id: str) -> Dict[str, Optional[str]]:
+async def _fetch_draft_metadata(service, draft_id: str) -> Dict[str, Any]:
     """Read an existing draft's thread association and addressing.
 
     drafts.update REPLACES the draft's underlying message, so anything the
@@ -988,8 +988,9 @@ async def _fetch_draft_metadata(service, draft_id: str) -> Dict[str, Optional[st
     from dropping the recipients.
 
     Returns a dict with keys ``thread_id``, ``in_reply_to``, ``references``,
-    ``to``, ``cc``, ``bcc`` and ``subject``; any header the draft does not carry
-    comes back as None.
+    ``to``, ``cc``, ``bcc``, ``subject`` and ``from`` (None when the draft does
+    not carry that header), plus ``message_id`` and ``payload`` so the caller
+    can carry the stored attachments forward.
 
     The three threading keys are gated together: Gmail gives every message a
     threadId, including a standalone draft, and re-supplying that bare threadId
@@ -1009,31 +1010,18 @@ async def _fetch_draft_metadata(service, draft_id: str) -> Dict[str, Optional[st
     proceeding: continuing would rebuild the message without threading or
     recipients and give the caller no way to tell.
     """
-    header_names = ["In-Reply-To", "References", "To", "Cc", "Bcc", "Subject"]
+    header_names = ["In-Reply-To", "References", "To", "Cc", "Bcc", "Subject", "From"]
     try:
-        # NOTE: drafts.get takes only (userId, id, format) — unlike messages.get
-        # and threads.get it does NOT accept metadataHeaders. googleapiclient
-        # validates kwargs when it BUILDS the request, so passing it raises
-        # TypeError before any network call. format="metadata" returns the full
-        # header set anyway and _extract_headers filters to the ones we want.
-        request = (
-            service.users().drafts().get(userId="me", id=draft_id, format="metadata")
-        )
+        # drafts.get takes no metadataHeaders; "full" carries every header plus
+        # the part tree needed to find attachments.
+        request = service.users().drafts().get(userId="me", id=draft_id, format="full")
         draft = await asyncio.to_thread(
             request.execute, num_retries=GOOGLE_API_WRITE_RETRIES
         )
     except HttpError as exc:
         if _http_error_status(exc) == 404:
-            raise UserInputError(
-                f"Draft '{draft_id}' was not found — it may have already been "
-                "sent or deleted, or its ID rotated after being discarded and "
-                "recreated in the Gmail UI. " + _RECOVER_DRAFT_ID
-            ) from exc
-        # Anything else (401/403/5xx) is re-raised so handle_http_errors can
-        # classify it. Typing a revoked token as a UserInputError would hand the
-        # caller "pass thread_id explicitly" when the real answer is re-auth —
-        # the same misdirection the sibling commit fixes for drafts.send. The
-        # update never runs, so the draft cannot be detached either way.
+            raise _draft_not_found(draft_id) from exc
+        # 401/403/5xx: let handle_http_errors classify it (e.g. re-auth).
         raise
 
     message = draft.get("message", {}) or {}
@@ -1057,6 +1045,9 @@ async def _fetch_draft_metadata(service, draft_id: str) -> Dict[str, Optional[st
         "cc": _unfolded(headers.get("Cc")),
         "bcc": _unfolded(headers.get("Bcc")),
         "subject": _unfolded(headers.get("Subject")),
+        "from": _unfolded(headers.get("From")),
+        "message_id": message.get("id"),
+        "payload": message.get("payload", {}) or {},
     }
 
 
@@ -1201,6 +1192,15 @@ _RECOVER_DRAFT_ID = (
 )
 
 
+def _draft_not_found(draft_id: str) -> UserInputError:
+    """Actionable error for a 404 from any drafts.* call."""
+    return UserInputError(
+        f"Draft '{draft_id}' was not found. It may have already been sent or "
+        "deleted, or its ID rotated after being discarded and recreated in the "
+        "Gmail UI. " + _RECOVER_DRAFT_ID
+    )
+
+
 # Headers the addressing-only update path may rewrite. Everything else in the
 # stored message — body, attachments, signature, quoted original, In-Reply-To,
 # References — is written back as it was read. That holds only because of
@@ -1283,12 +1283,9 @@ def _update_rebuild_reasons(
 ) -> List[str]:
     """Names of supplied update arguments a header patch cannot honour.
 
-    This is the ONE definition of "the caller asked for more than addressing".
-    The no-op guard, the addressing-only gate and the body-required guard all
-    read it, so they cannot drift apart — they did once: threading arguments
-    counted as "supplied" for the no-op guard but were invisible to the gate, so
-    update(cc=..., thread_id=...) reported "addressing only" while silently
-    dropping the re-thread.
+    The single definition of "the caller asked for more than addressing",
+    shared by the no-op guard, the addressing-only gate and the body-required
+    guard so they cannot disagree.
 
     from_name / from_email change the From header and, via Send-As, the
     signature inside the body. thread_id / in_reply_to / references re-thread
@@ -1331,12 +1328,7 @@ async def _send_draft_update(
         )
     except HttpError as exc:
         if _http_error_status(exc) == 404:
-            raise UserInputError(
-                f"Draft '{draft_id}' was not found — it may have already been "
-                "sent or deleted, or its ID rotated after being discarded and "
-                "recreated in the Gmail UI. Do not silently compose a "
-                "replacement: check what exists first. " + _RECOVER_DRAFT_ID
-            ) from exc
+            raise _draft_not_found(draft_id) from exc
         raise
 
 
@@ -1380,8 +1372,8 @@ async def _fetch_draft_raw(service, draft_id: str) -> tuple[bytes, Dict[str, Any
                     f"Draft '{draft_id}' did not report a size, so it cannot be "
                     "checked against WORKSPACE_MCP_MAX_FILE_BYTES and was not "
                     "loaded. Nothing was written. To change it anyway, re-pass "
-                    "the body (and any attachments you want kept) along with the "
-                    "addressing to rebuild the draft."
+                    "the body along with the addressing to rebuild the draft; "
+                    "add clear_fields=['attachments'] to drop large attachments."
                 )
             try:
                 ensure_within_file_size_limit(
@@ -1393,8 +1385,8 @@ async def _fetch_draft_raw(service, draft_id: str) -> tuple[bytes, Dict[str, Any
                 # an unexpected failure, and must not be retried as one.
                 raise UserInputError(
                     f"{exc} Nothing was written. To change this draft anyway, "
-                    "re-pass the body (and any attachments you want kept) along "
-                    "with the addressing to rebuild it."
+                    "re-pass the body along with the addressing to rebuild it; "
+                    "add clear_fields=['attachments'] to drop large attachments."
                 ) from exc
 
         draft = await asyncio.to_thread(
@@ -1406,11 +1398,7 @@ async def _fetch_draft_raw(service, draft_id: str) -> tuple[bytes, Dict[str, Any
         )
     except HttpError as exc:
         if _http_error_status(exc) == 404:
-            raise UserInputError(
-                f"Draft '{draft_id}' was not found — it may have already been "
-                "sent or deleted, or its ID rotated after being discarded and "
-                "recreated in the Gmail UI. " + _RECOVER_DRAFT_ID
-            ) from exc
+            raise _draft_not_found(draft_id) from exc
         raise  # 401/403/5xx: let handle_http_errors classify it
     message = draft.get("message", {}) or {}
     raw = message.get("raw")
@@ -3390,11 +3378,7 @@ async def send_gmail_message(
         except HttpError as exc:
             status = _http_error_status(exc)
             if status == 404:
-                raise UserInputError(
-                    f"Draft '{draft_id}' was not found — it may have already been "
-                    "sent or deleted, or its ID rotated after being discarded and "
-                    "recreated in the Gmail UI. " + _RECOVER_DRAFT_ID
-                ) from exc
+                raise _draft_not_found(draft_id) from exc
             if status == 400:
                 # Gmail uses 400 for two unrelated things: a malformed Draft ID,
                 # and a draft that EXISTS but cannot be sent (e.g. "Recipient
@@ -3610,6 +3594,76 @@ async def send_gmail_message(
     return f"Email sent! Message ID: {message_id}"
 
 
+async def _download_message_attachments(
+    service, message_id: str, payload: dict
+) -> List[Dict[str, Any]]:
+    """Download a message's attachments as standard-base64 ``content`` dicts.
+
+    The result is ready for ``_prepare_gmail_message``. Raises UserInputError if
+    any attachment exceeds the configured size cap or cannot be downloaded, so a
+    caller never builds a message that silently lost a file.
+    """
+    attachments: List[Dict[str, Any]] = []
+    failed_attachments = []
+    for att in _extract_attachments(payload):
+        try:
+            ensure_within_file_size_limit(
+                att.get("size"),
+                file_name=att.get("filename"),
+                file_id=att.get("attachmentId"),
+                kind="attachment",
+            )
+        except FileTooLargeError as exc:
+            # Do not let the broad per-attachment download handler turn a
+            # configured safety rejection into a generic partial failure.
+            raise UserInputError(str(exc)) from exc
+        try:
+            attachment_data = await asyncio.to_thread(
+                service.users()
+                .messages()
+                .attachments()
+                .get(userId="me", messageId=message_id, id=att["attachmentId"])
+                .execute
+            )
+            # Gmail normally repeats the decoded byte size in this
+            # response. Re-check it before making padded/decoded/re-encoded
+            # copies in case it differs from the message metadata.
+            ensure_within_file_size_limit(
+                attachment_data.get("size"),
+                file_name=att.get("filename"),
+                file_id=att.get("attachmentId"),
+                kind="attachment",
+            )
+            # Gmail returns URL-safe base64 (often unpadded). Decode it
+            # tolerantly and re-encode as standard, padded base64 so the
+            # downstream base64.b64decode() in _prepare_gmail_message succeeds.
+            urlsafe_data = attachment_data.get("data", "")
+            padded = urlsafe_data + "=" * (-len(urlsafe_data) % 4)
+            standard_b64 = base64.b64encode(base64.urlsafe_b64decode(padded)).decode()
+            attachments.append(
+                {
+                    "content": standard_b64,
+                    "filename": att["filename"],
+                    "mime_type": att["mimeType"],
+                }
+            )
+            logger.info(f"[gmail] Downloaded attachment: {att['filename']}")
+        except FileTooLargeError as exc:
+            raise UserInputError(str(exc)) from exc
+        except Exception as e:
+            logger.warning(
+                f"[gmail] Failed to download attachment {att['filename']}: {e}"
+            )
+            failed_attachments.append(att["filename"])
+
+    if failed_attachments:
+        raise UserInputError(
+            "Failed to include requested attachment(s): "
+            + ", ".join(failed_attachments)
+        )
+    return attachments
+
+
 async def _build_forward_message(
     service,
     message_id: str,
@@ -3642,74 +3696,11 @@ async def _build_forward_message(
         subject_override=subject,
     )
 
-    attachments_to_send: List[Dict[str, Any]] = []
-    if include_attachments:
-        attachment_metadata = _extract_attachments(payload)
-        failed_attachments = []
-        for att in attachment_metadata:
-            try:
-                ensure_within_file_size_limit(
-                    att.get("size"),
-                    file_name=att.get("filename"),
-                    file_id=att.get("attachmentId"),
-                    kind="attachment",
-                )
-            except FileTooLargeError as exc:
-                # Do not let the broad per-attachment download handler turn a
-                # configured safety rejection into a generic partial-forward
-                # failure, and never send the message without requested files.
-                raise UserInputError(str(exc)) from exc
-            try:
-                # Download attachment content
-                attachment_data = await asyncio.to_thread(
-                    service.users()
-                    .messages()
-                    .attachments()
-                    .get(userId="me", messageId=message_id, id=att["attachmentId"])
-                    .execute
-                )
-                # Gmail normally repeats the decoded byte size in this
-                # response. Re-check it before making padded/decoded/re-encoded
-                # copies in case it differs from the message metadata.
-                ensure_within_file_size_limit(
-                    attachment_data.get("size"),
-                    file_name=att.get("filename"),
-                    file_id=att.get("attachmentId"),
-                    kind="attachment",
-                )
-                # Gmail returns URL-safe base64 (often unpadded). Decode it
-                # tolerantly and re-encode as standard, padded base64 so the
-                # downstream base64.b64decode() in _prepare_gmail_message succeeds.
-                urlsafe_data = attachment_data.get("data", "")
-                padded = urlsafe_data + "=" * (-len(urlsafe_data) % 4)
-                standard_b64 = base64.b64encode(
-                    base64.urlsafe_b64decode(padded)
-                ).decode()
-                attachments_to_send.append(
-                    {
-                        "content": standard_b64,
-                        "filename": att["filename"],
-                        "mime_type": att["mimeType"],
-                    }
-                )
-                logger.info(
-                    f"[forward_gmail_message] Downloaded attachment: {att['filename']}"
-                )
-            except FileTooLargeError as exc:
-                raise UserInputError(str(exc)) from exc
-            except Exception as e:
-                logger.warning(
-                    f"[forward_gmail_message] Failed to download attachment {att['filename']}: {e}"
-                )
-                failed_attachments.append(att["filename"])
-
-        # Fail loudly rather than silently building an incomplete forward when the
-        # caller asked for the original attachments to be preserved.
-        if failed_attachments:
-            raise UserInputError(
-                "Failed to include requested attachment(s): "
-                + ", ".join(failed_attachments)
-            )
+    attachments_to_send = (
+        await _download_message_attachments(service, message_id, payload)
+        if include_attachments
+        else []
+    )
 
     return forward_subject, forward_body, body_format, attachments_to_send
 
@@ -3800,7 +3791,7 @@ async def _forward_gmail_message_impl(
     title="Draft Gmail Message",
     annotations=ToolAnnotations(
         readOnlyHint=False,
-        destructiveHint=False,
+        destructiveHint=True,
         idempotentHint=False,
         openWorldHint=True,
     ),
@@ -3903,7 +3894,7 @@ async def draft_gmail_message(
     action: Annotated[
         Literal["create", "update", "delete", "list"],
         Field(
-            description="'create' (default) makes a new draft. 'update' revises draft_id in place: omitted to/cc/bcc/subject are kept (clear_fields empties one); passing only addressing keeps the body and attachments, while passing a body rebuilds the message and DROPS attachments unless re-passed. Update overwrites edits made elsewhere — if the draft may have changed, confirm first. 'delete' PERMANENTLY deletes draft_id (no Trash, unrecoverable). 'list' returns drafts with their IDs — the only way to look up a Draft ID.",
+            description="'create' (default) makes a new draft. 'update' revises draft_id in place: omitted to/cc/bcc/subject/attachments are kept (clear_fields empties one); passing only addressing keeps the body, while passing a body replaces it. Update overwrites edits made elsewhere, so if the draft may have changed, confirm first. 'delete' PERMANENTLY deletes draft_id (no Trash, unrecoverable). 'list' returns drafts with their IDs; it is the only way to look up a Draft ID.",
         ),
     ] = "create",
     draft_id: Annotated[
@@ -3925,9 +3916,9 @@ async def draft_gmail_message(
         ),
     ] = None,
     clear_fields: Annotated[
-        Optional[List[Literal["to", "cc", "bcc", "subject"]]],
+        Optional[List[Literal["to", "cc", "bcc", "subject", "attachments"]]],
         Field(
-            description="action='update' only: addressing fields to empty, e.g. ['cc'].",
+            description="action='update' only: fields to empty, e.g. ['cc'] or ['attachments'].",
         ),
     ] = None,
 ) -> str:
@@ -3937,11 +3928,12 @@ async def draft_gmail_message(
     To REVISE a draft use action='update' — do not compose a replacement and
     trash the old one: trashing a draft's message does not remove the draft.
 
-    action='update': to/cc/bcc/subject are KEPT when omitted; name a field in
-    clear_fields to empty it. If ONLY addressing is passed, the stored message
-    is patched in place and the body and attachments survive. Passing anything
-    else (e.g. body) REBUILDS the message: the body becomes what you passed and
-    attachments are DROPPED unless re-passed. The response says which happened.
+    action='update': to/cc/bcc/subject/attachments are KEPT when omitted; name
+    a field in clear_fields to empty it. If ONLY addressing is passed, the
+    stored message is patched in place. Passing anything else (e.g. body)
+    REBUILDS the message with the body you passed; stored attachments are
+    carried over unless attachments (replace) or clear_fields=['attachments']
+    is given. The response says which happened.
     Every update gives the draft a new Message ID and new attachment IDs.
 
     action='list': returns each draft's Draft ID, Message ID, Thread ID, To,
@@ -4016,7 +4008,8 @@ async def draft_gmail_message(
             draft. All four are covered by the gmail.compose scope the tool already
             holds — no new consent.
         clear_fields (Optional[List[str]]): action='update' only. Any of 'to', 'cc', 'bcc',
-            'subject' to empty. Naming a field here AND giving it a value is an error.
+            'subject', 'attachments' to empty. Naming a field here AND giving it a value
+            is an error.
         page_size (int): action='list' only. Drafts per page, 1..100, default 25.
         page_token (Optional[str]): action='list' only. Cursor from a previous page.
         draft_id (Optional[str]): Existing draft ID for 'update'/'delete'. The ID a
@@ -4035,12 +4028,9 @@ async def draft_gmail_message(
     Notes (update contract, long form — kept out of the schema on purpose):
         Gmail's drafts.update has no partial-update mode: the supplied message
         REPLACES the stored one, so anything not re-sent ceases to exist.
-        - Addressing is tri-state. Omitted / JSON null -> keep the draft's value.
-          clear_fields=[...] -> empty it. A value -> replace. An empty or
-          whitespace-only string also clears, for clients that can send one;
-          at least one was observed unable to transmit "" for an optional
-          string, which is why clear_fields exists. null never clears: strict function-calling
-          clients send null for every unset parameter.
+        - Addressing is tri-state. Omitted, null or blank -> keep the draft's
+          value. clear_fields=[...] -> empty it. A value -> replace. Blank
+          never clears: some clients send "" or null for every unset argument.
         - Addressing-only update (no body, attachments, body_format,
           from_email/from_name, quote_original, thread_id, in_reply_to or
           references — see _update_rebuild_reasons): the stored MIME is fetched
@@ -4048,8 +4038,8 @@ async def draft_gmail_message(
           (Received etc.) dropped; body, attachments, signature and quoted
           original survive. Refused if the stored message has structural MIME
           defects or exceeds WORKSPACE_MCP_MAX_FILE_BYTES.
-        - Any other update rebuilds the message. Addressing is still inherited,
-          but the body is what was passed and attachments must be re-passed.
+        - Any other update rebuilds the message with the body that was passed.
+          Addressing, From and attachments are inherited unless supplied.
         - Gmail mints a new message on EVERY update, so the Message ID and all
           attachment IDs change even when only addressing was touched. The
           Draft ID is the stable handle.
@@ -4065,8 +4055,8 @@ async def draft_gmail_message(
         - Gmail APPENDS a Received header on every API write and OVERWRITES Date
           and Message-Id. Only the first accumulates, hence the transport strip.
         - Bcc is returned by drafts.get(format="metadata") and is inherited.
-        - From is recomputed on a rebuild rather than inherited, so a display
-          name Gmail's composer added can revert to the bare address.
+        - From (address and display name) is inherited on a rebuild unless
+          from_email is passed, so a Send-As alias draft stays on that alias.
         - NO CONCURRENCY CONTROL. Gmail has no conditional write for drafts, and
           the web client caches a draft it has loaded (even one only clicked from
           the Drafts list) and autosaves that copy as a blind replace. Typing in
@@ -4123,8 +4113,8 @@ async def draft_gmail_message(
             thread_id="thread_123"
         )
 
-        # Revise a draft's wording in place. To/Cc/Bcc/Subject are kept; the body
-        # is replaced, and attachments must be re-passed or they are dropped.
+        # Revise a draft's wording in place. Addressing and attachments are kept;
+        # the body is replaced.
         draft_gmail_message(action="update", draft_id="r-123", body="Updated wording.")
 
         # Add a Cc without touching the body or attachments
@@ -4144,35 +4134,46 @@ async def draft_gmail_message(
         f"subject_len={len(subject) if subject else 0}"
     )
 
-    # --- Clearing an addressing field -------------------------------------
-    # Three spellings, one meaning. Everything downstream (the no-op guard, the
-    # addressing-only gate, both update paths) keys
-    # off the single sentinel "" — so normalise into it here, once, before any
-    # of them runs.
-    #
-    #   clear_fields=["cc"]  the documented way. Exists because at least one MCP
-    #                        client was observed to be unable to transmit an
-    #                        empty string for an Optional[str] parameter (the
-    #                        value was emitted as nothing and the call never
-    #                        left the client).
-    #   cc=""                still honoured; programmatic clients send it fine.
-    #   cc="   "             blank is treated as empty.
-    #
-    # JSON null / omitted deliberately keeps meaning "not provided -> preserve".
-    # Strict function-calling clients send an explicit null for EVERY unset
-    # optional parameter, so null-clears would make a plain body-only update wipe
-    # To/Cc/Bcc/Subject — the exact bug the preserve contract exists to fix.
+    # On update, omitted, null and blank all mean "keep the stored value":
+    # some clients fill every unset argument with "" or [], and treating those
+    # as clears would wipe the draft. Clearing is explicit, via clear_fields.
     if clear_fields and action != "update":
         raise UserInputError(
             f"clear_fields only applies to action='update'; got it with "
             f"action='{action}'."
         )
     if action == "update":
+        (
+            to,
+            cc,
+            bcc,
+            subject,
+            body,
+            from_name,
+            from_email,
+            thread_id,
+            in_reply_to,
+            references,
+        ) = (
+            value if value and value.strip() else None
+            for value in (
+                to,
+                cc,
+                bcc,
+                subject,
+                body,
+                from_name,
+                from_email,
+                thread_id,
+                in_reply_to,
+                references,
+            )
+        )
+        attachments = attachments or None
         addressing = {"to": to, "cc": cc, "bcc": bcc, "subject": subject}
+        supplied = {**addressing, "attachments": attachments}
         contradictory = sorted(
-            name
-            for name in (clear_fields or [])
-            if addressing[name] is not None and addressing[name].strip() != ""
+            name for name in (clear_fields or []) if supplied[name] is not None
         )
         if contradictory:
             raise UserInputError(
@@ -4197,15 +4198,13 @@ async def draft_gmail_message(
                 f"{', '.join(with_linebreak)} contains a line break, which is "
                 f"not valid in an email header.{hint}"
             )
-        # Only a WHOLLY blank value becomes the clear sentinel. A real value is
-        # never stripped or otherwise altered here.
+        # "" and [] are the internal clear sentinels the update paths key off.
         to, cc, bcc, subject = (
-            ""
-            if name in (clear_fields or [])
-            or (value is not None and value.strip() == "")
-            else value
+            "" if name in (clear_fields or []) else value
             for name, value in addressing.items()
         )
+        if "attachments" in (clear_fields or []):
+            attachments = []
 
     if action == "create":
         if draft_id:
@@ -4298,11 +4297,7 @@ async def draft_gmail_message(
             )
         except HttpError as exc:
             if _http_error_status(exc) == 404:
-                raise UserInputError(
-                    f"Draft '{draft_id}' was not found — it may have already been "
-                    "sent or deleted, or its ID rotated after being discarded and "
-                    "recreated in the Gmail UI. " + _RECOVER_DRAFT_ID
-                ) from exc
+                raise _draft_not_found(draft_id) from exc
             raise
         logger.info(f"[draft_gmail_message] Draft {draft_id} permanently deleted.")
         return (
@@ -4361,18 +4356,14 @@ async def draft_gmail_message(
         )
 
     if action == "update" and body is None and rebuild_reasons:
-        # The rebuild path composes a NEW message from the arguments given, so
-        # a missing body means an empty body. The preserve contract teaches
-        # "omitted is kept", which makes a caller MORE likely to assume the body
-        # is kept too — attachments-only, from_name-only, thread_id-only and
-        # body_format+cc all used to return success having wiped the text.
+        # A rebuild composes a new message, so a missing body would be an
+        # empty one; refuse rather than wipe the text.
         raise UserInputError(
             f"action='update' with {', '.join(rebuild_reasons)} rebuilds the "
             "message, and a rebuild does not keep the existing body: nothing "
             "was written. Re-pass the body along with "
-            f"{', '.join(rebuild_reasons)} (and re-pass any attachments you "
-            "want kept). Only an update that changes nothing but "
-            "to/cc/bcc/subject leaves the body and attachments in place."
+            f"{', '.join(rebuild_reasons)}. Only an update that changes nothing "
+            "but to/cc/bcc/subject leaves the body in place."
         )
 
     if action == "update" and body is None and touches_addressing:
@@ -4410,22 +4401,18 @@ async def draft_gmail_message(
         )
         return result + _STALE_GMAIL_TAB_WARNING
 
-    # On update the STORED DRAFT is the source of truth for To and Subject, so
-    # the create path's reply-target derivation (fill a missing recipient or
-    # subject from the message being replied to) is switched off entirely.
-    # Guarding only a clear made in THIS call was not enough: after
-    # clear_fields=["to"], the stored To is absent, so the NEXT body-only update
-    # inherited None and the derivation quietly put the recipient back —
-    # contradicting "omitted fields are kept".
+    # On update the stored draft is the source of truth for To and Subject, so
+    # reply-target derivation is off: a field cleared by an earlier update must
+    # not be refilled from the thread.
     is_update = action == "update"
 
-    # NB#4: "Re: " is prefixed for a reply when the subject lacks it. Right for a
-    # subject being composed; wrong for one inherited from the stored draft
-    # (it was already whatever the author wanted — re-prefixing turned
-    # "Stored subject" into "Re: Stored subject" on every threaded rebuild) and
-    # wrong for a cleared one (it produced "Subject: Re: "). Only a subject the
-    # caller supplied in this call is eligible.
+    # Only a subject supplied in this call gets "Re: "; an inherited or cleared
+    # one is kept as stored.
     prefix_reply_subject = not is_update or bool(subject)
+
+    # Attachments copied from a forwarded original or from the draft being
+    # updated; they lead the list of any newly passed ones.
+    carried_attachments: List[Dict[str, Any]] = []
 
     if action == "update":
         # drafts.update destroys and replaces the underlying message, so
@@ -4433,28 +4420,32 @@ async def draft_gmail_message(
         # addressing alike. A model revising a draft usually passes only the
         # new body, so read the stored message back and carry forward whatever
         # was left unspecified rather than silently dropping it.
-        #
-        # The read is skipped entirely when the caller supplied every field it
-        # could provide, so a fully-specified update still costs one API call.
-        if not thread_id or to is None or cc is None or bcc is None or subject is None:
-            meta = await _fetch_draft_metadata(service, draft_id)
-            if not thread_id:
-                # An explicit thread_id always wins, which is what keeps a
-                # deliberate re-thread possible.
-                thread_id = meta["thread_id"]
-                in_reply_to = in_reply_to or meta["in_reply_to"]
-                references = references or meta["references"]
-            # Precedence: an explicit argument (including "") beats the stored
-            # value. Nothing else competes — reply-target derivation is switched
-            # off on update (see is_update below).
-            if to is None:
-                to = meta["to"]
-            if cc is None:
-                cc = meta["cc"]
-            if bcc is None:
-                bcc = meta["bcc"]
-            if subject is None:
-                subject = meta["subject"]
+        meta = await _fetch_draft_metadata(service, draft_id)
+        if not thread_id:
+            # An explicit thread_id always wins, which is what keeps a
+            # deliberate re-thread possible.
+            thread_id = meta["thread_id"]
+            in_reply_to = in_reply_to or meta["in_reply_to"]
+            references = references or meta["references"]
+        # An explicit argument (including the "" clear sentinel) beats the
+        # stored value; reply-target derivation is off on update.
+        if to is None:
+            to = meta["to"]
+        if cc is None:
+            cc = meta["cc"]
+        if bcc is None:
+            bcc = meta["bcc"]
+        if subject is None:
+            subject = meta["subject"]
+        if from_email is None:
+            # Keep a Send-As alias (and its signature) across a rebuild.
+            stored_name, stored_email = parseaddr(meta["from"] or "")
+            from_email = stored_email or None
+            from_name = from_name or stored_name or None
+        if attachments is None:
+            carried_attachments = await _download_message_attachments(
+                service, meta["message_id"], meta["payload"]
+            )
 
     # Prepare the email message. An explicit alias needs no settings lookup when
     # its signature is disabled. Otherwise resolve the identity and signature
@@ -4471,7 +4462,6 @@ async def draft_gmail_message(
             fallback_email=user_google_email,
         )
     signature_html = resolved_signature_html if include_signature else ""
-    forwarded_attachments: List[Dict[str, Any]] = []
 
     if forward_message_id:
         # Forward draft: build the subject, quoted body, and carried-over attachments
@@ -4482,7 +4472,7 @@ async def draft_gmail_message(
             subject,
             draft_body,
             body_format,
-            forwarded_attachments,
+            carried_attachments,
         ) = await _build_forward_message(
             service,
             forward_message_id,
@@ -4550,9 +4540,8 @@ async def draft_gmail_message(
             )
 
     resolved_attachments = await _resolve_url_attachments(attachments)
-    # Attachments carried over from a forwarded message lead the list.
-    if forwarded_attachments:
-        resolved_attachments = forwarded_attachments + (resolved_attachments or [])
+    if carried_attachments:
+        resolved_attachments = carried_attachments + (resolved_attachments or [])
     raw_message, _thread_id_final, attached_count, attachment_errors = (
         _prepare_gmail_message(
             subject=subject,
@@ -4571,8 +4560,7 @@ async def draft_gmail_message(
         )
     )
 
-    # Count both explicit attachments and any carried over from a forward.
-    requested_attachment_count = len(attachments or []) + len(forwarded_attachments)
+    requested_attachment_count = len(attachments or []) + len(carried_attachments)
     if requested_attachment_count > 0 and attached_count == 0:
         details = (
             f" Details: {'; '.join(attachment_errors)}" if attachment_errors else ""
@@ -4581,10 +4569,9 @@ async def draft_gmail_message(
             "No valid attachments were added. Verify each attachment path/content and retry."
             f"{details}"
         )
-    # Forwarded attachments were already fetched, so a partial attach means one was
-    # dropped at MIME-build time — fail loudly rather than draft a partial forward
-    # (mirrors the send-forward path).
-    if forwarded_attachments and attached_count != requested_attachment_count:
+    # Carried attachments were already fetched, so a partial attach means one was
+    # dropped at MIME-build time; fail rather than save a partial draft.
+    if carried_attachments and attached_count != requested_attachment_count:
         details = (
             f" Details: {'; '.join(attachment_errors)}" if attachment_errors else ""
         )
@@ -4627,9 +4614,7 @@ async def draft_gmail_message(
     # Say which path ran. A caller who expected a header-only patch and
     # silently got a rebuild has lost the body and any attachments.
     rebuild_note = (
-        " (message rebuilt — body and attachments are what you passed here)"
-        if action == "update"
-        else ""
+        " (message rebuilt with the body passed here)" if action == "update" else ""
     )
     result = f"Draft {verb}{attachment_info}{rebuild_note}! Draft ID: {draft_id}"
     if message_id:
