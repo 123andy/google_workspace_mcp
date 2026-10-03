@@ -22,6 +22,8 @@ from googleapiclient.errors import HttpError
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 from core.utils import UserInputError  # noqa: E402
+from gmail import gmail_helpers  # noqa: E402
+from gmail.gmail_helpers import _patch_draft_addressing  # noqa: E402
 from gmail.gmail_tools import draft_gmail_message  # noqa: E402
 
 
@@ -1019,8 +1021,6 @@ class TestPatchRoundTripFidelity:
         The control input deliberately carries NO transport-added headers
         (Received etc.): the patch path strips those on purpose, so a message
         containing them legitimately differs. See TestPatchStripsTransportHeaders."""
-        from gmail.gmail_tools import _patch_draft_addressing
-
         original = base64.urlsafe_b64decode(_stored_draft_raw())
         unchanged, _ = _patch_draft_addressing(
             original, to=None, cc=None, bcc=None, subject=None
@@ -1029,8 +1029,6 @@ class TestPatchRoundTripFidelity:
 
     @pytest.mark.asyncio
     async def test_a_real_patch_changes_only_that_header(self):
-        from gmail.gmail_tools import _patch_draft_addressing
-
         original = base64.urlsafe_b64decode(_stored_draft_raw())
         patched, _ = _patch_draft_addressing(
             original, to=None, cc="new@example.com", bcc=None, subject=None
@@ -1042,8 +1040,6 @@ class TestPatchRoundTripFidelity:
 
     @pytest.mark.asyncio
     async def test_threadedness_is_reported_from_the_stored_headers(self):
-        from gmail.gmail_tools import _patch_draft_addressing
-
         plain = base64.urlsafe_b64decode(_stored_draft_raw())
         reply = base64.urlsafe_b64decode(_stored_draft_raw(threaded=True))
         assert (
@@ -1065,8 +1061,6 @@ class TestPatchRoundTripFidelity:
         defects — it is valid, just normalised. Byte-identity was measured as a
         gate and rejected for exactly this reason: it would refuse ordinary
         drafts. The content is what must survive, and it does."""
-        from gmail.gmail_tools import _patch_draft_addressing
-
         lf = b"Subject: hi\nFrom: a@b.c\nTo: d@e.f\n\nbody line\n"
         patched, _ = _patch_draft_addressing(
             lf, to=None, cc="new@example.com", bcc=None, subject=None
@@ -1087,8 +1081,6 @@ class TestPatchRoundTripFidelity:
         MissingHeaderBodySeparatorDefect and re-serialises to different content.
         Falling back to a rebuild would silently drop the body, the exact loss
         this path exists to prevent, so it fails closed."""
-        from gmail.gmail_tools import _patch_draft_addressing
-
         with pytest.raises(UserInputError, match="did not parse cleanly"):
             _patch_draft_addressing(
                 b"\xff\xfe not a message at all \x00\x00",
@@ -1361,9 +1353,7 @@ class TestListDrafts:
     @pytest.mark.asyncio
     async def test_more_drafts_than_one_batch_are_all_read(self, monkeypatch):
         """Twelve drafts, batch size ten: the second chunk must not be dropped."""
-        import gmail.gmail_tools as gt
-
-        monkeypatch.setattr(gt, "GMAIL_REQUEST_DELAY", 0)
+        monkeypatch.setattr(gmail_helpers, "GMAIL_REQUEST_DELAY", 0)
         drafts = [
             {"id": f"r-{i}", "message": {"id": f"m-{i}", "threadId": f"t-{i}"}}
             for i in range(12)
@@ -1641,7 +1631,6 @@ class TestPatchStripsTransportHeaders:
     async def test_transport_headers_go_and_everything_composed_stays(self):
         from email import message_from_bytes as _mfb
         from email.policy import SMTP as _SMTP
-        from gmail.gmail_tools import _patch_draft_addressing
 
         stored = _with_transport_headers(_stored_draft_raw(threaded=True))
         before = _semantic_parts(stored)
@@ -1671,7 +1660,6 @@ class TestPatchStripsTransportHeaders:
         """Feed each patch's output back in with a fresh stamp, as Gmail would."""
         from email import message_from_bytes as _mfb
         from email.policy import SMTP as _SMTP
-        from gmail.gmail_tools import _patch_draft_addressing
 
         current = base64.urlsafe_b64decode(_stored_draft_raw())
         for i in range(3):
@@ -1737,8 +1725,6 @@ class TestPatchDoesNotRefoldSourceHeaders:
 
     @pytest.mark.asyncio
     async def test_long_message_ids_survive_verbatim(self):
-        from gmail.gmail_tools import _patch_draft_addressing
-
         assert len(_LONG_MSG_ID) > 80
         patched, is_threaded = _patch_draft_addressing(
             self._stored(), to=None, cc="new@example.com", bcc=None, subject=None
@@ -1751,8 +1737,6 @@ class TestPatchDoesNotRefoldSourceHeaders:
 
     @pytest.mark.asyncio
     async def test_long_and_encoded_attachment_filenames_are_unchanged(self):
-        from gmail.gmail_tools import _patch_draft_addressing
-
         long_name = (
             "Quarterly-financial-summary-and-forward-projections-FY2026-"
             + "x" * 40
@@ -1786,8 +1770,6 @@ class TestPatchDoesNotRefoldSourceHeaders:
     async def test_a_newly_set_non_ascii_header_is_still_encoded(self):
         """refold_source="none" must only spare SOURCE headers. One set here
         still has to be encoded, or the output is not valid 7-bit mail."""
-        from gmail.gmail_tools import _patch_draft_addressing
-
         patched, _ = _patch_draft_addressing(
             self._stored(), to=None, cc=None, bcc=None, subject="Отчёт за квартал"
         )
