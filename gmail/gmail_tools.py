@@ -3255,8 +3255,8 @@ async def get_gmail_attachment_content(
     signed_wanted = not return_base64 and signed_downloads.enabled()
     if signed_wanted:
         if not filename:
-            # Without a size cap there was no metadata pass above, and the
-            # caller's ID may already be stale: the index selects the same part.
+            # The metadata pass above found no name, or did not run (no size
+            # cap and no attachment_index); the caller's ID may be stale.
             resolved = await _resolve_attachment(
                 service,
                 message_id,
