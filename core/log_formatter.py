@@ -24,15 +24,26 @@ class SuppressStatelessTransportTerminationFilter(logging.Filter):
 
 # Paths whose trailing segment is itself the credential: a short-link handle or a
 # signed token. Anyone who can read the access log could replay them.
-_CAPABILITY_PATH_PREFIXES = ("/dl/", "/ul/", "/attachments/signed/", "/auth/")
+_CAPABILITY_PATH_PREFIXES = ("/dl/", "/ul/", "/attachments/signed/")
+# ``/auth/`` also hosts literal operator routes (``/auth/callback``), so only a
+# single credential-shaped segment there is redacted: ``secrets.token_urlsafe``
+# output, 16 or more URL-safe characters.
+_AUTH_HANDLE = re.compile(r"/auth/[A-Za-z0-9_-]{16,}(?=[/?#]|$)")
+_CAPABILITY_PATH = re.compile(
+    "|".join(re.escape(prefix) for prefix in _CAPABILITY_PATH_PREFIXES)
+)
 
 
 def redact_capability_path(path: str) -> str:
     """``/dl/<handle>`` becomes ``/dl/<redacted>``; other paths pass through.
-    Anything after the prefix, including a query string, is dropped."""
-    for prefix in _CAPABILITY_PATH_PREFIXES:
-        if path.startswith(prefix):
-            return f"{prefix}<redacted>"
+    Anything after the prefix, including a query string, is dropped. The prefix
+    may follow a mount point (uvicorn logs ``root_path`` + path)."""
+    match = _CAPABILITY_PATH.search(path)
+    if match:
+        return f"{path[: match.end()]}<redacted>"
+    match = _AUTH_HANDLE.search(path)
+    if match:
+        return f"{path[: match.start()]}/auth/<redacted>"
     return path
 
 
