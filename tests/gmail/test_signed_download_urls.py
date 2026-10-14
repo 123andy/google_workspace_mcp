@@ -770,3 +770,70 @@ async def test_a_stored_copy_follows_the_index_when_the_id_has_rotated(monkeypat
     assert saved["filename"] == "invoice.pdf"
     fetched = service.users().messages().attachments().get.call_args_list[-1]
     assert fetched.kwargs["id"] == "new-invoice"
+
+
+@pytest.mark.asyncio
+async def test_attachment_uses_gcs_staging_when_url_cannot_be_minted(
+    enabled, monkeypatch
+):
+    """Stateful but GCS-staged: the stored copy gets a working signed GCS URL, so
+    the fail-loud error must not fire."""
+    monkeypatch.setattr("auth.oauth_config.is_stateless_mode", lambda: False)
+    monkeypatch.setattr("gmail.gmail_tools.gcs_files_enabled", lambda: True)
+    monkeypatch.setattr("core.config.get_transport_mode", lambda: "streamable-http")
+    storage = Mock()
+    storage.save_attachment.return_value = Mock(path="p", file_id="f1")
+    monkeypatch.setattr(
+        "core.attachment_storage.get_attachment_storage", lambda: storage
+    )
+    monkeypatch.setattr(
+        "core.attachment_storage.get_attachment_url",
+        lambda fid: "https://gcs.example/signed",
+    )
+    with patch.object(
+        sd,
+        "offer_url",
+        new_callable=AsyncMock,
+        return_value=sd.Offer(reason=sd.NO_CREDENTIALS),
+    ):
+        result = await _unwrap(get_gmail_attachment_content)(
+            service=_service(),
+            message_id="msg-1",
+            attachment_id="att-1",
+            user_google_email=USER,
+        )
+
+    assert not result.startswith("Error:")
+    assert "https://gcs.example/signed" in result
+
+
+@pytest.mark.asyncio
+async def test_full_export_uses_gcs_staging_when_url_cannot_be_minted(
+    enabled, monkeypatch
+):
+    import gmail.gmail_tools as gmail_tools
+
+    monkeypatch.setattr(gmail_tools, "is_stateless_mode", lambda: False)
+    monkeypatch.setattr(gmail_tools, "gcs_files_enabled", lambda: True)
+    monkeypatch.setattr(gmail_tools, "get_transport_mode", lambda: "streamable-http")
+    storage = Mock()
+    storage.save_attachment_bytes.return_value = _Saved()
+    monkeypatch.setattr(gmail_tools, "get_attachment_storage", lambda: storage)
+    monkeypatch.setattr(
+        gmail_tools, "get_attachment_url", lambda fid: "https://gcs.example/signed"
+    )
+    service = Mock()
+    service.users().messages().get().execute.return_value = {"raw": "SGVsbG8gd29ybGQ="}
+
+    with patch.object(
+        sd,
+        "offer_url",
+        new_callable=AsyncMock,
+        return_value=sd.Offer(reason=sd.NO_CREDENTIALS),
+    ):
+        result = await _export_full_message(
+            service, "msg-5", HEADERS, "raw", user_google_email=USER
+        )
+
+    assert not result.startswith("Error:")
+    assert "https://gcs.example/signed" in result

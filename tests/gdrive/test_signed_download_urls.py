@@ -172,3 +172,41 @@ async def test_items_with_no_bytes_get_no_link(download, enabled, mime):
                 service=_service(mime, "thing"), user_google_email=USER, file_id="x"
             )
     offer.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("gdrive.drive_tools._download_file_to_temp", new_callable=AsyncMock)
+async def test_gcs_staging_keeps_working_when_url_cannot_be_minted(
+    download, enabled, monkeypatch, tmp_path
+):
+    """Stateful but GCS-staged: get_attachment_url returns a working signed GCS URL,
+    so the fail-loud error must not fire."""
+    import gdrive.drive_tools as drive_tools
+
+    monkeypatch.setattr(drive_tools, "is_stateless_mode", lambda: False)
+    monkeypatch.setattr(drive_tools, "gcs_files_enabled", lambda: True)
+    monkeypatch.setattr(drive_tools, "get_transport_mode", lambda: "streamable-http")
+    monkeypatch.setattr(
+        drive_tools, "get_attachment_url", lambda fid: "https://gcs.example/signed"
+    )
+    storage = Mock()
+    storage.save_attachment_from_path.return_value = Mock(path="p", file_id="f1")
+    monkeypatch.setattr(drive_tools, "get_attachment_storage", lambda: storage)
+    blob = tmp_path / "clip.mp4"
+    blob.write_bytes(b"x" * 300)
+    download.return_value = blob
+
+    with patch.object(
+        sd,
+        "offer_url",
+        new_callable=AsyncMock,
+        return_value=sd.Offer(reason=sd.NO_CREDENTIALS),
+    ):
+        result = await _unwrap(get_drive_file_download_url)(
+            service=_service("video/mp4", "clip.mp4"),
+            user_google_email=USER,
+            file_id="v-1",
+        )
+
+    assert not result.startswith("Error:")
+    assert "https://gcs.example/signed" in result
