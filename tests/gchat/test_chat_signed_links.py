@@ -101,3 +101,72 @@ async def test_flag_on_returns_signed_short_link_not_an_unsigned_url(signed_env)
     assert "http://testserver/attachments/" not in text
     assert "expire after 1 hour" not in text
     download.assert_not_called()  # nothing is fetched or stored at mint time
+
+
+@pytest.mark.asyncio
+async def test_link_carries_the_resource_name_and_file_details(signed_env):
+    with patch.object(sd, "offer_url", wraps=sd.offer_url) as offer:
+        text = await call_tool()
+
+    kwargs = offer.call_args.kwargs
+    assert kwargs["source"] == "chat"
+    assert kwargs["ref"] == {"rn": RN}
+    assert kwargs["filename"] == "report.pdf"
+    assert kwargs["mime_type"] == "application/pdf"
+    assert "File: report.pdf" in text and "~15 minutes" in text
+
+
+@pytest.mark.asyncio
+async def test_stateless_mode_returns_a_link(signed_env):
+    with (
+        patch("auth.oauth_config.is_stateless_mode", return_value=True),
+        patch("gchat.chat_tools.download_http_url_bytes") as download,
+    ):
+        text = await call_tool()
+
+    assert "http://testserver/dl/" in text
+    download.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_unsignable_fails_loudly_without_downloading_or_storing(
+    signed_env, tmp_path
+):
+    with (
+        patch.object(sd, "offer_url", return_value=None),
+        patch("gchat.chat_tools.download_http_url_bytes") as download,
+    ):
+        text = await call_tool()
+
+    assert "no signed download link could be issued" in text
+    assert "start_google_auth" in text
+    assert "/attachments/" not in text and "/dl/" not in text
+    download.assert_not_called()
+    assert list(tmp_path.iterdir()) == []  # no disk write
+
+
+@pytest.mark.asyncio
+async def test_unsafe_resource_name_is_refused_before_minting(signed_env):
+    with patch.object(sd, "offer_url") as offer:
+        text = await call_tool(service=chat_service("spaces/S/attachments/../x"))
+
+    assert "invalid resource name" in text
+    offer.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_flag_off_keeps_the_unsigned_flow(signed_env, monkeypatch):
+    monkeypatch.delenv("WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS", raising=False)
+    with (
+        patch.object(sd, "offer_url") as offer,
+        patch(
+            "gchat.chat_tools.download_http_url_bytes",
+            new_callable=AsyncMock,
+            return_value=b"bytes",
+        ) as download,
+    ):
+        text = await call_tool()
+
+    offer.assert_not_called()
+    download.assert_awaited_once()
+    assert "expire after 1 hour" in text

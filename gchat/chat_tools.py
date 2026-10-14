@@ -18,6 +18,7 @@ from mcp.types import ToolAnnotations
 
 # Auth & server utilities
 from auth.service_decorator import require_google_service, require_multiple_services
+from core import download_handles, signed_downloads
 from core.file_limits import FileTooLargeError, download_http_url_bytes
 from core.server import server
 from core.utils import TransientNetworkError, UserInputError, handle_http_errors
@@ -612,10 +613,16 @@ async def download_chat_attachment(
     attachment_index: int = 0,
 ) -> str:
     """
-    Downloads an attachment from a Google Chat message and saves it to local disk.
+    Downloads an attachment from a Google Chat message.
 
-    In stdio mode, returns the local file path for direct access.
-    In HTTP mode, returns a temporary download URL (valid for 1 hour).
+    With signed download URLs enabled, returns a short-lived signed link (see
+    the lifetime in the result) that streams the file from Google when fetched;
+    nothing is downloaded or stored by this call, and it works in stateless
+    mode. If no signed link can be issued the call fails with an error rather
+    than returning a link that needs a browser login.
+
+    Otherwise, in stdio mode, saves the file to local disk and returns its path;
+    in HTTP mode, returns a temporary download URL (valid for 1 hour).
 
     Args:
         message_id: The message resource name (e.g. spaces/X/messages/Y).
@@ -668,6 +675,38 @@ async def download_chat_attachment(
 
     # Prefer attachmentDataRef.resourceName for the media endpoint
     resource_name = media_resource or att_name
+
+    # Signed link: the route streams the attachment from Chat at download time,
+    # so nothing is downloaded or stored here (and stateless mode works).
+    if signed_downloads.enabled():
+        try:
+            signed_downloads.chat_media_url(resource_name)
+        except ValueError:
+            return f"Cannot offer attachment '{filename}': invalid resource name."
+        signed = await download_handles.shorten_signed_url(
+            signed_downloads.offer_url(
+                user_google_email,
+                source="chat",
+                ref={"rn": resource_name},
+                filename=filename,
+                mime_type=content_type,
+            )
+        )
+        if not signed:
+            return signed_downloads.SIGNING_FAILED_ERROR
+        url, ttl = signed
+        logger.info(
+            "[download_chat_attachment] Returning signed download URL (no download)"
+        )
+        return "\n".join(
+            [
+                "File ready — streamed on demand (no base64, nothing stored).",
+                f"File: {filename}",
+                f"Type: {content_type}",
+                *signed_downloads.url_lines(url, ttl, "file"),
+            ]
+        )
+
     download_url = f"https://chat.googleapis.com/v1/media/{resource_name}?alt=media"
 
     try:
