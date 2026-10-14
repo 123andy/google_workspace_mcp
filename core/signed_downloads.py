@@ -583,8 +583,8 @@ async def _fetch_chat(claims: dict, credentials: Credentials) -> DownloadResult:
     except ValueError as exc:
         raise SignedDownloadError(str(exc)) from exc
     limit = get_max_file_bytes()
-    # Redirects are not followed: a redirect would carry the bearer token to
-    # whatever host it names.
+    # Redirects are not followed: Google's media endpoint answers directly, so a
+    # redirect is unexpected and is treated as a failure rather than chased.
     client = httpx.AsyncClient(
         timeout=httpx.Timeout(120.0, connect=30.0), follow_redirects=False
     )
@@ -607,6 +607,14 @@ async def _fetch_chat(claims: dict, credentials: Credentials) -> DownloadResult:
         if response.status_code != 200:
             raise SignedDownloadError(
                 f"Chat media download failed: HTTP {response.status_code}"
+            )
+        # aiter_bytes would decode an encoded body while Content-Length counts
+        # the encoded bytes, ending a 200 short of its declared length.
+        encoding = response.headers.get("content-encoding", "identity")
+        if any(t.strip().lower() not in ("", "identity") for t in encoding.split(",")):
+            raise SignedDownloadError(
+                "Chat media response has a Content-Encoding despite "
+                "Accept-Encoding: identity"
             )
         declared = response.headers.get("content-length")
         # Without a declared length a cut upstream body is indistinguishable from

@@ -117,7 +117,43 @@ async def test_streams_bytes_with_bearer_token_and_no_redirect_following(
     assert (result.filename, result.media_type) == ("r.pdf", "application/pdf")
     request = chat_endpoint["requests"][0]
     assert request.headers["authorization"] == "Bearer tok-123"
+    # Identity keeps Content-Length and the streamed bytes in the same unit.
+    assert request.headers["accept-encoding"] == "identity"
     assert str(request.url) == sd.chat_media_url(RN)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("encoding", ["gzip", "br", "deflate", "GZIP"])
+async def test_encoded_upstream_body_is_refused(chat_endpoint, encoding):
+    """aiter_bytes decodes a gzip body while Content-Length counts the compressed
+    bytes, which would end a 200 short of its declared length."""
+    import gzip
+
+    compressed = gzip.compress(PAYLOAD)
+    chat_endpoint["handler"] = lambda request: httpx.Response(
+        200,
+        headers={
+            "content-encoding": encoding,
+            "content-length": str(len(compressed)),
+        },
+        stream=_Stream([compressed]),
+    )
+    with pytest.raises(sd.SignedDownloadError):
+        await sd._fetch_chat(CLAIMS, CREDS)
+
+
+@pytest.mark.asyncio
+async def test_identity_content_encoding_is_accepted(chat_endpoint):
+    chat_endpoint["handler"] = lambda request: httpx.Response(
+        200,
+        headers={
+            "content-encoding": "identity",
+            "content-length": str(len(PAYLOAD)),
+        },
+        stream=_Stream([PAYLOAD]),
+    )
+    result = await sd._fetch_chat(CLAIMS, CREDS)
+    assert await _drain(result) == PAYLOAD
 
 
 @pytest.mark.asyncio
