@@ -561,6 +561,16 @@ def unavailable_note(offer: Offer) -> str:
     return f"\n⚠️ No signed download URL could be issued: {offer.reason}."
 
 
+def signing_failed_error(offer: Offer) -> str:
+    """The error a tool returns when signing is on, no link could be issued and
+    the only alternative would be an unsigned link that needs a browser login."""
+    return (
+        "Error: no signed download link could be issued, so nothing was "
+        f"downloaded: {offer.reason}. Re-authenticate with start_google_auth if "
+        "that applies, then call this tool again."
+    )
+
+
 # --- Fetchers: claims + owner credentials -> bytes -------------------------------
 
 
