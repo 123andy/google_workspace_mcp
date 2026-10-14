@@ -681,11 +681,13 @@ async def download_chat_attachment(
     # Signed link: the route streams the attachment from Chat when it is opened,
     # so nothing is downloaded or stored here (and stateless mode works).
     if signed_downloads.enabled():
-        if not media_resource:
+        if source == "DRIVE_FILE" or not media_resource:
+            drive_file_id = (att.get("driveDataRef") or {}).get("driveFileId")
+            id_note = f" (Drive file ID: {drive_file_id})" if drive_file_id else ""
             return (
-                f"Error: attachment '{filename}' is a Drive file, not Chat-hosted "
-                "data, so it has no download link here. Use the Drive tools to "
-                "fetch it."
+                f"Error: attachment '{filename}' is a Drive file{id_note}, not "
+                "Chat-hosted data, so it has no download link here. Use the "
+                "Drive tools to fetch it."
             )
         try:
             signed_downloads.chat_media_url(resource_name)
