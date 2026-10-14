@@ -417,6 +417,9 @@ class DownloadResult:
     media_type: str
     content: Optional[bytes] = None
     stream: Optional[AsyncIterator[bytes]] = None
+    # Exact byte count of ``stream`` when Google declared it; sent as
+    # Content-Length so a client can tell a cut transfer from a complete one.
+    length: Optional[int] = None
 
 
 class SignedDownloadError(Exception):
@@ -606,12 +609,15 @@ async def _fetch_chat(claims: dict, credentials: Credentials) -> DownloadResult:
                 f"Chat media download failed: HTTP {response.status_code}"
             )
         declared = response.headers.get("content-length")
-        if (
-            limit is not None
-            and declared
-            and declared.isdigit()
-            and int(declared) > limit
-        ):
+        # Without a declared length a cut upstream body is indistinguishable from
+        # a complete one, and the client would get a truncated file as a clean 200.
+        if not (declared and declared.isdigit()):
+            raise SignedDownloadError(
+                "Chat media response declared no Content-Length; refusing to "
+                "stream a body that cannot be checked for truncation"
+            )
+        declared_bytes = int(declared)
+        if limit is not None and declared_bytes > limit:
             raise SignedDownloadError("attachment exceeds the file size limit")
     except BaseException as exc:
         if response is not None:
@@ -628,11 +634,17 @@ async def _fetch_chat(claims: dict, credentials: Credentials) -> DownloadResult:
         try:
             async for chunk in response.aiter_bytes(_CHAT_STREAM_CHUNK_BYTES):
                 sent += len(chunk)
-                if limit is not None and sent > limit:
-                    # Raising aborts the chunked body: the client sees an
-                    # incomplete transfer, not a short file that looks complete.
-                    raise SignedDownloadError("attachment exceeds the file size limit")
+                if sent > declared_bytes or (limit is not None and sent > limit):
+                    # Raising aborts the body: the client sees an incomplete
+                    # transfer, not a file that looks complete.
+                    raise SignedDownloadError(
+                        "attachment exceeds its declared size or the file size limit"
+                    )
                 yield chunk
+            if sent != declared_bytes:
+                raise SignedDownloadError(
+                    f"Chat stream ended early: {sent} of {declared_bytes} bytes"
+                )
         except SignedDownloadError:
             raise
         except Exception as exc:
@@ -646,6 +658,7 @@ async def _fetch_chat(claims: dict, credentials: Credentials) -> DownloadResult:
         filename=claims.get("fn") or "attachment",
         media_type=claims.get("mt") or "application/octet-stream",
         stream=body(),
+        length=declared_bytes,
     )
 
 
@@ -716,6 +729,8 @@ async def serve(token: str) -> Response:
         "Content-Disposition": _content_disposition(result.filename),
     }
     if result.stream is not None:
+        if result.length is not None:
+            headers["Content-Length"] = str(result.length)
         return StreamingResponse(
             result.stream, media_type=result.media_type, headers=headers
         )
