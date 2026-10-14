@@ -69,7 +69,7 @@ URL_TTL_SECONDS = 900
 # A URL must expire at least this long before the credential stops being usable.
 _EXPIRY_MARGIN_SECONDS = 30
 # A link that would live less than this is not worth handing to an agent that has
-# yet to fetch it; the tool falls back to its stored copy instead.
+# yet to fetch it; the tool then reports why no link was issued (see ``Offer``).
 _MIN_TTL_SECONDS = 60
 # Bound on names carried in a token, so a long sender-controlled filename cannot
 # push the token past _MAX_TOKEN_CHARS.
@@ -511,8 +511,8 @@ async def offer_url(
     filename: Optional[str] = None,
     mime_type: Optional[str] = None,
 ) -> Offer:
-    """Tool-side entry point: an ``Offer`` with a URL, or one saying why not so the
-    tool can use its normal path and tell the user.
+    """Tool-side entry point: an ``Offer`` with a URL, or one saying why not, which
+    the tool reports (stateless mode may still return the content inline).
 
     No URL when the feature is off, or when the route could not serve one: the
     owner's credentials are recoverable from neither store, they would stay usable
