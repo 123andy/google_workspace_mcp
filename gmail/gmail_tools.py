@@ -1860,8 +1860,8 @@ def _format_resolved_attachment_error(attachment: Dict[str, Any]) -> str:
 def _is_own_download_route(url: str) -> bool:
     """True if ``url`` is one of this server's own signed download links.
 
-    ``get_drive_file_download_url`` and ``get_gmail_attachment_content`` mint
-    ``/dl/{handle}`` (the default while ``WORKSPACE_MCP_SHORT_SIGNED_URLS`` is
+    ``get_drive_file_download_url``, ``get_gmail_attachment_content`` and
+    ``download_chat_attachment`` mint ``/dl/{handle}`` (the default while ``WORKSPACE_MCP_SHORT_SIGNED_URLS`` is
     on) or ``/attachments/signed/{token}``. Neither is usable as an attachment
     *source*: :func:`_try_read_local_attachment` only short-circuits the bare
     two-segment ``/attachments/{id}`` plane, so these fall through to an HTTP
@@ -3146,6 +3146,8 @@ async def get_gmail_attachment_content(
     In HTTP mode, returns a download URL: with signed download URLs enabled on the
     server, a link that streams from Gmail on demand and expires within ~15 minutes
     (fetch it promptly); otherwise a server-stored copy valid for 1 hour.
+    With signed URLs enabled but no link issuable, the tool returns an error
+    instead of falling back to an unsigned link.
     May re-fetch message metadata to resolve filename and MIME type.
 
     Args:
