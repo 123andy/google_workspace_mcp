@@ -154,15 +154,12 @@ async def test_declared_length_over_the_cap_is_refused_up_front(
 
 
 @pytest.mark.asyncio
-async def test_undeclared_length_is_capped_on_the_streamed_bytes(
-    chat_endpoint, monkeypatch
-):
-    monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", "100")
-    chat_endpoint["handler"] = _ok(chunks=[b"x" * 60, b"x" * 60], length=False)
-    result = await sd._fetch_chat(CLAIMS, CREDS)
-    assert result.length is None
-    with pytest.raises(sd.SignedDownloadError):
-        await _drain(result)
+async def test_undeclared_length_is_refused_with_a_generic_502(chat_endpoint):
+    chat_endpoint["handler"] = _ok(chunks=[b"secret-body"], length=False)
+    with pytest.raises(sd.SignedDownloadError) as caught:
+        await sd._fetch_chat(CLAIMS, CREDS)
+    assert caught.value.status == 502
+    assert "secret-body" not in caught.value.public
 
 
 @pytest.mark.asyncio
@@ -270,12 +267,67 @@ async def test_oversized_attachment_is_413(app, chat_endpoint, monkeypatch):
     assert response.status_code == 413
 
 
-@pytest.mark.asyncio
-async def test_mid_stream_cut_never_completes_the_response(app, chat_endpoint):
-    client, _ = app
-    chat_endpoint["handler"] = _ok(
-        chunks=[b"x" * 10], then_raise=httpx.ReadError("connection reset")
+def _serve_real(port_holder):
+    """Serve the real app over a real socket; returns (server, thread)."""
+    import socket
+    import threading
+    import time
+
+    import uvicorn
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port_holder.append(probe.getsockname()[1])
+    srv = uvicorn.Server(
+        uvicorn.Config(
+            server.http_app(),
+            host="127.0.0.1",
+            port=port_holder[0],
+            log_level="critical",
+        )
     )
-    async with client() as http:
-        with pytest.raises(sd.SignedDownloadError):
-            await http.get(_link())
+    thread = threading.Thread(target=srv.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not srv.started:
+        if not thread.is_alive() or time.monotonic() > deadline:
+            pytest.fail("uvicorn test server did not start")
+        time.sleep(0.02)
+    return srv, thread
+
+
+def test_over_a_real_socket_a_cut_stream_fails_visibly_and_no_length_is_refused(
+    app, chat_endpoint, monkeypatch
+):
+    """A truncated body must never look like a complete 200 to the client."""
+    big = 140000
+    port = []
+    srv, thread = _serve_real(port)
+    base = f"http://127.0.0.1:{port[0]}"
+    path = _link().removeprefix("http://testserver")
+    try:
+        # Declared length, upstream cut mid-body: the connection is dropped.
+        chat_endpoint["handler"] = lambda request: httpx.Response(
+            200,
+            headers={"content-length": str(big)},
+            stream=_Stream(
+                [b"x" * 65536], then_raise=httpx.ReadError("connection reset")
+            ),
+        )
+        with pytest.raises(httpx.RemoteProtocolError):
+            httpx.get(base + path)
+
+        # Declared length over the cap: refused before any body.
+        monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", "100")
+        chat_endpoint["handler"] = _ok()
+        assert httpx.get(base + path).status_code == 413
+
+        # No declared length: refused, whatever the body would have been.
+        monkeypatch.delenv("WORKSPACE_MCP_MAX_FILE_BYTES")
+        chat_endpoint["handler"] = _ok(chunks=[b"x" * big], length=False)
+        response = httpx.get(base + path)
+        assert response.status_code == 502
+        assert b"x" * 10 not in response.content
+    finally:
+        srv.should_exit = True
+        thread.join(5)

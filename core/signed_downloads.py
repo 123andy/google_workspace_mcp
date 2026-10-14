@@ -924,15 +924,18 @@ async def _fetch_chat(claims: dict, credentials: Credentials) -> DownloadResult:
             raise SignedDownloadError(
                 f"Chat media download failed: HTTP {response.status_code}"
             )
+        # Without a Content-Length a mid-stream cut would end the chunked
+        # body cleanly and the client would keep a truncated file as a 200.
         declared = response.headers.get("content-length")
-        if declared and declared.isdigit():
-            length = int(declared)
-            if limit is not None and length > limit:
-                raise SignedDownloadError(
-                    "Chat attachment exceeds the file size limit",
-                    status=413,
-                    public="The attachment exceeds this server's file size limit.",
-                )
+        if not (declared and declared.isdigit()):
+            raise SignedDownloadError("Chat media response declared no Content-Length")
+        length = int(declared)
+        if limit is not None and length > limit:
+            raise SignedDownloadError(
+                "Chat attachment exceeds the file size limit",
+                status=413,
+                public="The attachment exceeds this server's file size limit.",
+            )
     except BaseException as exc:
         if response is not None:
             await response.aclose()
