@@ -38,6 +38,19 @@ _SEARCH_MESSAGES_MAX_CONCURRENT_SPACE_FETCHES = 1
 _SEARCH_MESSAGES_SSL_RETRIES = 3
 
 
+def _is_drive_attachment(att: dict) -> bool:
+    """A Drive-file attachment has no Chat-hosted bytes behind it: the source says
+    so, or there is no ``attachmentDataRef`` for the media endpoint to read."""
+    return att.get("source") == "DRIVE_FILE" or not att.get("attachmentDataRef")
+
+
+def _drive_id_note(att: dict, template: str) -> str:
+    """``template`` filled with the Drive file ID when the attachment carries one;
+    the key is read defensively, and its absence is not an error."""
+    drive_file_id = (att.get("driveDataRef") or {}).get("driveFileId")
+    return template.format(drive_file_id) if drive_file_id else ""
+
+
 @server.tool(
     title="List Spaces",
     annotations=ToolAnnotations(
@@ -206,7 +219,17 @@ async def get_messages(
             att_type = att.get("contentType", "unknown type")
             att_resource = att.get("name", "")
             output.append(f"  [attachment {idx}: {att_name} ({att_type})]")
-            if att_resource:
+            if (
+                att_resource
+                and signed_downloads.enabled()
+                and _is_drive_attachment(att)
+            ):
+                output.append(
+                    "  Drive file: not downloadable with download_chat_attachment; "
+                    "use the Drive tools"
+                    + _drive_id_note(att, " with Drive file ID {}")
+                )
+            elif att_resource:
                 output.append(
                     f"  Use download_chat_attachment(message_id='{msg_name}', attachment_index={idx}) to download"
                 )
@@ -679,14 +702,14 @@ async def download_chat_attachment(
     # Signed link: the route streams the attachment from Chat at download time,
     # so nothing is downloaded or stored here (and stateless mode works).
     if signed_downloads.enabled():
-        if not media_resource:
+        if _is_drive_attachment(att):
             # A Drive-file attachment has no attachmentDataRef; the media endpoint
             # rejects the attachment name (see above), so no link could work.
             return (
-                f"Error: attachment '{filename}' has no Chat-hosted file data "
-                "(it is a Google Drive file, not an upload), so no download "
-                "link can be issued for it here. Use the Drive tools with the "
-                "file's Drive ID instead."
+                f"Error: attachment '{filename}' is a Google Drive file"
+                f"{_drive_id_note(att, ' (Drive file ID: {})')}, not Chat-hosted "
+                "data, so no download link can be issued for it here. Use the "
+                "Drive tools instead."
             )
         try:
             signed_downloads.chat_media_url(resource_name)

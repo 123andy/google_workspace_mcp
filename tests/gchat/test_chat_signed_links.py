@@ -18,13 +18,14 @@ OWNER = "user@example.com"
 RN = "spaces/S/attachments/A"
 
 
-def chat_service(resource_name=RN):
+def chat_service(resource_name=RN, **extra):
     service = Mock()
     attachment = {
         "name": "spaces/S/messages/M/attachments/A",
         "contentName": "report.pdf",
         "contentType": "application/pdf",
         "source": "UPLOADED_CONTENT",
+        **extra,
     }
     if resource_name:
         attachment["attachmentDataRef"] = {"resourceName": resource_name}
@@ -167,6 +168,38 @@ async def test_drive_file_attachment_is_an_error_and_mints_no_link(signed_env):
 
 
 @pytest.mark.asyncio
+async def test_drive_source_is_recognised_even_with_a_data_ref(signed_env):
+    service = chat_service(source="DRIVE_FILE", driveDataRef={"driveFileId": "1AbCdEf"})
+    with patch.object(sd, "offer_url") as offer:
+        text = await call_tool(service=service)
+
+    assert text.startswith("Error:") and "Drive file" in text
+    assert "1AbCdEf" in text
+    offer.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_drive_file_error_includes_the_id_when_present(signed_env):
+    service = chat_service(
+        resource_name=None,
+        source="DRIVE_FILE",
+        driveDataRef={"driveFileId": "1AbCdEf"},
+    )
+    text = await call_tool(service=service)
+
+    assert "1AbCdEf" in text
+    assert "/dl/" not in text
+
+
+@pytest.mark.asyncio
+async def test_drive_file_error_without_an_id_still_works(signed_env):
+    text = await call_tool(service=chat_service(resource_name=None))
+
+    assert text.startswith("Error:") and "Drive file" in text
+    assert "File ID" not in text
+
+
+@pytest.mark.asyncio
 async def test_drive_file_attachment_unchanged_when_signing_is_off(
     signed_env, monkeypatch
 ):
@@ -236,7 +269,7 @@ async def test_minted_short_link_streams_the_attachment_through_the_app(signed_e
         async with functools.partial(
             real_client, transport=transport, base_url="http://testserver"
         )() as http:
-            response = await http.get(url, follow_redirects=True)
+            response = await http.get(url, follow_redirects=False)
 
     assert response.status_code == 200
     assert response.content == payload
