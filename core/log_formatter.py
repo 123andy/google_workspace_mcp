@@ -22,8 +22,45 @@ class SuppressStatelessTransportTerminationFilter(logging.Filter):
         )
 
 
+# Paths whose trailing segment is itself the credential: a short-link handle or a
+# signed token. Anyone who can read the access log could replay them.
+_CAPABILITY_PATH_PREFIXES = ("/dl/", "/ul/", "/attachments/signed/", "/auth/")
+
+
+def redact_capability_path(path: str) -> str:
+    """``/dl/<handle>`` becomes ``/dl/<redacted>``; other paths pass through.
+    Anything after the prefix, including a query string, is dropped."""
+    for prefix in _CAPABILITY_PATH_PREFIXES:
+        if path.startswith(prefix):
+            return f"{prefix}<redacted>"
+    return path
+
+
+class RedactCapabilityPathsFilter(logging.Filter):
+    """Redact capability-bearing paths in uvicorn access-log records.
+
+    uvicorn logs ``'%s - "%s %s HTTP/%s" %d'`` with the request path as the
+    third argument; status, size and timing are untouched.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
+            redacted = redact_capability_path(args[2])
+            if redacted != args[2]:
+                record.args = (*args[:2], redacted, *args[3:])
+        return True
+
+
 def install_noisy_log_filters() -> None:
-    """Install targeted filters for known noisy third-party log lines."""
+    """Install targeted filters for known noisy third-party log lines, and the
+    redaction filter on the uvicorn access logger."""
+    access_logger = logging.getLogger("uvicorn.access")
+    if not any(
+        isinstance(existing, RedactCapabilityPathsFilter)
+        for existing in access_logger.filters
+    ):
+        access_logger.addFilter(RedactCapabilityPathsFilter())
     target_logger = logging.getLogger("mcp.server.streamable_http")
     if not any(
         isinstance(existing, SuppressStatelessTransportTerminationFilter)
