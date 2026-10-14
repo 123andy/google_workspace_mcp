@@ -28,23 +28,31 @@ _CAPABILITY_PATH_PREFIXES = ("/dl/", "/ul/", "/attachments/signed/")
 # ``/auth/`` also hosts literal operator routes (``/auth/callback``), so only a
 # single credential-shaped segment there is redacted: ``secrets.token_urlsafe``
 # output, 16 or more URL-safe characters.
-_AUTH_HANDLE = re.compile(r"/auth/[A-Za-z0-9_-]{16,}(?=[/?#]|$)")
+_AUTH_HANDLE = re.compile(r"/auth/[A-Za-z0-9_-]{16,}(?=[/?#&]|$)")
 _CAPABILITY_PATH = re.compile(
     "|".join(re.escape(prefix) for prefix in _CAPABILITY_PATH_PREFIXES)
 )
+_CAPABILITY_IN_QUERY = re.compile(f"({_CAPABILITY_PATH.pattern})[^/?#&\\s]+")
 
 
 def redact_capability_path(path: str) -> str:
-    """``/dl/<handle>`` becomes ``/dl/<redacted>``; other paths pass through.
-    Anything after the prefix, including a query string, is dropped. The prefix
-    may follow a mount point (uvicorn logs ``root_path`` + path)."""
-    match = _CAPABILITY_PATH.search(path)
+    """Redact every capability in a logged request target.
+
+    A credential in the path (``/dl/<handle>``, ``/auth/<handle>``) becomes
+    ``<redacted>`` and the query string is dropped with it, so a second
+    credential riding in the query cannot survive. Otherwise any capability in
+    the query is redacted in place and the rest is kept. The prefix may follow a
+    mount point (uvicorn logs ``root_path`` + path)."""
+    original, sep, query = path.partition("?")
+    path_part = _AUTH_HANDLE.sub("/auth/<redacted>", original)
+    match = _CAPABILITY_PATH.search(path_part)
     if match:
-        return f"{path[: match.end()]}<redacted>"
-    match = _AUTH_HANDLE.search(path)
-    if match:
-        return f"{path[: match.start()]}/auth/<redacted>"
-    return path
+        return f"{path_part[: match.end()]}<redacted>"
+    if path_part != original or not sep:
+        return path_part
+    query = _AUTH_HANDLE.sub("/auth/<redacted>", query)
+    query = _CAPABILITY_IN_QUERY.sub(r"\1<redacted>", query)
+    return f"{path_part}?{query}"
 
 
 class RedactCapabilityPathsFilter(logging.Filter):
