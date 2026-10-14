@@ -516,6 +516,12 @@ async def _export_full_message(
         )
         return "\n".join(result_lines)
 
+    # Signing is on but no link could be issued. Stateless mode can still return
+    # the message inline (below); otherwise the only alternative is an unsigned
+    # link that needs a browser session, so fail instead of handing out a dead end.
+    if signed_wanted and not is_stateless_mode():
+        return signed_downloads.signing_failed_error(offer)
+
     try:
         content_bytes, mime_type, extension, notes = await _render_message_export(
             service, message_id, body_format
@@ -2649,6 +2655,12 @@ async def get_gmail_attachment_content(
                     "recent message fetch.",
                 ]
             )
+        # No link could be issued. Stateless mode still returns a preview below;
+        # otherwise fail rather than download and offer a link behind a login.
+        import auth.oauth_config as _oauth_config
+
+        if not _oauth_config.is_stateless_mode():
+            return signed_downloads.signing_failed_error(offer)
 
     try:
         attachment = await asyncio.to_thread(
