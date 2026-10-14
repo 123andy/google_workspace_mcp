@@ -41,6 +41,15 @@ SECRET = "SECRETHANDLE0123456789ab"
         ),
         (f"/mcp-gw/auth/{SECRET}", "/mcp-gw/auth/<redacted>"),
         ("/mcp-gw/auth/callback", "/mcp-gw/auth/callback"),
+        # every occurrence, in the path and in the query, is redacted
+        (f"/auth/{SECRET}?x=/dl/{SECRET}", "/auth/<redacted>"),
+        (f"/mcp?next=/auth/{SECRET}", "/mcp?next=/auth/<redacted>"),
+        (f"/dl/{SECRET}?x=/auth/{SECRET}", "/dl/<redacted>"),
+        (
+            f"/mcp?a=/ul/{SECRET}&b=/dl/{SECRET}",
+            "/mcp?a=/ul/<redacted>&b=/dl/<redacted>",
+        ),
+        ("/auth/callback?next=/auth/callback", "/auth/callback?next=/auth/callback"),
         ("/mcp", "/mcp"),
         ("/attachments/some-uuid", "/attachments/some-uuid"),
         ("/readyz", "/readyz"),
