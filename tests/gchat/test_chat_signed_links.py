@@ -170,3 +170,44 @@ async def test_flag_off_keeps_the_unsigned_flow(signed_env, monkeypatch):
     offer.assert_not_called()
     download.assert_awaited_once()
     assert "expire after 1 hour" in text
+
+
+@pytest.mark.asyncio
+async def test_minted_short_link_streams_the_attachment_through_the_app(signed_env):
+    """Tool mints the /dl/ link; a plain GET through the real app streams the bytes."""
+    import functools
+
+    import httpx
+
+    payload = b"chat attachment bytes " * 50
+    real_client = httpx.AsyncClient
+    seen = []
+
+    def chat_handler(request):
+        seen.append(request)
+        return httpx.Response(200, content=payload)
+
+    def client_factory(**kw):
+        if kw.get("transport") is None and kw.get("follow_redirects") is False:
+            kw["transport"] = httpx.MockTransport(chat_handler)
+        return real_client(**kw)
+
+    text = await call_tool()
+    url = next(line.split(": ", 1)[1] for line in text.splitlines() if "/dl/" in line)
+    assert url.startswith("http://testserver/dl/")
+
+    creds = Mock(valid=True, expiry=datetime.utcnow() + timedelta(hours=1), token="t")
+    with (
+        patch.object(sd, "_recover_credentials", Mock(return_value=creds)),
+        patch.object(sd.httpx, "AsyncClient", client_factory),
+    ):
+        transport = httpx.ASGITransport(app=server.http_app())
+        async with functools.partial(
+            real_client, transport=transport, base_url="http://testserver"
+        )() as http:
+            response = await http.get(url, follow_redirects=True)
+
+    assert response.status_code == 200
+    assert response.content == payload
+    assert 'filename="report.pdf"' in response.headers["content-disposition"]
+    assert [r.url.path for r in seen] == [f"/v1/media/{RN}"]
