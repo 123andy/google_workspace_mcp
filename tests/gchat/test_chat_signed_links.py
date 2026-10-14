@@ -144,7 +144,7 @@ async def test_unsignable_fails_loudly_without_downloading_or_storing(
 
     assert text.startswith("Error: no signed download link could be issued")
     assert sd.NO_CREDENTIALS in text
-    assert "start_google_auth" in text
+    assert "start_google_auth" not in text  # absent in OAuth 2.1 mode
     assert "/attachments/" not in text
     download.assert_not_called()
     assert list(tmp_path.iterdir()) == []  # no disk write
@@ -155,8 +155,22 @@ async def test_unsafe_resource_name_is_refused_before_minting(signed_env):
     with patch.object(sd, "offer_url") as offer:
         text = await call_tool(service=chat_service("spaces/S/attachments/../x"))
 
+    assert text.startswith("Error:")
     assert "invalid resource name" in text
     offer.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_drive_file_attachment_gets_a_clear_error_and_no_link(signed_env):
+    """A Drive file has no attachmentDataRef, and the media endpoint 400s on the
+    attachment name, so minting a link would hand out one that cannot work."""
+    with patch.object(sd, "offer_url") as offer:
+        text = await call_tool(service=chat_service(resource_name=None))
+
+    assert text.startswith("Error:")
+    assert "Drive" in text
+    offer.assert_not_called()
+    assert "/attachments/signed/" not in text
 
 
 @pytest.mark.asyncio

@@ -566,8 +566,7 @@ def signing_failed_error(offer: Offer) -> str:
     the only alternative would be an unsigned link that needs a browser login."""
     return (
         "Error: no signed download link could be issued, so nothing was "
-        f"downloaded: {offer.reason}. Re-authenticate with start_google_auth if "
-        "that applies, then call this tool again."
+        f"downloaded: {offer.reason}. Once that is resolved, call this tool again."
     )
 
 
