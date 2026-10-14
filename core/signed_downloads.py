@@ -38,6 +38,7 @@ from pathlib import PurePath
 from typing import AsyncIterator, Awaitable, Callable, Optional
 from urllib.parse import quote, urlparse
 
+import httpx
 from cryptography.fernet import Fernet
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from google.auth.transport.requests import Request
@@ -48,7 +49,11 @@ from googleapiclient.http import MediaIoBaseDownload
 
 from core.attachment_storage import external_base_url
 from core.config import get_transport_mode
-from core.file_limits import FileTooLargeError, ensure_within_file_size_limit
+from core.file_limits import (
+    FileTooLargeError,
+    ensure_within_file_size_limit,
+    get_max_file_bytes,
+)
 
 try:
     from google.auth._helpers import REFRESH_THRESHOLD
@@ -843,10 +848,121 @@ async def _fetch_drive(claims: dict, credentials: Credentials) -> DownloadResult
     )
 
 
+_CHAT_MEDIA_BASE = "https://chat.googleapis.com/v1/media/"
+_CHAT_STREAM_CHUNK_BYTES = 64 * 1024
+
+
+def chat_media_url(resource_name: str) -> str:
+    """The Chat media URL for ``attachmentDataRef.resourceName``.
+
+    The host is fixed; the name is only ever a path suffix. Names that could
+    change the path or query (``..``, ``?``, ``#``, ``%``, backslash, control
+    characters) are refused rather than escaped. Raises ``ValueError``.
+    """
+    if (
+        not isinstance(resource_name, str)
+        or not resource_name
+        or ".." in resource_name
+        or any(ch in resource_name for ch in "?#%\\")
+        or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in resource_name)
+    ):
+        raise ValueError("invalid Chat attachment resource name")
+    url = f"{_CHAT_MEDIA_BASE}{quote(resource_name, safe='/')}?alt=media"
+    if httpx.URL(url).host != "chat.googleapis.com":
+        raise ValueError("invalid Chat attachment resource name")
+    return url
+
+
+async def _fetch_chat(claims: dict, credentials: Credentials) -> DownloadResult:
+    """Stream a Chat attachment from the media endpoint in bounded chunks.
+
+    The size cap is enforced on the declared length up front and on the bytes
+    actually streamed. A declared length is also sent as ``Content-Length``, so a
+    stream cut short ends short of it and the client sees an incomplete transfer
+    rather than a complete-looking file."""
+    _tool_module("gchat.chat_tools", "Chat")
+    try:
+        url = chat_media_url(claims.get("rn"))
+    except ValueError as exc:
+        raise SignedDownloadError(str(exc)) from exc
+    try:
+        limit = get_max_file_bytes()
+    except ValueError as exc:
+        raise SignedDownloadError(f"invalid file size limit: {exc}") from exc
+    # A redirect would carry the bearer token to whatever host it names.
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(120.0, connect=30.0), follow_redirects=False
+    )
+    response = None
+    length: Optional[int] = None
+    try:
+        # Identity encoding keeps Content-Length and the streamed bytes in the
+        # same unit, so the size cap is exact.
+        response = await client.send(
+            client.build_request(
+                "GET",
+                url,
+                headers={
+                    "Authorization": f"Bearer {credentials.token}",
+                    "Accept-Encoding": "identity",
+                },
+            ),
+            stream=True,
+        )
+        # Check the status before committing a 200 to the client.
+        if response.status_code != 200:
+            raise SignedDownloadError(
+                f"Chat media download failed: HTTP {response.status_code}"
+            )
+        declared = response.headers.get("content-length")
+        if declared and declared.isdigit():
+            length = int(declared)
+            if limit is not None and length > limit:
+                raise SignedDownloadError(
+                    "Chat attachment exceeds the file size limit",
+                    status=413,
+                    public="The attachment exceeds this server's file size limit.",
+                )
+    except BaseException as exc:
+        if response is not None:
+            await response.aclose()
+        await client.aclose()
+        if isinstance(exc, (SignedDownloadError, asyncio.CancelledError)):
+            raise
+        if isinstance(exc, Exception):
+            raise SignedDownloadError(f"Chat media download failed: {exc}") from exc
+        raise
+
+    async def body() -> AsyncIterator[bytes]:
+        sent = 0
+        try:
+            async for chunk in response.aiter_bytes(_CHAT_STREAM_CHUNK_BYTES):
+                sent += len(chunk)
+                if limit is not None and sent > limit:
+                    raise SignedDownloadError("Chat attachment exceeds the size limit")
+                yield chunk
+        except SignedDownloadError:
+            raise
+        except Exception as exc:
+            logger.error("Chat stream interrupted mid-download: %s", exc)
+            raise SignedDownloadError(f"Chat stream interrupted: {exc}") from exc
+        finally:
+            await response.aclose()
+            await client.aclose()
+
+    return DownloadResult(
+        filename=claims.get("fn") or "attachment",
+        media_type=claims.get("mt") or "application/octet-stream",
+        stream=body(),
+        length=length,
+    )
+
+
 _FETCHERS: dict[str, Callable[[dict, Credentials], Awaitable[DownloadResult]]] = {
     "gmail": _fetch_gmail_attachment,
     "gmail_message": _fetch_gmail_message,
     "drive": _fetch_drive,
+    "chat": _fetch_chat,
 }
 
 
