@@ -1,6 +1,6 @@
 """Signed, short-lived download URLs that stream Google content on demand.
 
-Neither Gmail nor Drive offers a public download URL: bytes only come back from
+Gmail, Drive and Chat offer no public download URL: bytes only come back from
 an authenticated API call. Without this module a remote server must either write
 the file to local disk and serve it from ``/attachments/{id}`` (impossible in
 stateless mode, and not tied to a user) or hand base64 back through the model.

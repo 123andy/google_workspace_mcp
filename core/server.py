@@ -850,7 +850,7 @@ async def serve_attachment(request: Request):
 
 @server.custom_route("/attachments/signed/{token}", methods=["GET"])
 async def serve_signed_attachment(request: Request):
-    """Stream a Gmail/Drive resource named by a signed capability URL; nothing is stored."""
+    """Stream a Gmail, Drive or Chat resource named by a signed capability URL; nothing is stored."""
     from core.signed_downloads import serve
 
     return await serve(request.path_params["token"])
