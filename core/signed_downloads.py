@@ -674,7 +674,7 @@ _FETCHERS: dict[str, Callable[[dict, Credentials], Awaitable[DownloadResult]]] =
 
 
 def _content_disposition(name: str) -> str:
-    """Names come from Gmail/Drive metadata (sender-controlled): the ASCII
+    """Names come from Gmail/Drive/Chat metadata (sender-controlled): the ASCII
     ``filename=`` keeps printable ASCII only — no quotes, backslashes, C0/DEL
     controls (h11 refuses a header value containing NUL) or non-ASCII, which the
     percent-encoded ``filename*`` carries intact."""
