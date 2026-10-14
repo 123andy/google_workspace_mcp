@@ -2,7 +2,7 @@
 so loudly when they cannot."""
 
 import base64
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -112,6 +112,27 @@ async def test_stateless_fallback_is_loud_when_url_cannot_be_minted(
 
 
 @pytest.mark.asyncio
+async def test_attachment_fails_loud_when_url_cannot_be_minted(enabled, monkeypatch):
+    """Not stateless: no download, no storage write, an error naming the fix."""
+    monkeypatch.setattr("auth.oauth_config.is_stateless_mode", lambda: False)
+    service = _service()
+    with (
+        patch.object(sd, "offer_url", return_value=None),
+        patch("core.attachment_storage.get_attachment_storage") as storage,
+    ):
+        result = await _unwrap(get_gmail_attachment_content)(
+            service=service,
+            message_id="msg-1",
+            attachment_id="att-1",
+            user_google_email=USER,
+        )
+
+    assert result == sd.SIGNING_FAILED_ERROR
+    service.users().messages().attachments().get().execute.assert_not_called()
+    storage.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_stateless_wording_unchanged_when_feature_off(monkeypatch):
     monkeypatch.delenv("WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS", raising=False)
     monkeypatch.delenv("WORKSPACE_MCP_MAX_FILE_BYTES", raising=False)
@@ -172,20 +193,12 @@ class _Saved:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stateless", [True, False])
-async def test_full_export_fallback_is_loud_when_url_cannot_be_minted(
-    enabled, monkeypatch, stateless
-):
-    """Same contract as the attachment and Drive tools: signed links on, offer
-    refused, so the fallback (inline or stored) says no signed URL was issued."""
+async def test_full_export_stateless_inline_fallback_is_loud(enabled, monkeypatch):
+    """Stateless mode keeps returning the message inline when no link can be
+    issued, and says that no signed URL was issued."""
     import gmail.gmail_tools as gmail_tools
 
-    monkeypatch.setattr(gmail_tools, "is_stateless_mode", lambda: stateless)
-    monkeypatch.setattr(gmail_tools, "get_transport_mode", lambda: "streamable-http")
-    storage = Mock()
-    storage.save_attachment_bytes.return_value = _Saved()
-    monkeypatch.setattr(gmail_tools, "get_attachment_storage", lambda: storage)
-    monkeypatch.setattr(gmail_tools, "get_attachment_url", lambda fid: f"/a/{fid}")
+    monkeypatch.setattr(gmail_tools, "is_stateless_mode", lambda: True)
     service = Mock()
     service.users().messages().get().execute.return_value = {"raw": "SGVsbG8gd29ybGQ="}
 
@@ -194,8 +207,33 @@ async def test_full_export_fallback_is_loud_when_url_cannot_be_minted(
             service, "msg-4", HEADERS, "raw", user_google_email=USER
         )
 
-    assert "Error" not in result
+    assert "Hello world" in result
     assert sd.UNAVAILABLE_NOTE in result
+
+
+@pytest.mark.asyncio
+async def test_full_export_fails_loud_when_url_cannot_be_minted(enabled, monkeypatch):
+    """Not stateless: the only alternative is an unsigned link behind a login, so
+    the tool errors before fetching anything or writing to storage."""
+    import gmail.gmail_tools as gmail_tools
+
+    monkeypatch.setattr(gmail_tools, "is_stateless_mode", lambda: False)
+    monkeypatch.setattr(gmail_tools, "get_transport_mode", lambda: "streamable-http")
+    storage = Mock()
+    monkeypatch.setattr(gmail_tools, "get_attachment_storage", lambda: storage)
+    render = AsyncMock()
+    monkeypatch.setattr(gmail_tools, "_render_message_export", render)
+    service = Mock()
+
+    with patch.object(sd, "offer_url", return_value=None):
+        result = await _export_full_message(
+            service, "msg-4", HEADERS, "raw", user_google_email=USER
+        )
+
+    assert result == sd.SIGNING_FAILED_ERROR
+    assert "start_google_auth" in result
+    render.assert_not_called()
+    storage.save_attachment_bytes.assert_not_called()
 
 
 @pytest.mark.asyncio
