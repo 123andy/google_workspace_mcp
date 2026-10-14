@@ -752,7 +752,9 @@ async def _fetch_drive(claims: dict, credentials: Credentials) -> DownloadResult
     a stream that fails partway ends short of it and the client sees an
     incomplete transfer rather than a complete-looking file (middleware between
     the route and the server would otherwise close a chunked body cleanly)."""
-    drive_tools = _tool_module("gdrive.drive_tools", "Drive")
+    _tool_module("gdrive.drive_tools", "Drive")
+    from gdrive import drive_helpers
+
     file_id = claims.get("fid")
     if not file_id:
         raise SignedDownloadError("Drive token missing fid")
@@ -761,8 +763,8 @@ async def _fetch_drive(claims: dict, credentials: Credentials) -> DownloadResult
     buffer = io.BytesIO()
     downloader = MediaIoBaseDownload(
         buffer,
-        drive_tools._media_request(drive, file_id, export_mime),
-        chunksize=drive_tools.DOWNLOAD_CHUNK_SIZE,
+        drive_helpers._media_request(drive, file_id, export_mime),
+        chunksize=drive_helpers.STREAMED_DOWNLOAD_CHUNK_SIZE_BYTES,
     )
 
     def next_chunk() -> tuple[bytes, bool, Optional[int]]:

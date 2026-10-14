@@ -1181,13 +1181,15 @@ class TestDriveFetcher:
 
     @pytest.fixture
     def drive(self, monkeypatch):
-        import gdrive.drive_tools as drive_tools
+        import gdrive.drive_helpers as drive_helpers
 
         calls = []
         files = _FakeFiles(calls, self.PAYLOAD)
         monkeypatch.setattr(sd, "build", lambda *a, **k: Mock(files=lambda: files))
         monkeypatch.setattr(sd, "MediaIoBaseDownload", _FakeDownloader)
-        monkeypatch.setattr(drive_tools, "DOWNLOAD_CHUNK_SIZE", self.CHUNK)
+        monkeypatch.setattr(
+            drive_helpers, "STREAMED_DOWNLOAD_CHUNK_SIZE_BYTES", self.CHUNK
+        )
         return calls
 
     @pytest.mark.asyncio
@@ -1244,7 +1246,7 @@ class TestDriveFetcher:
 
     @pytest.mark.asyncio
     async def test_unknown_total_streams_without_a_length(self, monkeypatch):
-        import gdrive.drive_tools as drive_tools
+        import gdrive.drive_helpers as drive_helpers
 
         class NoTotal(_FakeDownloader):
             def next_chunk(self):
@@ -1254,7 +1256,7 @@ class TestDriveFetcher:
         files = _FakeFiles([], b"abc")
         monkeypatch.setattr(sd, "build", lambda *a, **k: Mock(files=lambda: files))
         monkeypatch.setattr(sd, "MediaIoBaseDownload", NoTotal)
-        monkeypatch.setattr(drive_tools, "DOWNLOAD_CHUNK_SIZE", 8)
+        monkeypatch.setattr(drive_helpers, "STREAMED_DOWNLOAD_CHUNK_SIZE_BYTES", 8)
         result = await sd._fetch_drive({"fid": "F"}, Mock())
         assert result.length is None
 
@@ -1274,7 +1276,7 @@ class TestDriveFetcher:
     @pytest.fixture
     def fails_on_second_chunk(self, monkeypatch):
         """Drive answers the first chunk, then the connection to Google drops."""
-        import gdrive.drive_tools as drive_tools
+        import gdrive.drive_helpers as drive_helpers
 
         class Flaky(_FakeDownloader):
             def next_chunk(self):
@@ -1285,7 +1287,9 @@ class TestDriveFetcher:
         files = _FakeFiles([], self.PAYLOAD)
         monkeypatch.setattr(sd, "build", lambda *a, **k: Mock(files=lambda: files))
         monkeypatch.setattr(sd, "MediaIoBaseDownload", Flaky)
-        monkeypatch.setattr(drive_tools, "DOWNLOAD_CHUNK_SIZE", self.CHUNK)
+        monkeypatch.setattr(
+            drive_helpers, "STREAMED_DOWNLOAD_CHUNK_SIZE_BYTES", self.CHUNK
+        )
 
     @pytest.mark.asyncio
     async def test_mid_stream_failure_raises_instead_of_ending_cleanly(
@@ -1888,7 +1892,7 @@ class TestLimitsLoggingAndStartup:
         the read (a disconnect) must not mark that chunk done early."""
         import threading
 
-        import gdrive.drive_tools as drive_tools
+        import gdrive.drive_helpers as drive_helpers
 
         release_chunk = threading.Event()
 
@@ -1901,7 +1905,7 @@ class TestLimitsLoggingAndStartup:
         files = _FakeFiles([], b"x" * 32)
         monkeypatch.setattr(sd, "build", lambda *a, **k: Mock(files=lambda: files))
         monkeypatch.setattr(sd, "MediaIoBaseDownload", Slow)
-        monkeypatch.setattr(drive_tools, "DOWNLOAD_CHUNK_SIZE", 8)
+        monkeypatch.setattr(drive_helpers, "STREAMED_DOWNLOAD_CHUNK_SIZE_BYTES", 8)
         monkeypatch.setattr(sd, "_close_service", lambda service: None)
 
         result = await sd._fetch_drive({"fid": "F"}, Mock())

@@ -177,7 +177,7 @@ class TestHideLocalFileArgs:
 
         async with Client(mcp) as client:
             (tool,) = await client.list_tools()
-            assert "file_path" not in tool.inputSchema["properties"]
+            assert "file_path" not in tool.input_schema["properties"]
 
             ok = await client.call_tool("fn", {"file_name": "n"})
             assert ok.content[0].text == "n:None"
@@ -251,7 +251,7 @@ class TestGuidanceWhenDisabled:
 
     @pytest.mark.asyncio
     @DISABLED
-    @patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+    @patch("gdrive.drive_helpers.resolve_folder_id", new_callable=AsyncMock)
     async def test_inline_content_still_works(self, mock_folder, _enabled):
         mock_folder.return_value = "root"
         service = Mock()
@@ -277,7 +277,7 @@ class TestGuidanceWhenDisabled:
 class TestFilePathWorksByDefault:
     @pytest.mark.asyncio
     @patch("core.utils.get_transport_mode", return_value="streamable-http")
-    @patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+    @patch("gdrive.drive_helpers.resolve_folder_id", new_callable=AsyncMock)
     async def test_localhost_http_keeps_file_path(
         self, mock_folder, _mode, tmp_path, monkeypatch
     ):
@@ -359,7 +359,7 @@ async def main():
             tools = {t.name: t for t in await client.list_tools()}
             for name in ('import_to_google_doc', 'import_to_google_slides',
                          'import_to_google_sheets', 'update_drive_file'):
-                advertised = 'file_path' in tools[name].inputSchema['properties']
+                advertised = 'file_path' in tools[name].input_schema['properties']
                 print(f'ADVERTISED:{name}={advertised}')
             result = await client.call_tool(
                 'import_to_google_slides',
@@ -416,7 +416,7 @@ async def main():
                 "description": t.description or "",
                 "properties": {
                     name: prop.get("description", "")
-                    for name, prop in t.inputSchema["properties"].items()
+                    for name, prop in t.input_schema["properties"].items()
                 },
             }
             for t in await client.list_tools()
@@ -444,14 +444,18 @@ asyncio.run(main())
         assert offenders == []
 
     def test_enabled_ships_the_same_text_plus_the_parameter(self):
-        """The wording is not switched per setting: hidden or shown, the
-        description and every other property read the same."""
+        """The wording is not switched per setting: each setting swaps file_path
+        for return_upload_url, and the description and every other property
+        read the same. The description names neither, since each is hidden
+        under one setting."""
+        swapped = {"file_path", "return_upload_url"}
         on = self._shipped({"WORKSPACE_MCP_DISABLE_LOCAL_FILES": "true"})
         off = self._shipped({})
         for name in TestSchemaThroughFastMCP.TOOLS:
             assert off[name]["description"] == on[name]["description"]
-            assert "file_path" in off[name]["properties"]
-            shown = {
-                k: v for k, v in off[name]["properties"].items() if k != "file_path"
-            }
-            assert shown == on[name]["properties"]
+            assert "return_upload_url" not in off[name]["description"]
+            assert swapped & set(off[name]["properties"]) == {"file_path"}
+            assert swapped & set(on[name]["properties"]) == {"return_upload_url"}
+            assert {
+                k: v for k, v in off[name]["properties"].items() if k not in swapped
+            } == {k: v for k, v in on[name]["properties"].items() if k not in swapped}

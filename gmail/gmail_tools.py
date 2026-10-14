@@ -42,6 +42,7 @@ from core.file_limits import (
     ensure_within_file_size_limit,
     get_max_file_bytes,
 )
+from core.gcs_attachment_storage import gcs_files_enabled
 from core.config import (
     get_transport_mode,
     WORKSPACE_EXTERNAL_URL,
@@ -64,10 +65,13 @@ from auth.scopes import (
     GMAIL_COMPOSE_SCOPE,
     GMAIL_MODIFY_SCOPE,
     GMAIL_LABELS_SCOPE,
+    has_required_scopes,
 )
 from gmail.gmail_helpers import (
+    FILTER_APPLY_DEFAULT_MAX_MESSAGES,
     GMAIL_METADATA_HEADERS,
     RAW_BODY_TRUNCATE_LIMIT,
+    THREAD_REPLY_CONTEXT_FIELDS,
     _analyze_thread_ownership_impl,
     _build_forward_content,
     _derive_reply_all_recipients,
@@ -76,12 +80,17 @@ from gmail.gmail_helpers import (
     _get_send_as_identity_and_signature,
     _get_send_as_signature_html_for_tool,
     _http_error_status,
+    _is_email_reaction,
+    _new_attachment_id,
     _retryable_result_ids,
     _signature_html_to_text,
     _wrap_signature_html,
+    apply_gmail_filter_to_existing,
     build_label_color,
+    format_filter_apply_result,
     html_newlines_to_br,
     html_to_text_preserving_breaks,
+    update_gmail_filter,
 )
 
 logger = logging.getLogger(__name__)
@@ -440,9 +449,11 @@ async def _export_full_message(
     user_google_email: Optional[str] = None,
 ) -> str:
     """
-    Return a message's complete, untruncated content: saved to local storage and
+    Return a message's complete, untruncated content: saved to storage and
     referenced by download URL (HTTP transport) or file path (stdio transport), or —
-    in stateless mode, where there is no storage — inlined in the response.
+    in stateless mode without GCS staging, where there is no storage — inlined in
+    the response. With a GCS bucket configured, stateless mode also gets a signed
+    download URL, since the bucket is not instance-local.
 
     Whenever a file is written the body is kept out of the returned string, which is
     the point of the export: large messages are handed off out-of-band instead of
@@ -527,7 +538,12 @@ async def _export_full_message(
     # Stateless deployments have no persistent storage to hand a file reference off
     # from, but the guarantee callers actually want is "complete and untruncated".
     # Inline delivery satisfies that; it only costs model context.
-    stateless = is_stateless_mode()
+    #
+    # GCS staging is the exception: the bucket is not instance-local, so a
+    # stateless deployment that configures one can hand back a signed URL after
+    # all and keep the body out of the model context. Only fall back to inlining
+    # when stateless mode has no staging available.
+    stateless = is_stateless_mode() and not gcs_files_enabled()
 
     size_bytes = len(content_bytes)
     size_kb = size_bytes / 1024
@@ -586,7 +602,8 @@ async def _export_full_message(
             "from the file path (its content is NOT included above)."
         )
     else:
-        result_lines.append(f"\n📎 Download URL: {get_attachment_url(saved.file_id)}")
+        download_url = await asyncio.to_thread(get_attachment_url, saved.file_id)
+        result_lines.append(f"\n📎 Download URL: {download_url}")
         result_lines.append(
             "\nFetch the full message from the URL above (content is NOT included "
             "in this response). The file will expire after 1 hour."
@@ -613,11 +630,11 @@ def _build_message_get_request(
     return service.users().messages().get(**request_kwargs)
 
 
-def _validate_message_batch_options(
+def _validate_message_format_options(
     response_format: Literal["full", "metadata"],
     body_format: Literal["text", "html", "raw"],
 ) -> None:
-    """Reject incompatible output combinations for batch message reads."""
+    """Reject incompatible output combinations for message reads."""
     if response_format == "metadata" and body_format != "text":
         raise UserInputError(
             "body_format='html' and body_format='raw' require format='full'."
@@ -1193,13 +1210,9 @@ async def _fetch_thread_reply_context(
     ]
 
     try:
-        request_kwargs = {
-            "userId": "me",
-            "id": thread_id,
-            "format": "full" if include_bodies else "metadata",
-        }
+        request_kwargs = {"userId": "me", "id": thread_id, "format": "full"}
         if not include_bodies:
-            request_kwargs["metadataHeaders"] = header_names
+            request_kwargs["fields"] = THREAD_REPLY_CONTEXT_FIELDS
 
         request = service.users().threads().get(**request_kwargs)
         thread = await asyncio.to_thread(request.execute)
@@ -1245,9 +1258,16 @@ async def _fetch_thread_reply_context(
             context["html_body"] = bodies.get("html", "")
         message_contexts.append(context)
         # Automatic selection only considers actual sent or received messages.
-        # Keep every context above so an explicit In-Reply-To can still resolve
-        # to the exact message the caller selected.
-        if context["message_id"] and "DRAFT" not in labels and "TRASH" not in labels:
+        # Gmail web renders a reaction as a chip on its parent, so a reply
+        # parented on one is hidden from the conversation view. Keep every
+        # context above so an explicit In-Reply-To can still resolve to the
+        # exact message the caller selected.
+        if (
+            context["message_id"]
+            and "DRAFT" not in labels
+            and "TRASH" not in labels
+            and not _is_email_reaction(payload)
+        ):
             eligible_contexts.append(context)
 
     target = None
@@ -1697,11 +1717,14 @@ def _prepare_gmail_message(
                     f"filename_len={len(safe_filename)} ({len(file_data)} bytes)"
                 )
             else:
+                attachment_id = _new_attachment_id()
                 message.add_attachment(
                     file_data,
                     maintype=main_type,
                     subtype=sub_type,
                     filename=safe_filename,
+                    cid=f"<{attachment_id}>",
+                    headers=[f"X-Attachment-Id: {attachment_id}"],
                 )
                 logger.info(
                     f"Attached file: filename_len={len(safe_filename)} "
@@ -2058,7 +2081,7 @@ async def get_gmail_message_content(
         Literal["text", "html", "raw"],
         Field(
             description=(
-                "Body output format. "
+                "Body output format (only applies when format='full'). "
                 "'text' (default) returns plaintext (HTML converted to text as fallback). "
                 "'html' returns the raw HTML body as-is without conversion. "
                 "'raw' fetches the full raw MIME message and returns the base64url-decoded content."
@@ -2071,50 +2094,60 @@ async def get_gmail_message_content(
             description=(
                 "When True, return the COMPLETE untruncated message: referenced by a "
                 "download URL (a short-lived encrypted link when the server enables signed "
-                "URLs, else a stored file) or file path instead of the body text, or "
-                "inlined in the response when the server has no file storage (stateless "
-                "mode). Use for messages large enough to hit the truncation "
-                "limit, or when byte-exact fidelity is needed (pair with "
-                "body_format='raw' for a .eml export)."
+                "URLs, else a stored file) or file path instead of the body text. In "
+                "stateless mode without GCS staging, the body is returned inline; with "
+                "GCS staging, a signed download URL is returned. Use for messages large "
+                "enough to hit the truncation limit, or when byte-exact fidelity is "
+                "needed (pair with body_format='raw' for a .eml export)."
             ),
         ),
     ] = False,
+    format: Literal["full", "metadata"] = "full",
 ) -> str:
     """
     Retrieves the full content (subject, sender, recipients, body) of a specific Gmail message.
 
     Bodies are returned inline and truncated at 20,000 characters. Set full=True to
-    get the complete, untruncated message instead: it is exported to disk and the
+    get the complete, untruncated message instead: it is exported to storage and the
     response carries a short-lived download URL (HTTP transport) or file path (stdio
     transport) rather than the body, so large messages never stream through the model
-    context. Stateless deployments have no file storage, so there full=True returns the
-    untruncated body inline.
+    context. Stateless deployments without GCS staging have no storage, so there
+    full=True returns the untruncated body inline; with GCS staging configured it
+    returns a signed download URL like any other HTTP deployment.
 
     Args:
         message_id (str): The unique ID of the Gmail message to retrieve.
         user_google_email (str): The user's Google email address. Required.
-        body_format (Literal["text", "html", "raw"]): Body output format.
+        body_format (Literal["text", "html", "raw"]): Body output format (only applies
+            when format='full').
             "text" (default) returns plaintext (HTML converted to text as fallback).
             "html" returns the raw HTML body as-is without conversion.
             "raw" fetches the full raw MIME message and returns the base64url-decoded content.
-        full (bool): When True, write the untruncated message to local storage and
+        full (bool): When True, write the untruncated message to storage and
             return its URL/path instead of the body. body_format selects the exported
             file type: "raw" saves the byte-exact RFC 5322 message as .eml, "html"
             saves the raw HTML body, "text" saves the plaintext body. The "html"/"text"
             exports decode as UTF-8 and drop undecodable bytes, so prefer "raw" when
-            byte-exact fidelity matters. In stateless mode there is no storage to write
-            to, so the untruncated content is returned inline instead.
+            byte-exact fidelity matters. In stateless mode without GCS staging there is
+            no storage to write to, so the untruncated content is returned inline
+            instead; with GCS staging it is saved and returned as a signed URL.
+        format (Literal["full", "metadata"]): Message format. "full" (default) includes
+            the body and attachments, "metadata" only headers.
 
     Returns:
         str: The message details including subject, sender, date, Message-ID, recipients
             (To, Cc), and body content — or, when full=True, the saved file's download
-            URL or path in place of the body (the untruncated body itself in stateless
-            mode).
+            URL or path in place of the body (inline only in stateless mode without
+            GCS staging).
     """
     logger.info(
         f"[get_gmail_message_content] Invoked. Message ID: '{message_id}', "
-        f"Email: '{user_google_email}', body_format='{body_format}', full={full}"
+        f"Email: '{user_google_email}', format='{format}', "
+        f"body_format='{body_format}', full={full}"
     )
+    _validate_message_format_options(format, body_format)
+    if format == "metadata" and full:
+        raise UserInputError("full=True requires format='full'.")
 
     # Fetch message metadata first to get headers
     message_metadata = await asyncio.to_thread(
@@ -2132,6 +2165,9 @@ async def get_gmail_message_content(
     headers = _extract_headers(
         message_metadata.get("payload", {}), GMAIL_METADATA_HEADERS
     )
+
+    if format == "metadata":
+        return "\n".join(_format_message_header_lines(headers))
 
     # Full export: hand back a file reference instead of the (truncated) body.
     if full:
@@ -2255,7 +2291,7 @@ async def get_gmail_messages_content_batch(
 
     if not message_ids:
         raise Exception("No message IDs provided")
-    _validate_message_batch_options(format, body_format)
+    _validate_message_format_options(format, body_format)
 
     output_messages = []
     message_format: Literal["metadata", "full"] = (
@@ -2468,8 +2504,9 @@ async def get_gmail_attachment_content(
         attachment_index (Optional[int]): Zero-based attachment position from
             the message-content response. Pass it whenever you have it: Gmail
             refreshes attachment IDs between fetches, and the index lets the
-            server select the same attachment in current metadata (for the
-            file-size check and for signed download links).
+            server resolve the current attachment ID, filename and MIME type
+            from current metadata (for the file-size check, the download, and
+            signed download links).
 
     Returns:
         str: Attachment metadata with either a local file path or download URL,
@@ -2491,7 +2528,7 @@ async def get_gmail_attachment_content(
     # returns it now, so download_attachment_id is that part's current ID.
     attachment_id_is_current = False
     max_file_bytes = get_max_file_bytes()
-    if max_file_bytes is not None:
+    if max_file_bytes is not None or attachment_index is not None:
         try:
             message_full = await asyncio.to_thread(
                 service.users()
@@ -2543,7 +2580,7 @@ async def get_gmail_attachment_content(
         # metadata projection could not resolve this attachment (for example,
         # because it is nested deeper than the fields mask), fail closed before
         # requesting data that may exceed the configured cap.
-        if declared_size is None:
+        if max_file_bytes is not None and declared_size is None:
             return (
                 "Error: Could not verify the attachment size before download while "
                 "WORKSPACE_MCP_MAX_FILE_BYTES is configured. Fetch the message again "
@@ -2652,10 +2689,10 @@ async def get_gmail_attachment_content(
         base64_data = ""
         return str(e)
 
-    # Check if we're in stateless mode (can't save files)
+    # Stateless mode has no file storage unless GCS staging is configured.
     from auth.oauth_config import is_stateless_mode
 
-    if is_stateless_mode():
+    if is_stateless_mode() and not gcs_files_enabled():
         result_lines = [
             "Attachment fetched, but NO download URL could be issued."
             if signed_wanted
@@ -2727,9 +2764,12 @@ async def get_gmail_attachment_content(
                     f"Could not fetch attachment metadata for {attachment_id}, using defaults"
                 )
 
-        # Save attachment to local disk
-        result = storage.save_attachment(
-            base64_data=base64_data, filename=filename, mime_type=mime_type
+        # The GCS backend uploads over the network, so keep it off the event loop.
+        result = await asyncio.to_thread(
+            storage.save_attachment,
+            base64_data=base64_data,
+            filename=filename,
+            mime_type=mime_type,
         )
         saved_filename = Path(result.path).name
 
@@ -2747,7 +2787,7 @@ async def get_gmail_attachment_content(
                 "\nThe file has been saved to disk and can be accessed directly via the file path."
             )
         else:
-            download_url = get_attachment_url(result.file_id)
+            download_url = await asyncio.to_thread(get_attachment_url, result.file_id)
             result_lines.append(f"\n📎 Download URL: {download_url}")
             result_lines.append("\nThe file will expire after 1 hour.")
             if signed_wanted:
@@ -3069,6 +3109,7 @@ async def send_gmail_message(
             forward_message=body,
             forward_message_format=body_format,
             include_attachments=include_forwarded_attachments,
+            attachments=attachments,
             cc=cc,
             bcc=bcc,
             from_name=from_name,
@@ -3214,7 +3255,7 @@ async def send_gmail_message(
 async def _forward_gmail_message_impl(
     service,
     message_id: str,
-    to: str,
+    to: Optional[str],
     subject: Optional[str] = None,
     forward_message: Optional[str] = None,
     forward_message_format: Literal["plain", "html"] = "plain",
@@ -3224,11 +3265,13 @@ async def _forward_gmail_message_impl(
     from_name: Optional[str] = None,
     from_email: Optional[str] = None,
     user_google_email: str = "",
+    as_draft: bool = False,
+    attachments: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
-    """Build and send a forward of an existing Gmail message.
+    """Build a forward of an existing Gmail message and send it or save it as a draft.
 
-    Shared by send_gmail_message's forward path. An explicit ``subject`` overrides
-    the auto-derived 'Fwd: <original subject>'.
+    Shared by the forward paths of send_gmail_message and draft_gmail_message. An
+    explicit ``subject`` overrides the auto-derived 'Fwd: <original subject>'.
     """
     # Fetch the original message with full payload
     original_message = await asyncio.to_thread(
@@ -3318,6 +3361,8 @@ async def _forward_gmail_message_impl(
                 + ", ".join(failed_attachments)
             )
 
+    attachments_to_send.extend(await _resolve_url_attachments(attachments) or [])
+
     # Prepare and send the message
     sender_email = from_email or user_google_email
     raw_message, _, attached_count, attachment_errors = _prepare_gmail_message(
@@ -3340,7 +3385,23 @@ async def _forward_gmail_message_impl(
             f"{attached_count}/{len(attachments_to_send)} attached.{details}"
         )
 
+    attachment_info = (
+        _format_attachment_result(attached_count, len(attachments_to_send))
+        if attachments_to_send
+        else ""
+    )
     send_body = {"raw": raw_message}
+
+    if as_draft:
+        created_draft = await asyncio.to_thread(
+            service.users()
+            .drafts()
+            .create(userId="me", body={"message": send_body})
+            .execute,
+            num_retries=GOOGLE_API_WRITE_RETRIES,
+        )
+        draft_id = created_draft.get("id")
+        return f"Forward draft created{attachment_info}! Draft ID: {draft_id}"
 
     # Send the message
     sent_message = await asyncio.to_thread(
@@ -3348,12 +3409,6 @@ async def _forward_gmail_message_impl(
         num_retries=GOOGLE_API_WRITE_RETRIES,
     )
     sent_message_id = sent_message.get("id")
-
-    attachment_info = (
-        _format_attachment_result(attached_count, len(attachments_to_send))
-        if attachments_to_send
-        else ""
-    )
     return f"Email forwarded{attachment_info}! Message ID: {sent_message_id}"
 
 
@@ -3371,14 +3426,36 @@ async def _forward_gmail_message_impl(
 async def draft_gmail_message(
     service,
     user_google_email: str,
-    subject: Annotated[str, Field(description="Email subject.")],
-    body: Annotated[str, Field(description="Email body (plain text).")],
+    subject: Annotated[
+        Optional[str],
+        Field(
+            description="Email subject. Required unless forwarding (then defaults to 'Fwd: <original subject>').",
+        ),
+    ] = None,
+    body: Annotated[
+        Optional[str],
+        Field(
+            description="Email body. Required unless forwarding, where it becomes an optional note prepended above the quoted original.",
+        ),
+    ] = None,
     body_format: Annotated[
         Literal["plain", "html"],
         Field(
             description="Email body format. Use 'plain' for plaintext or 'html' for HTML content.",
         ),
     ] = "plain",
+    forward_message_id: Annotated[
+        Optional[str],
+        Field(
+            description="Set to a Gmail message ID to save a forward of that message as a draft for review. The original subject, body, and (optionally) attachments are carried over; 'body' becomes an optional note prepended to the forward.",
+        ),
+    ] = None,
+    include_forwarded_attachments: Annotated[
+        bool,
+        Field(
+            description="When forwarding, whether to include the original message's attachments. Ignored unless forward_message_id is set.",
+        ),
+    ] = True,
     to: Annotated[
         Optional[str],
         Field(
@@ -3441,8 +3518,14 @@ async def draft_gmail_message(
     ] = False,
 ) -> str:
     """
-    Creates a draft email in the user's Gmail account. Supports both new drafts and reply drafts with optional attachments.
-    Supports Gmail's "Send As" feature to draft from configured alias addresses.
+    Creates a draft email in the user's Gmail account. Supports new, reply, and forward
+    drafts with optional attachments. Supports Gmail's "Send As" feature to draft from
+    configured alias addresses.
+
+    To save a forward as a draft for review, pass forward_message_id. The original
+    subject, body (quoted with a "Forwarded message" header), and attachments are
+    carried over. In forward mode, body (if any) is prepended as a note, subject is
+    optional, and threading, reply, and signature options do not apply.
 
     SCHEDULED SEND IS NOT AVAILABLE. Gmail's REST API exposes no send-time
     parameter; the Schedule send feature is web-UI only, and a message cannot be
@@ -3455,9 +3538,11 @@ async def draft_gmail_message(
 
     Args:
         user_google_email (str): The user's Google email address. Required for authentication.
-        subject (str): Email subject.
-        body (str): Email body (plain text).
+        subject (Optional[str]): Email subject. Required unless forwarding (then defaults to 'Fwd: <original subject>').
+        body (Optional[str]): Email body. Required unless forwarding (then an optional prepended note).
         body_format (Literal['plain', 'html']): Email body format. Defaults to 'plain'.
+        forward_message_id (Optional[str]): Gmail message ID to forward. When set, the draft is a forward of that message.
+        include_forwarded_attachments (bool): Whether to carry over the original attachments when forwarding. Defaults to True.
         to (Optional[str]): Optional recipient email address. Can be left empty for drafts.
         cc (Optional[str]): Optional CC email address.
         bcc (Optional[str]): Optional BCC email address.
@@ -3543,7 +3628,46 @@ async def draft_gmail_message(
             to="user@example.com",
             thread_id="thread_123"
         )
+
+        # Save a forward (with the original attachments) as a draft for review
+        draft_gmail_message(
+            to="user@example.com",
+            forward_message_id="abc123",
+            body="FYI - see below."
+        )
     """
+    if forward_message_id:
+        sender_email = from_email
+        if not sender_email:
+            sender_email, _ = await _get_send_as_identity_and_signature(
+                service, from_email=None, fallback_email=user_google_email
+            )
+        logger.info(
+            f"[draft_gmail_message] Drafting forward of message '{forward_message_id}' for '{user_google_email}'"
+        )
+        return await _forward_gmail_message_impl(
+            service=service,
+            message_id=forward_message_id,
+            to=to,
+            subject=subject,
+            forward_message=body,
+            forward_message_format=body_format,
+            include_attachments=include_forwarded_attachments,
+            attachments=attachments,
+            cc=cc,
+            bcc=bcc,
+            from_name=from_name,
+            from_email=sender_email,
+            user_google_email=user_google_email,
+            as_draft=True,
+        )
+
+    if subject is None or body is None:
+        raise UserInputError(
+            "Both 'subject' and 'body' are required when drafting a message "
+            "(they are optional only when forwarding via 'forward_message_id')."
+        )
+
     logger.info(
         f"[draft_gmail_message] Invoked. Email: '{user_google_email}', subject_len={len(subject) if subject else 0}"
     )
@@ -4353,16 +4477,31 @@ async def manage_gmail_filter(
     criteria: Optional[JsonDict] = None,
     filter_action: Optional[JsonDict] = None,
     filter_id: Optional[str] = None,
+    dry_run: bool = False,
+    max_messages: int = FILTER_APPLY_DEFAULT_MAX_MESSAGES,
 ) -> str:
     """
-    Manages Gmail filters. Supports creating and deleting filters.
+    Manages Gmail filters: create, delete, update, and apply to existing mail.
+
+    - update: Gmail has no filter update API, so the filter is recreated (new
+      one first, then the old one is deleted) and its ID changes. A passed
+      criteria or filter_action replaces that whole object; omit one to keep
+      the old filter's.
+    - apply: runs a filter's label actions on mail ALREADY in the mailbox
+      (Gmail filters only act on new mail). Only matching messages change,
+      not whole conversations as in the web UI. Use filter_id, or criteria +
+      filter_action for an ad-hoc run. Forwarding is never applied. Use
+      dry_run=true first to see the search query and the match count.
+      Needs the gmail.modify scope in addition to gmail.settings.basic.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
-        action (str): Action to perform - "create" or "delete".
-        criteria (Optional[Dict[str, Any]]): Filter criteria object (required for create).
-        filter_action (Optional[Dict[str, Any]]): Filter action object (required for create). Named 'filter_action' to avoid shadowing the 'action' parameter.
-        filter_id (Optional[str]): ID of the filter to delete (required for delete).
+        action (str): "create", "delete", "update" or "apply".
+        criteria (Optional[Dict[str, Any]]): Filter criteria object (required for create; optional for update/apply).
+        filter_action (Optional[Dict[str, Any]]): Filter action object (required for create; optional for update/apply). Named 'filter_action' to avoid shadowing the 'action' parameter.
+        filter_id (Optional[str]): ID of the filter (required for delete and update; optional for apply).
+        dry_run (bool): apply only: count matches without changing anything.
+        max_messages (int): apply only: safety cap on messages changed (default 5000).
 
     Returns:
         str: Confirmation message with filter details.
@@ -4406,9 +4545,67 @@ async def manage_gmail_filter(
             f"Criteria: {criteria_info or '(none)'}\n"
             f"Action: {action_info or '(none)'}"
         )
+    elif action_lower == "update":
+        if not filter_id:
+            raise ValueError("filter_id is required for update action")
+        if not criteria and not filter_action:
+            raise ValueError(
+                "criteria and/or filter_action are required for update action"
+            )
+        logger.info(f"[manage_gmail_filter] Updating filter {filter_id}")
+        created = await update_gmail_filter(
+            service, filter_id, criteria=criteria, filter_action=filter_action
+        )
+        return (
+            "Filter updated successfully (Gmail recreates filters on update).\n"
+            f"Old filter ID: {filter_id} (deleted)\n"
+            f"New filter ID: {created.get('id', '(unknown)')}\n"
+            f"Criteria: {created.get('criteria') or '(none)'}\n"
+            f"Action: {created.get('action') or '(none)'}"
+        )
+    elif action_lower == "apply":
+        # Checked here, not in the decorator, so the other actions work with
+        # only gmail.settings.basic.
+        credentials = getattr(getattr(service, "_http", None), "credentials", None)
+        granted = getattr(credentials, "scopes", None)
+        if isinstance(granted, (list, tuple, set, frozenset)) and not (
+            has_required_scopes(granted, [GMAIL_MODIFY_SCOPE])
+        ):
+            raise ToolExecutionError(
+                "apply needs the gmail.modify scope to change existing messages; "
+                "re-authenticate with Gmail modify access."
+            )
+        if max_messages < 1:
+            raise ValueError("max_messages must be at least 1")
+        if filter_id:
+            existing = await asyncio.to_thread(
+                service.users()
+                .settings()
+                .filters()
+                .get(userId="me", id=filter_id)
+                .execute
+            )
+            criteria = existing.get("criteria", {})
+            filter_action = existing.get("action", {})
+        if not criteria or not filter_action:
+            raise ValueError(
+                "apply needs filter_id, or both criteria and filter_action"
+            )
+        logger.info(
+            f"[manage_gmail_filter] Applying filter to existing mail (dry_run={dry_run})"
+        )
+        result = await apply_gmail_filter_to_existing(
+            service,
+            criteria,
+            filter_action,
+            dry_run=dry_run,
+            max_messages=max_messages,
+        )
+        return format_filter_apply_result(result, dry_run)
     else:
         raise ValueError(
-            f"Invalid action '{action_lower}'. Must be 'create' or 'delete'."
+            f"Invalid action '{action_lower}'. Must be 'create', 'delete', "
+            "'update' or 'apply'."
         )
 
 

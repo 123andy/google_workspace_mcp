@@ -19,61 +19,23 @@ from mcp.types import ToolAnnotations
 # Auth & server utilities
 from auth.service_decorator import require_google_service, require_multiple_services
 from core.file_limits import FileTooLargeError, download_http_url_bytes
+from core.gcs_attachment_storage import gcs_files_enabled
 from core.server import server
 from core.utils import TransientNetworkError, UserInputError, handle_http_errors
-from gchat.chat_helpers import _name_spaces, _resolve_sender
+from gchat.chat_helpers import (
+    _execute_chat_request,
+    _extract_rich_links,
+    _name_spaces,
+    _none_if_blank,
+    _none_if_null_sentinel,
+    _resolve_sender,
+)
 
 logger = logging.getLogger(__name__)
 
+
 _SEARCH_MESSAGES_MAX_CONCURRENT_SPACE_FETCHES = 1
 _SEARCH_MESSAGES_SSL_RETRIES = 3
-_SEARCH_MESSAGES_RETRY_BASE_DELAY_SECONDS = 1
-
-
-async def _execute_chat_request(
-    request_factory,
-    *,
-    request_label: str,
-    retries: int = 1,
-    semaphore: Optional[asyncio.Semaphore] = None,
-):
-    """Execute a Chat API request in a worker thread with optional SSL retries."""
-    for attempt in range(retries):
-        try:
-            if semaphore is None:
-                return await asyncio.to_thread(lambda: request_factory().execute())
-            async with semaphore:
-                return await asyncio.to_thread(lambda: request_factory().execute())
-        except ssl.SSLError as e:
-            if attempt == retries - 1:
-                raise
-            delay = _SEARCH_MESSAGES_RETRY_BASE_DELAY_SECONDS * (2**attempt)
-            logger.warning(
-                "[search_messages] SSL error during %s on attempt %s/%s: %s. Retrying in %s seconds.",
-                request_label,
-                attempt + 1,
-                retries,
-                e,
-                delay,
-            )
-            await asyncio.sleep(delay)
-
-
-def _extract_rich_links(msg: dict) -> List[str]:
-    """Extract URLs from RICH_LINK annotations (smart chips).
-
-    When a user pastes a Google Workspace URL in Chat and it renders as a
-    smart chip, the URL is NOT in the text field — it's only available in
-    the annotations array as a RICH_LINK with richLinkMetadata.uri.
-    """
-    text = msg.get("text", "")
-    urls = []
-    for ann in msg.get("annotations", []):
-        if ann.get("type") == "RICH_LINK":
-            uri = ann.get("richLinkMetadata", {}).get("uri", "")
-            if uri and uri not in text:
-                urls.append(uri)
-    return urls
 
 
 @server.tool(
@@ -306,6 +268,10 @@ async def send_message(
     """
     logger.info(f"[send_message] Email: '{user_google_email}', Space: '{space_id}'")
 
+    thread_key = _none_if_blank(thread_key)
+    thread_name = _none_if_blank(thread_name)
+    message_name = _none_if_null_sentinel(message_name)
+
     if message_name is not None:
         if thread_name or thread_key:
             raise UserInputError(
@@ -441,7 +407,11 @@ async def search_messages(
 
     # If specific space provided, search within that space
     if space_id:
-        list_params = {"parent": space_id, "pageSize": page_size}
+        list_params = {
+            "parent": space_id,
+            "pageSize": page_size,
+            "orderBy": "createTime desc",
+        }
         if filter_str:
             list_params["filter"] = filter_str
         response = await _execute_chat_request(
@@ -473,7 +443,11 @@ async def search_messages(
 
         async def fetch_space_messages(space: dict) -> tuple[List[dict], bool]:
             try:
-                list_params = {"parent": space.get("name"), "pageSize": page_size}
+                list_params = {
+                    "parent": space.get("name"),
+                    "pageSize": page_size,
+                    "orderBy": "createTime desc",
+                }
                 if filter_str:
                     list_params["filter"] = filter_str
                 response = await _execute_chat_request(
@@ -512,7 +486,10 @@ async def search_messages(
                 "A transient SSL error occurred in 'search_messages' while searching Chat spaces. "
                 "Please try again shortly."
             )
-        context = "all accessible spaces"
+        if len(spaces) > len(spaces_to_search) or spaces_response.get("nextPageToken"):
+            context = f"the first {len(spaces_to_search)} accessible spaces"
+        else:
+            context = "all accessible spaces"
 
     # Client-side text filtering (text: operator is not supported by the API)
     if query:
@@ -716,10 +693,10 @@ async def download_chat_attachment(
     size_bytes = len(file_bytes)
     size_kb = size_bytes / 1024
 
-    # Check if we're in stateless mode (can't save files)
+    # Stateless mode has no file storage unless GCS staging is configured.
     from auth.oauth_config import is_stateless_mode
 
-    if is_stateless_mode():
+    if is_stateless_mode() and not gcs_files_enabled():
         # 75 input bytes encode to at most 100 base64 characters; do not encode
         # the entire attachment merely to return a short preview.
         b64_preview = base64.urlsafe_b64encode(file_bytes[:75]).decode("utf-8")[:100]
@@ -738,8 +715,12 @@ async def download_chat_attachment(
     from core.config import get_transport_mode
 
     storage = get_attachment_storage()
-    result = storage.save_attachment_bytes(
-        file_bytes=file_bytes, filename=filename, mime_type=content_type
+    # The GCS backend uploads over the network, so keep it off the event loop.
+    result = await asyncio.to_thread(
+        storage.save_attachment_bytes,
+        file_bytes=file_bytes,
+        filename=filename,
+        mime_type=content_type,
     )
 
     result_lines = [
@@ -754,7 +735,7 @@ async def download_chat_attachment(
             "\nThe file has been saved to disk and can be accessed directly via the file path."
         )
     else:
-        download_url = get_attachment_url(result.file_id)
+        download_url = await asyncio.to_thread(get_attachment_url, result.file_id)
         result_lines.append(f"\nDownload URL: {download_url}")
         result_lines.append("\nThe file will expire after 1 hour.")
 

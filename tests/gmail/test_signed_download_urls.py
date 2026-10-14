@@ -670,9 +670,9 @@ async def test_an_out_of_range_index_is_never_read_as_the_only_attachment(enable
 
 
 @pytest.mark.asyncio
-async def test_a_stored_copy_is_named_by_its_size_not_a_wrong_index(monkeypatch):
-    """The bytes were fetched by the caller's ID; their size names them. An
-    index (here 1-based by mistake) does not override that."""
+async def test_a_stored_copy_follows_the_index_when_the_id_has_rotated(monkeypatch):
+    """With the caller's ID gone from the message, attachment_index selects the
+    current part, and that part's current ID is what gets downloaded and named."""
     monkeypatch.delenv("WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS", raising=False)
     monkeypatch.delenv("WORKSPACE_MCP_MAX_FILE_BYTES", raising=False)
     monkeypatch.setattr("auth.oauth_config.is_stateless_mode", lambda: False)
@@ -719,4 +719,6 @@ async def test_a_stored_copy_is_named_by_its_size_not_a_wrong_index(monkeypatch)
         user_google_email=USER,
         attachment_index=1,
     )
-    assert saved["filename"] == "photo.jpg"
+    assert saved["filename"] == "invoice.pdf"
+    fetched = service.users().messages().attachments().get.call_args_list[-1]
+    assert fetched.kwargs["id"] == "new-invoice"

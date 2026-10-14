@@ -18,7 +18,7 @@ from googleapiclient.errors import HttpError
 from googleapiclient.discovery import build
 
 from auth.service_decorator import require_google_service
-from core.utils import handle_http_errors, StringList
+from core.utils import handle_http_errors, StringList, StringOrDictList, UserInputError
 from gcalendar.calendar_helpers import (
     _format_event_detail_lines,
     _format_event_time,
@@ -828,7 +828,7 @@ async def _create_event_impl(
     calendar_id: str = "primary",
     description: Optional[str] = None,
     location: Optional[str] = None,
-    attendees: Optional[List[str]] = None,
+    attendees: Optional[List[Union[str, Dict[str, Any]]]] = None,
     timezone: Optional[str] = None,
     attachments: Optional[List[str]] = None,
     add_google_meet: bool = False,
@@ -873,8 +873,9 @@ async def _create_event_impl(
         event_body["location"] = location
     if description:
         event_body["description"] = description
-    if attendees:
-        event_body["attendees"] = [{"email": email} for email in attendees]
+    normalized_attendees = _normalize_attendees(attendees)
+    if normalized_attendees is not None:
+        event_body["attendees"] = normalized_attendees
 
     # Handle reminders
     if reminders is not None or not use_default_reminders:
@@ -986,8 +987,12 @@ async def _create_event_impl(
     return confirmation_message
 
 
+class AttendeeValidationError(ValueError, UserInputError):
+    """Invalid attendee input, preserving ValueError compatibility for callers."""
+
+
 def _normalize_attendees(
-    attendees: Optional[Union[List[str], List[Dict[str, Any]]]],
+    attendees: Optional[List[Union[str, Dict[str, Any]]]],
 ) -> Optional[List[Dict[str, Any]]]:
     """
     Normalize attendees input to list of attendee objects.
@@ -998,6 +1003,10 @@ def _normalize_attendees(
     - Mixed list of both formats
 
     Returns list of attendee dicts with at minimum 'email' key.
+
+    Raises:
+        AttendeeValidationError: If an attendee is neither an email string nor a
+            dict with an 'email' key, so it is never silently left off the event.
     """
     if attendees is None:
         return None
@@ -1009,8 +1018,9 @@ def _normalize_attendees(
         elif isinstance(att, dict) and "email" in att:
             normalized.append(att)
         else:
-            logger.warning(
-                f"[_normalize_attendees] Invalid attendee format (type={type(att).__name__}), skipping"
+            raise AttendeeValidationError(
+                "Each attendee must be an email string or an object with an "
+                f"'email' key; got {type(att).__name__}"
             )
     return normalized if normalized else None
 
@@ -1025,7 +1035,7 @@ async def _modify_event_impl(
     end_time: Optional[str] = None,
     description: Optional[str] = None,
     location: Optional[str] = None,
-    attendees: Optional[Union[List[str], List[Dict[str, Any]]]] = None,
+    attendees: Optional[List[Union[str, Dict[str, Any]]]] = None,
     timezone: Optional[str] = None,
     add_google_meet: Optional[bool] = None,
     conference_data: Optional[Dict[str, Any]] = None,
@@ -1084,10 +1094,10 @@ async def _modify_event_impl(
         else:
             # Preserve existing event's useDefault value if not explicitly specified
             try:
-                existing_event = (
+                existing_event = await asyncio.to_thread(
                     service.events()
                     .get(calendarId=calendar_id, eventId=event_id)
-                    .execute()
+                    .execute
                 )
                 reminder_data["useDefault"] = existing_event.get("reminders", {}).get(
                     "useDefault", True
@@ -1412,7 +1422,7 @@ async def manage_event(
     calendar_id: str = "primary",
     description: Optional[str] = None,
     location: Optional[str] = None,
-    attendees: Optional[Union[StringList, List[Dict[str, Any]]]] = None,
+    attendees: Optional[StringOrDictList] = None,
     timezone: Optional[str] = None,
     attachments: Optional[StringList] = None,
     add_google_meet: Optional[bool] = None,
@@ -1450,7 +1460,7 @@ async def manage_event(
         calendar_id (str): Calendar ID (default: 'primary').
         description (Optional[str]): Event description.
         location (Optional[str]): Event location.
-        attendees (Optional[Union[List[str], List[Dict[str, Any]]]]): Attendee email addresses or objects.
+        attendees (Optional[List[Union[str, Dict[str, Any]]]]): Attendee email addresses, attendee objects (e.g. {"email": ..., "responseStatus": "accepted"}), or a mix of both.
         timezone (Optional[str]): IANA timezone applied to both boundaries (e.g.,
             "America/New_York"). Converts offset-bearing timestamps without changing their
             instant; interprets offset-free timestamps as local times in this zone.
@@ -1722,6 +1732,7 @@ async def _list_ooo_events_impl(
     time_max: Optional[str] = None,
     max_results: int = 10,
     timezone: Optional[str] = None,
+    page_token: Optional[str] = None,
 ) -> str:
     """Internal implementation for listing Out of Office calendar events."""
     logger.info(
@@ -1729,6 +1740,11 @@ async def _list_ooo_events_impl(
     )
 
     formatted_time_min = _correct_time_format_for_api(time_min, "time_min", timezone)
+    if page_token and formatted_time_min is None:
+        raise ValueError(
+            "[list_ooo_events] page_token requires time_min. Pass the Pagination "
+            "time_min from the previous response to preserve the original range."
+        )
     if formatted_time_min:
         effective_time_min = formatted_time_min
     else:
@@ -1763,13 +1779,27 @@ async def _list_ooo_events_impl(
     }
     if effective_time_max:
         request_params["timeMax"] = effective_time_max
+    if page_token:
+        request_params["pageToken"] = page_token
 
     events_result = await asyncio.to_thread(
         lambda: service.events().list(**request_params).execute()
     )
     items = events_result.get("items", [])
+    next_page_token = events_result.get("nextPageToken")
+    pagination_info = ""
+    if next_page_token:
+        pagination_info = (
+            f"Next page token: {next_page_token}"
+            f"\nPagination time_min: {effective_time_min}"
+        )
 
     if not items:
+        if next_page_token:
+            return (
+                f"No out-of-office events on this page for {user_google_email}, and more pages remain."
+                f"\n{pagination_info}"
+            )
         return f"No out-of-office events found for {user_google_email}."
 
     lines = [f"Found {len(items)} out-of-office event(s) for {user_google_email}:\n"]
@@ -1793,6 +1823,8 @@ async def _list_ooo_events_impl(
         lines.append(f"   Event ID: {event_id}")
         lines.append("")
 
+    if next_page_token:
+        lines.append(pagination_info)
     return "\n".join(lines).rstrip()
 
 
@@ -1955,6 +1987,7 @@ async def manage_out_of_office(
     max_results: int = 10,
     event_id: Optional[str] = None,
     calendar_id: str = "primary",
+    page_token: Optional[str] = None,
 ) -> str:
     """
     Manages Out of Office events on Google Calendar. These special events auto-decline
@@ -1972,9 +2005,10 @@ async def manage_out_of_office(
         timezone (Optional[str]): Timezone for the event (e.g., "America/New_York", "Europe/London"). Required when using date-only values or dateTime values without an explicit UTC offset.
         time_min (Optional[str]): For "list" action: start of time range. Defaults to current time. Recurring series are expanded into individual instances in the requested range.
         time_max (Optional[str]): For "list" action: end of time range.
-        max_results (int): For "list" action: maximum events to return. Defaults to 10.
+        max_results (int): For "list" action: maximum events to return in one page. Defaults to 10.
         event_id (Optional[str]): Event ID. Required for "update" and "delete" actions.
         calendar_id (str): Calendar ID. Defaults to 'primary'. Out of Office status events live on primary calendars, so use 'primary' or a user's primary calendar ID/email rather than a secondary calendar ID.
+        page_token (Optional[str]): For "list" action: token for the next page, taken from a previous response. Also pass the response's Pagination time_min as time_min, even if omitted on the first call. Keep all other query parameters unchanged.
 
     Returns:
         str: Confirmation message with event details, or a formatted list of OOO events.
@@ -2004,6 +2038,7 @@ async def manage_out_of_office(
             time_max=time_max,
             max_results=max_results,
             timezone=timezone,
+            page_token=page_token,
         )
     elif action_lower == "update":
         if not event_id:
@@ -2175,6 +2210,7 @@ async def _list_focus_time_events_impl(
     time_max: Optional[str] = None,
     max_results: int = 10,
     timezone: Optional[str] = None,
+    page_token: Optional[str] = None,
 ) -> str:
     """Internal implementation for listing Focus Time calendar events."""
     logger.info(
@@ -2182,6 +2218,11 @@ async def _list_focus_time_events_impl(
     )
 
     formatted_time_min = _correct_time_format_for_api(time_min, "time_min", timezone)
+    if page_token and formatted_time_min is None:
+        raise ValueError(
+            "[list_focus_time_events] page_token requires time_min. Pass the Pagination "
+            "time_min from the previous response to preserve the original range."
+        )
     if formatted_time_min:
         effective_time_min = formatted_time_min
     else:
@@ -2216,13 +2257,27 @@ async def _list_focus_time_events_impl(
     }
     if effective_time_max:
         request_params["timeMax"] = effective_time_max
+    if page_token:
+        request_params["pageToken"] = page_token
 
     events_result = await asyncio.to_thread(
         lambda: service.events().list(**request_params).execute()
     )
     items = events_result.get("items", [])
+    next_page_token = events_result.get("nextPageToken")
+    pagination_info = ""
+    if next_page_token:
+        pagination_info = (
+            f"Next page token: {next_page_token}"
+            f"\nPagination time_min: {effective_time_min}"
+        )
 
     if not items:
+        if next_page_token:
+            return (
+                f"No Focus Time events on this page for {user_google_email}, and more pages remain."
+                f"\n{pagination_info}"
+            )
         return f"No Focus Time events found for {user_google_email}."
 
     lines = [f"Found {len(items)} Focus Time event(s) for {user_google_email}:\n"]
@@ -2249,6 +2304,8 @@ async def _list_focus_time_events_impl(
         lines.append(f"   Event ID: {event_id}")
         lines.append("")
 
+    if next_page_token:
+        lines.append(pagination_info)
     return "\n".join(lines).rstrip()
 
 
@@ -2429,6 +2486,7 @@ async def manage_focus_time(
     max_results: int = 10,
     event_id: Optional[str] = None,
     calendar_id: str = "primary",
+    page_token: Optional[str] = None,
 ) -> str:
     """
     Manages Focus Time events on Google Calendar. These special events auto-decline
@@ -2449,9 +2507,10 @@ async def manage_focus_time(
         timezone (Optional[str]): Timezone for the event (e.g., "America/New_York", "Europe/London"). Required when using date-only values or dateTime values without an explicit UTC offset.
         time_min (Optional[str]): For "list" action: start of time range. Defaults to current time. Recurring series are expanded into individual instances in the requested range.
         time_max (Optional[str]): For "list" action: end of time range.
-        max_results (int): For "list" action: maximum events to return. Defaults to 10.
+        max_results (int): For "list" action: maximum events to return in one page. Defaults to 10.
         event_id (Optional[str]): Event ID. Required for "update" and "delete" actions.
         calendar_id (str): Calendar ID. Defaults to 'primary'. Focus Time status events live on primary calendars, so use 'primary' or a user's primary calendar ID/email rather than a secondary calendar ID.
+        page_token (Optional[str]): For "list" action: token for the next page, taken from a previous response. Also pass the response's Pagination time_min as time_min, even if omitted on the first call. Keep all other query parameters unchanged.
 
     Returns:
         str: Confirmation message with event details, or a formatted list of Focus Time events.
@@ -2483,6 +2542,7 @@ async def manage_focus_time(
             time_max=time_max,
             max_results=max_results,
             timezone=timezone,
+            page_token=page_token,
         )
     elif action_lower == "update":
         if not event_id:

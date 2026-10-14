@@ -14,7 +14,7 @@ import functools
 import inspect
 
 from pathlib import Path
-from typing import Annotated, Any, List, Optional
+from typing import Annotated, Any, List, Optional, Union
 
 from pydantic import BeforeValidator
 from defusedxml import DefusedXmlException, ElementTree as ET
@@ -136,6 +136,12 @@ ObjectList = Annotated[List[object], BeforeValidator(_coerce_json_str_to_list)]
 """``List[object]`` that also accepts a JSON-encoded string of an array."""
 
 
+StringOrDictList = Annotated[
+    List[Union[str, dict[str, Any]]], BeforeValidator(_coerce_json_str_to_list)
+]
+"""List of strings and/or dicts that also accepts a JSON-encoded string of an array."""
+
+
 def _coerce_json_str_to_dict(v: Any) -> Any:
     """Coerce a JSON-encoded string to a dict.
 
@@ -177,25 +183,50 @@ def local_file_access_enabled() -> bool:
     return os.environ.get(_DISABLE_LOCAL_FILES_ENV, "").strip().lower() != "true"
 
 
+def _hide_parameters(func, names: tuple[str, ...], hide: bool):
+    """Drop ``names`` from ``func``'s signature when ``hide`` is set.
+
+    Rewrites ``__signature__``, as ``require_google_service`` does, so FastMCP
+    omits the parameters from the schema and rejects them if a client with a
+    cached schema sends them anyway. Names are checked either way, so a stale
+    one fails at import. Each call reads the signature the previous decorator
+    left, so the decorators below stack.
+    """
+    sig = inspect.signature(func)
+    missing = [name for name in names if name not in sig.parameters]
+    if missing:
+        raise ValueError(f"{func.__name__} has no parameter(s) {missing} to hide.")
+    if hide:
+        func.__signature__ = sig.replace(
+            parameters=[p for p in sig.parameters.values() if p.name not in names]
+        )
+    return func
+
+
 def hide_local_file_args(*names: str):
     """Tool decorator: drop server-side path parameters when local files are off.
 
-    Rewrites ``__signature__``, as ``require_google_service`` does, so apply it
-    directly under ``@server.tool``. FastMCP then omits the parameters from the
-    schema and rejects them if a client with a cached schema sends them anyway.
-    Names are checked either way, so a stale one fails at import.
+    Apply directly under ``@server.tool`` so the rewritten signature is what
+    FastMCP sees (see ``_hide_parameters``). No-op when local file access is
+    enabled.
     """
 
     def decorator(func):
-        sig = inspect.signature(func)
-        missing = [name for name in names if name not in sig.parameters]
-        if missing:
-            raise ValueError(f"{func.__name__} has no parameter(s) {missing} to hide.")
-        if not local_file_access_enabled():
-            func.__signature__ = sig.replace(
-                parameters=[p for p in sig.parameters.values() if p.name not in names]
-            )
-        return func
+        return _hide_parameters(func, names, hide=not local_file_access_enabled())
+
+    return decorator
+
+
+def hide_remote_only_args(*names: str):
+    """Tool decorator: drop remote-only parameters when local files are on.
+
+    The inverse of ``hide_local_file_args``, so a tool carrying both kinds of
+    parameter advertises exactly one under any setting. Apply directly under
+    ``@server.tool``, stacked with ``hide_local_file_args`` in either order.
+    """
+
+    def decorator(func):
+        return _hide_parameters(func, names, hide=local_file_access_enabled())
 
     return decorator
 
@@ -1070,6 +1101,20 @@ def _format_http_error_for_log(error: HttpError) -> str:
     return f"status={status}, request={request}"
 
 
+APPS_SCRIPT_USER_SETTINGS_URL = "https://script.google.com/home/usersettings"
+
+
+def _is_apps_script_api_disabled_for_user(error: HttpError, error_details: str) -> bool:
+    """Google reports the per-user setting off as a 403 or a 503 "Service error -27"."""
+    host = urllib.parse.urlparse(getattr(error, "uri", None) or "").hostname
+    if host != "script.googleapis.com":
+        return False
+    status = getattr(error.resp, "status", None)
+    if status == 503:
+        return "Service error -27" in error_details
+    return status == 403 and "has not enabled the Apps Script API" in error_details
+
+
 def handle_http_errors(
     tool_name: str, is_read_only: bool = False, service_type: Optional[str] = None
 ):
@@ -1141,6 +1186,16 @@ def handle_http_errors(
                                 f"The required API is not enabled for your project. "
                                 f"Please check the Google Cloud Console to enable it."
                             )
+                    elif _is_apps_script_api_disabled_for_user(error, error_details):
+                        message = (
+                            f"API error in {tool_name}: the Apps Script API refused "
+                            f"the request (HTTP {error.resp.status}) for user "
+                            f"'{user_google_email}'. This usually means the Apps "
+                            f"Script API is turned off in that user's Apps Script "
+                            f"settings. LLM: Ask the user to open "
+                            f"{APPS_SCRIPT_USER_SETTINGS_URL}, turn on 'Google Apps "
+                            f"Script API', wait a minute, and retry."
+                        )
                     elif error.resp.status in [401, 403]:
                         # Authentication/authorization errors
                         if is_oauth21_enabled():

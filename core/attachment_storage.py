@@ -383,7 +383,20 @@ _attachment_storage: Optional[AttachmentStorage] = None
 
 
 def get_attachment_storage() -> AttachmentStorage:
-    """Get the global attachment storage instance."""
+    """Get the global attachment storage instance.
+
+    Returns the GCS-backed storage instead of local disk when
+    ``WORKSPACE_MCP_FILES_GCS_BUCKET`` is set on an HTTP transport.
+    """
+    # core.gcs_attachment_storage imports this module, so import it lazily.
+    from core.gcs_attachment_storage import (
+        gcs_files_enabled,
+        get_gcs_attachment_storage,
+    )
+
+    if gcs_files_enabled():
+        return get_gcs_attachment_storage()
+
     global _attachment_storage
     if _attachment_storage is None:
         _attachment_storage = AttachmentStorage()
@@ -401,6 +414,14 @@ def get_attachment_url(file_id: str) -> str:
     Returns:
         Full URL to access the attachment
     """
+    from core.gcs_attachment_storage import (
+        gcs_files_enabled,
+        get_gcs_attachment_storage,
+    )
+
+    if gcs_files_enabled():
+        return get_gcs_attachment_storage().get_signed_url(file_id)
+
     # In stdio mode the attachment route is served by the lazily-started callback
     # server; bring it up now so the URL we hand out is actually reachable. The
     # import is local to avoid pulling the FastAPI/uvicorn auth stack into this

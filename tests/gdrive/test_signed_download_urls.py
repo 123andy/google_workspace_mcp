@@ -93,6 +93,9 @@ async def test_stateless_fallback_is_loud_when_url_cannot_be_minted(
             file_id="v-1",
         )
 
+    # Stateless mode returns the file as an embedded resource; the text part
+    # carries the summary.
+    result = result.content[0].text
     assert "downloaded successfully" not in result
     assert "NO download URL could be issued" in result
     assert sd.NO_CREDENTIALS in result
@@ -116,6 +119,7 @@ async def test_stateless_wording_unchanged_when_feature_off(
         service=_service("video/mp4", "clip.mp4"), user_google_email=USER, file_id="v-1"
     )
 
+    result = result.content[0].text
     assert result.startswith("File downloaded successfully!")
     assert "signed" not in result.lower()
 

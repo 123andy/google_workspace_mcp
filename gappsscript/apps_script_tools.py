@@ -507,44 +507,37 @@ async def _run_script_function_impl(
     if parameters:
         request_body["parameters"] = parameters
 
-    try:
+    if not deployment_id:
+        deployment_id = await _resolve_execution_deployment_id(service, script_id)
         if not deployment_id:
-            deployment_id = await _resolve_execution_deployment_id(service, script_id)
-            if not deployment_id:
-                return (
-                    "Execution failed\n"
-                    f"Function: {function_name}\n"
-                    "Error: No versioned API Executable deployment was found. In the "
-                    "Apps Script editor, use Deploy > New deployment > API Executable. "
-                    "The script and caller must share a standard Google Cloud project. "
-                    "manage_deployment(action='create') is sufficient only when the "
-                    "script manifest already defines executionApi."
-                )
-
-        response = await asyncio.to_thread(
-            service.scripts().run(scriptId=deployment_id, body=request_body).execute
-        )
-
-        if "error" in response:
-            error_details = response["error"]
-            error_message = error_details.get("message", "Unknown error")
             return (
-                f"Execution failed\nFunction: {function_name}\nError: {error_message}"
+                "Execution failed\n"
+                f"Function: {function_name}\n"
+                "Error: No versioned API Executable deployment was found. In the "
+                "Apps Script editor, use Deploy > New deployment > API Executable. "
+                "The script and caller must share a standard Google Cloud project. "
+                "manage_deployment(action='create') is sufficient only when the "
+                "script manifest already defines executionApi."
             )
 
-        result = response.get("response", {}).get("result")
-        output = [
-            "Execution successful",
-            f"Function: {function_name}",
-            f"Result: {result}",
-        ]
+    response = await asyncio.to_thread(
+        service.scripts().run(scriptId=deployment_id, body=request_body).execute
+    )
 
-        logger.info(f"[run_script_function] Successfully executed {function_name}")
-        return "\n".join(output)
+    if "error" in response:
+        error_details = response["error"]
+        error_message = error_details.get("message", "Unknown error")
+        return f"Execution failed\nFunction: {function_name}\nError: {error_message}"
 
-    except Exception as e:
-        logger.error(f"[run_script_function] Execution error: {str(e)}")
-        return f"Execution failed\nFunction: {function_name}\nError: {str(e)}"
+    result = response.get("response", {}).get("result")
+    output = [
+        "Execution successful",
+        f"Function: {function_name}",
+        f"Result: {result}",
+    ]
+
+    logger.info(f"[run_script_function] Successfully executed {function_name}")
+    return "\n".join(output)
 
 
 async def _resolve_execution_deployment_id(
