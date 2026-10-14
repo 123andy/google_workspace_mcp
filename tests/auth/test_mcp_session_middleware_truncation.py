@@ -76,7 +76,6 @@ def live_server(request):
     thread.join(timeout=10)
 
 
-@pytest.mark.xfail(strict=True, reason="BaseHTTPMiddleware ends the body cleanly")
 @pytest.mark.parametrize("path", ["/mcp/stream-fail", "/other/stream-fail"])
 def test_mid_body_failure_aborts_the_transfer(live_server, path):
     received = 0
