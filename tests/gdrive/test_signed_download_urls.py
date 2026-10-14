@@ -105,6 +105,29 @@ async def test_stateless_fallback_is_loud_when_url_cannot_be_minted(
 
 @pytest.mark.asyncio
 @patch("gdrive.drive_tools._download_file_to_temp", new_callable=AsyncMock)
+async def test_fails_loud_when_url_cannot_be_minted(download, enabled, monkeypatch):
+    """Not stateless: no download, no storage write, an error naming the fix."""
+    import gdrive.drive_tools as drive_tools
+
+    monkeypatch.setattr(drive_tools, "is_stateless_mode", lambda: False)
+    storage = Mock()
+    monkeypatch.setattr(drive_tools, "get_attachment_storage", lambda: storage)
+
+    with patch.object(sd, "offer_url", return_value=None):
+        result = await _unwrap(get_drive_file_download_url)(
+            service=_service("video/mp4", "clip.mp4"),
+            user_google_email=USER,
+            file_id="v-1",
+        )
+
+    assert result == sd.SIGNING_FAILED_ERROR
+    assert "start_google_auth" in result
+    download.assert_not_called()
+    storage.save_attachment_from_path.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("gdrive.drive_tools._download_file_to_temp", new_callable=AsyncMock)
 async def test_stateless_wording_unchanged_when_feature_off(
     download, monkeypatch, tmp_path
 ):

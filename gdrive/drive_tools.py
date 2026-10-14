@@ -612,6 +612,11 @@ async def get_drive_file_download_url(
             ]
         )
     no_url = signed_downloads.enabled()
+    if no_url and not is_stateless_mode():
+        # Signing is on but no link could be issued. Stateless mode can still
+        # return the file inline (below); otherwise the only alternative is an
+        # unsigned link that needs a browser session, so fail before downloading.
+        return signed_downloads.SIGNING_FAILED_ERROR
 
     # Stateless mode has no attachment storage to hand out a URL from, so the
     # file itself goes back as an embedded resource, up to inline_max_bytes.
@@ -712,8 +717,6 @@ async def get_drive_file_download_url(
             download_url = get_attachment_url(result.file_id)
             result_lines.append(f"\n📎 Download URL: {download_url}")
             result_lines.append("\nThe file will expire after 1 hour.")
-            if no_url:
-                result_lines.append(signed_downloads.UNAVAILABLE_NOTE)
 
         if export_mime_type:
             result_lines.append(

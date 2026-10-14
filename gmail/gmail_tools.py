@@ -513,6 +513,12 @@ async def _export_full_message(
         )
         return "\n".join(result_lines)
 
+    # Signing is on but no link could be issued. Stateless mode can still return
+    # the message inline (below); otherwise the only alternative is an unsigned
+    # link that needs a browser session, so fail instead of handing out a dead end.
+    if signed_wanted and not is_stateless_mode():
+        return signed_downloads.SIGNING_FAILED_ERROR
+
     try:
         content_bytes, mime_type, extension, notes = await _render_message_export(
             service, message_id, body_format
@@ -599,8 +605,6 @@ async def _export_full_message(
             "\nFetch the full message from the URL above (content is NOT included "
             "in this response). The file will expire after 1 hour."
         )
-        if signed_wanted:
-            result_lines.append(signed_downloads.UNAVAILABLE_NOTE)
 
     logger.info(
         f"[get_gmail_message_content] Exported {size_kb:.1f} KB "
@@ -3302,6 +3306,12 @@ async def get_gmail_attachment_content(
                     "recent message fetch.",
                 ]
             )
+        # No link could be issued. Stateless mode still returns a preview below;
+        # otherwise fail rather than download and offer a link behind a login.
+        import auth.oauth_config as _oauth_config
+
+        if not _oauth_config.is_stateless_mode():
+            return signed_downloads.SIGNING_FAILED_ERROR
 
     try:
         attachment = await asyncio.to_thread(
@@ -3410,8 +3420,6 @@ async def get_gmail_attachment_content(
             download_url = get_attachment_url(result.file_id)
             result_lines.append(f"\n📎 Download URL: {download_url}")
             result_lines.append("\nThe file will expire after 1 hour.")
-            if signed_wanted:
-                result_lines.append(signed_downloads.UNAVAILABLE_NOTE)
 
         result_lines.append(
             "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch."
