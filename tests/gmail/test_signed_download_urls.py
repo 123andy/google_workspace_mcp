@@ -231,7 +231,8 @@ async def test_full_export_fails_loud_when_url_cannot_be_minted(enabled, monkeyp
         )
 
     assert result == sd.SIGNING_FAILED_ERROR
-    assert "start_google_auth" in result
+    assert "re-authenticate through this server" in result.lower()
+    assert "start_google_auth" not in result
     render.assert_not_called()
     storage.save_attachment_bytes.assert_not_called()
 

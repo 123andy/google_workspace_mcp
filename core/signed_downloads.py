@@ -402,7 +402,7 @@ SIGNING_FAILED_ERROR = (
     "Error: no signed download link could be issued, so nothing was downloaded. "
     "This server could not recover usable credentials for you (none stored here, "
     "or an access token about to expire with no refresh token). Re-authenticate "
-    "with start_google_auth, then call this tool again."
+    "through this server, then call this tool again."
 )
 
 
