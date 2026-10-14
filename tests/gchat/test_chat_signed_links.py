@@ -139,7 +139,8 @@ async def test_unsignable_fails_loudly_without_downloading_or_storing(
         text = await call_tool()
 
     assert "no signed download link could be issued" in text
-    assert "start_google_auth" in text
+    assert "re-authenticate through this server" in text.lower()
+    assert "start_google_auth" not in text
     assert "/attachments/" not in text and "/dl/" not in text
     download.assert_not_called()
     assert list(tmp_path.iterdir()) == []  # no disk write
@@ -150,8 +151,38 @@ async def test_unsafe_resource_name_is_refused_before_minting(signed_env):
     with patch.object(sd, "offer_url") as offer:
         text = await call_tool(service=chat_service("spaces/S/attachments/../x"))
 
-    assert "invalid resource name" in text
+    assert text.startswith("Error:") and "invalid resource name" in text
     offer.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_drive_file_attachment_is_an_error_and_mints_no_link(signed_env):
+    with patch.object(sd, "offer_url") as offer:
+        text = await call_tool(service=chat_service(resource_name=None))
+
+    assert text.startswith("Error:")
+    assert "Drive" in text
+    assert "/dl/" not in text
+    offer.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_drive_file_attachment_unchanged_when_signing_is_off(
+    signed_env, monkeypatch
+):
+    monkeypatch.delenv("WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS", raising=False)
+    with (
+        patch.object(sd, "offer_url") as offer,
+        patch(
+            "gchat.chat_tools.download_http_url_bytes",
+            new_callable=AsyncMock,
+            return_value=b"bytes",
+        ) as download,
+    ):
+        await call_tool(service=chat_service(resource_name=None))
+
+    offer.assert_not_called()
+    download.assert_awaited_once()  # the legacy flow still attempts the name
 
 
 @pytest.mark.asyncio
