@@ -152,20 +152,38 @@ async def test_declared_length_over_the_cap_is_refused_up_front(
 
 
 @pytest.mark.asyncio
-async def test_undeclared_length_is_capped_on_the_streamed_bytes(
-    chat_endpoint, monkeypatch
-):
-    monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", "100")
-    chat_endpoint["handler"] = _ok(chunks=[b"x" * 60, b"x" * 60], length=False)
+async def test_undeclared_length_is_refused_before_streaming(chat_endpoint):
+    chat_endpoint["handler"] = _ok(chunks=[b"x" * 60], length=False)
+    with pytest.raises(sd.SignedDownloadError, match="Content-Length"):
+        await sd._fetch_chat(CLAIMS, CREDS)
+
+
+@pytest.mark.asyncio
+async def test_mid_stream_cut_aborts_instead_of_ending_cleanly(chat_endpoint):
+    chat_endpoint["handler"] = lambda request: httpx.Response(
+        200,
+        headers={"content-length": "100"},
+        stream=_Stream([b"x" * 10], httpx.ReadError("connection reset")),
+    )
     result = await sd._fetch_chat(CLAIMS, CREDS)
     with pytest.raises(sd.SignedDownloadError):
         await _drain(result)
 
 
 @pytest.mark.asyncio
-async def test_mid_stream_cut_aborts_instead_of_ending_cleanly(chat_endpoint):
-    chat_endpoint["handler"] = _ok(
-        chunks=[b"x" * 10], then_raise=httpx.ReadError("connection reset")
+async def test_short_body_with_clean_end_is_an_error(chat_endpoint):
+    chat_endpoint["handler"] = lambda request: httpx.Response(
+        200, headers={"content-length": "100"}, stream=_Stream([b"x" * 10])
+    )
+    result = await sd._fetch_chat(CLAIMS, CREDS)
+    with pytest.raises(sd.SignedDownloadError, match="ended early"):
+        await _drain(result)
+
+
+@pytest.mark.asyncio
+async def test_body_longer_than_declared_is_an_error(chat_endpoint):
+    chat_endpoint["handler"] = lambda request: httpx.Response(
+        200, headers={"content-length": "5"}, stream=_Stream([b"x" * 10])
     )
     result = await sd._fetch_chat(CLAIMS, CREDS)
     with pytest.raises(sd.SignedDownloadError):
@@ -265,14 +283,3 @@ async def test_oversized_attachment_is_refused(app, chat_endpoint, monkeypatch):
         response = await http.get(_link())
     # The cap trips on the declared length, before any byte is sent.
     assert response.status_code == 502
-
-
-@pytest.mark.asyncio
-async def test_mid_stream_cut_never_completes_the_response(app, chat_endpoint):
-    client, _ = app
-    chat_endpoint["handler"] = _ok(
-        chunks=[b"x" * 10], then_raise=httpx.ReadError("connection reset")
-    )
-    async with client() as http:
-        with pytest.raises(sd.SignedDownloadError):
-            await http.get(_link())
