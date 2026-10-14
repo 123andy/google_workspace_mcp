@@ -151,6 +151,55 @@ async def test_unsignable_fails_loudly_without_downloading_or_storing(
 
 
 @pytest.mark.asyncio
+async def test_gcs_staging_returns_its_url_when_no_link_can_be_minted(signed_env):
+    """GCS staging yields a working signed URL, so the fail-loud error must not
+    fire; the flag-off flow runs and returns that URL."""
+    storage = Mock()
+    storage.save_attachment_bytes.return_value = Mock(path="p", file_id="fid")
+    with (
+        patch.object(
+            sd,
+            "offer_url",
+            new_callable=AsyncMock,
+            return_value=sd.Offer(reason=sd.NO_CREDENTIALS),
+        ),
+        patch("gchat.chat_tools.gcs_files_enabled", return_value=True),
+        patch(
+            "gchat.chat_tools.download_http_url_bytes",
+            new_callable=AsyncMock,
+            return_value=b"bytes",
+        ),
+        patch("core.attachment_storage.get_attachment_storage", return_value=storage),
+        patch(
+            "core.attachment_storage.get_attachment_url",
+            return_value="https://gcs.example/signed",
+        ),
+    ):
+        text = await call_tool()
+
+    assert "Download URL: https://gcs.example/signed" in text
+    assert not text.startswith("Error:")
+
+
+@pytest.mark.asyncio
+async def test_gcs_off_still_fails_loudly_when_no_link_can_be_minted(signed_env):
+    with (
+        patch.object(
+            sd,
+            "offer_url",
+            new_callable=AsyncMock,
+            return_value=sd.Offer(reason=sd.NO_CREDENTIALS),
+        ),
+        patch("gchat.chat_tools.gcs_files_enabled", return_value=False),
+        patch("gchat.chat_tools.download_http_url_bytes") as download,
+    ):
+        text = await call_tool()
+
+    assert text.startswith("Error: no signed download link could be issued")
+    download.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_unsafe_resource_name_is_refused_before_minting(signed_env):
     with patch.object(sd, "offer_url") as offer:
         text = await call_tool(service=chat_service("spaces/S/attachments/../x"))

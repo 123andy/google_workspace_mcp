@@ -620,7 +620,8 @@ async def download_chat_attachment(
     the lifetime in the result) that streams the file from Google when fetched;
     nothing is downloaded or stored by this call, and it works in stateless
     mode. If no signed link can be issued the call fails with an error rather
-    than returning a link that needs a browser login.
+    than returning a link that needs a browser login, unless GCS attachment
+    staging is configured, which supplies a working signed URL instead.
 
     Otherwise, in stdio mode, saves the file to local disk and returns its path;
     in HTTP mode, returns a temporary download URL (valid for 1 hour).
@@ -699,19 +700,23 @@ async def download_chat_attachment(
             filename=filename,
             mime_type=content_type,
         )
-        if not offer:
+        if offer:
+            logger.info(
+                "[download_chat_attachment] Returning signed download URL (no download)"
+            )
+            return "\n".join(
+                [
+                    "File ready — streamed on demand (no base64, nothing stored).",
+                    f"File: {filename}",
+                    f"Type: {content_type}",
+                    *signed_downloads.url_lines(offer.url, offer.ttl, "file"),
+                ]
+            )
+        # No link could be minted. GCS staging still yields a working signed
+        # URL, so fall through to it; otherwise the only alternative is an
+        # unsigned link that needs a browser session, so fail instead.
+        if not gcs_files_enabled():
             return signed_downloads.signing_failed_error(offer)
-        logger.info(
-            "[download_chat_attachment] Returning signed download URL (no download)"
-        )
-        return "\n".join(
-            [
-                "File ready — streamed on demand (no base64, nothing stored).",
-                f"File: {filename}",
-                f"Type: {content_type}",
-                *signed_downloads.url_lines(offer.url, offer.ttl, "file"),
-            ]
-        )
 
     download_url = f"https://chat.googleapis.com/v1/media/{resource_name}?alt=media"
 
