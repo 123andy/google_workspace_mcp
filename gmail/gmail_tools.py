@@ -2493,6 +2493,9 @@ async def get_gmail_attachment_content(
     In HTTP mode, returns a download URL: with signed download URLs enabled on the
     server, a link that streams from Gmail on demand and expires within ~15 minutes
     (fetch it promptly); otherwise a server-stored copy valid for 1 hour.
+    With signed URLs enabled but no link issuable, the tool returns an error
+    instead, unless GCS attachment staging is configured, whose signed URL is
+    returned.
     May re-fetch message metadata to resolve filename and MIME type.
 
     Args:

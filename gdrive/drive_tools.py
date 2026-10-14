@@ -472,6 +472,9 @@ async def get_drive_file_download_url(
     In HTTP mode, returns a download URL: with signed download URLs enabled on the
     server, a link that streams from Drive on demand and expires within ~15 minutes
     (fetch it promptly); otherwise a temporary server-stored copy (valid for 1 hour).
+    With signed URLs enabled but no link issuable, the tool returns an error
+    instead, unless GCS attachment staging is configured, whose signed URL is
+    returned.
     In stateless mode (no file storage), returns the file itself as an embedded
     resource, up to WORKSPACE_MCP_STATELESS_INLINE_MAX_BYTES (default 10 MiB,
     and never more than WORKSPACE_MCP_MAX_FILE_BYTES when that is set).
