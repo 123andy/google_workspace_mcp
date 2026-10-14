@@ -127,7 +127,12 @@ def _with_share_restriction_note(func):
 
 
 def _stateless_too_large_message(
-    file_name: str, file_id: str, size_bytes: int, mime_type: str, limit: int
+    file_name: str,
+    file_id: str,
+    size_bytes: int,
+    mime_type: str,
+    limit: int,
+    unavailable_note: str = "",
 ) -> str:
     """Explain why a stateless-mode download was not returned inline."""
     return "\n".join(
@@ -142,12 +147,13 @@ def _stateless_too_large_message(
             "(WORKSPACE_MCP_STATELESS_INLINE_MAX_BYTES, or "
             "WORKSPACE_MCP_MAX_FILE_BYTES if lower). Use "
             "get_drive_file_content for its text, or raise the limit.",
+            *([unavailable_note] if unavailable_note else []),
         ]
     )
 
 
 def _stateless_inline_disabled_message(
-    file_name: str, file_id: str, mime_type: str
+    file_name: str, file_id: str, mime_type: str, unavailable_note: str = ""
 ) -> str:
     """Explain that stateless-mode downloads are not returned inline at all."""
     return "\n".join(
@@ -159,6 +165,7 @@ def _stateless_inline_disabled_message(
             "Not returned: stateless mode has no file storage, and inline "
             "returns are disabled (WORKSPACE_MCP_STATELESS_INLINE_MAX_BYTES=0). "
             "Use get_drive_file_content for its text, or raise the limit.",
+            *([unavailable_note] if unavailable_note else []),
         ]
     )
 
@@ -612,6 +619,7 @@ async def get_drive_file_download_url(
             ]
         )
     no_url = signed_downloads.enabled()
+    note = signed_downloads.UNAVAILABLE_NOTE if no_url else ""
     if no_url and not is_stateless_mode():
         # Signing is on but no link could be issued. Stateless mode can still
         # return the file inline (below); otherwise the only alternative is an
@@ -622,7 +630,9 @@ async def get_drive_file_download_url(
     # file itself goes back as an embedded resource, up to inline_max_bytes.
     inline_max_bytes = get_stateless_inline_max_bytes() if is_stateless_mode() else None
     if inline_max_bytes == 0:
-        return _stateless_inline_disabled_message(file_name, file_id, output_mime_type)
+        return _stateless_inline_disabled_message(
+            file_name, file_id, output_mime_type, note
+        )
     # Drive's declared size is the download size only for binary files; an
     # export's size is unknown until it has been downloaded.
     declared_size = int(file_metadata.get("size") or 0)
@@ -632,7 +642,7 @@ async def get_drive_file_download_url(
         and declared_size > inline_max_bytes
     ):
         return _stateless_too_large_message(
-            file_name, file_id, declared_size, output_mime_type, inline_max_bytes
+            file_name, file_id, declared_size, output_mime_type, inline_max_bytes, note
         )
 
     # Stream the download straight to disk. Outside the capped stateless inline
@@ -645,7 +655,12 @@ async def get_drive_file_download_url(
         try:
             if size_bytes > inline_max_bytes:
                 return _stateless_too_large_message(
-                    file_name, file_id, size_bytes, output_mime_type, inline_max_bytes
+                    file_name,
+                    file_id,
+                    size_bytes,
+                    output_mime_type,
+                    inline_max_bytes,
+                    note,
                 )
             with tmp_path.open("rb") as fh:
                 payload = fh.read()
@@ -662,7 +677,7 @@ async def get_drive_file_download_url(
                 f"MIME Type: {output_mime_type}",
                 "\nStateless mode: the file is attached to this result as an "
                 f"embedded resource ({output_filename}).",
-                *([signed_downloads.UNAVAILABLE_NOTE] if no_url else []),
+                *([note] if no_url else []),
             ]
         )
         if export_mime_type:
