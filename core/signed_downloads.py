@@ -923,6 +923,14 @@ async def _fetch_chat(claims: dict, credentials: Credentials) -> DownloadResult:
             raise SignedDownloadError(
                 f"Chat media download failed: HTTP {response.status_code}"
             )
+        # aiter_bytes would decode an encoded body while Content-Length counts
+        # the encoded bytes, ending a 200 short of its declared length.
+        encoding = response.headers.get("content-encoding", "identity")
+        if any(t.strip().lower() not in ("", "identity") for t in encoding.split(",")):
+            raise SignedDownloadError(
+                "Chat media response has a Content-Encoding despite "
+                "Accept-Encoding: identity"
+            )
         # Without a Content-Length a mid-stream cut would end the chunked
         # body cleanly and the client would keep a truncated file as a 200.
         declared = response.headers.get("content-length")
