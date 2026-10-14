@@ -679,10 +679,21 @@ async def download_chat_attachment(
     # Signed link: the route streams the attachment from Chat at download time,
     # so nothing is downloaded or stored here (and stateless mode works).
     if signed_downloads.enabled():
+        if not media_resource:
+            # A Drive-file attachment has no attachmentDataRef; the media endpoint
+            # rejects the attachment name (see above), so no link could work.
+            return (
+                f"Error: attachment '{filename}' has no Chat-hosted file data "
+                "(it is a Google Drive file, not an upload), so no download "
+                "link can be issued for it here. Use the Drive tools with the "
+                "file's Drive ID instead."
+            )
         try:
             signed_downloads.chat_media_url(resource_name)
         except ValueError:
-            return f"Cannot offer attachment '{filename}': invalid resource name."
+            return (
+                f"Error: cannot offer attachment '{filename}': invalid resource name."
+            )
         signed = await download_handles.shorten_signed_url(
             signed_downloads.offer_url(
                 user_google_email,
