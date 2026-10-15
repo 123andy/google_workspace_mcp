@@ -15,7 +15,7 @@ this server, and Google's session URL never leaves it.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `WORKSPACE_MCP_SIGNED_UPLOAD_URLS` | `false` | Turn the feature on. Needs `WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS=true` (its external-URL and key checks); the server refuses to start otherwise. Ignored (with a warning) over stdio. |
+| `WORKSPACE_MCP_SIGNED_UPLOAD_URLS` | `false` | Turn the feature on. Needs `WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS=true` (its external-URL and key checks); the server refuses to start otherwise. Ignored (with a warning) over stdio, except that the tool descriptions, read at import, still mention the upload URL. |
 | `WORKSPACE_MCP_SIGNED_UPLOAD_MAX_BYTES` | `104857600` (100 MiB) | Largest file one link accepts. Invalid values fail startup. |
 
 Off, nothing changes: `/ul/` is not mounted (it answers like any unknown
@@ -39,17 +39,19 @@ curl --fail-with-body -w '\nHTTP %{http_code}\n' \
   and `Content-Length: 0` asks how much arrived (`308`, with `Range` if any
   bytes are committed), and the rest is sent with `Content-Range`.
 - `410` means the link is closed (completed, refused by Google, or used up):
-  call the tool again.
+  call the tool again. After a completed upload, the status query above still
+  returns Google's completion reply (kept with the link), so a caller that
+  missed it can read the file id.
 
 ## Limits per link
 
 | Limit | Value |
 | --- | --- |
 | Time to first use | 15 minutes |
-| Expiry after use | 15 minutes after the last request, never more than 2 hours after minting |
+| Expiry after use | 15 minutes after the last request, never more than 2 hours after minting (a body still arriving then is cut off) |
 | Requests | 50 |
 | Bytes in total | twice the size cap |
-| Concurrency | one request at a time (`409` for a second) |
+| Concurrency | one request at a time per server instance (`409` for a second) |
 
 ## Status codes
 
@@ -57,11 +59,11 @@ curl --fail-with-body -w '\nHTTP %{http_code}\n' \
 | --- | --- |
 | `200`/`201` | Google completed the upload; body is its JSON. The link closes. |
 | `308` | Google has part of the file; `Range` says how much. |
-| `400` | Malformed `Content-Length` or `Content-Range`, or the body did not arrive as declared. |
+| `400` | Malformed `Content-Length` or `Content-Range`, or the body did not arrive as declared: cut short, more than declared, no data for 60 s, still arriving at the 2-hour limit, or a server restart mid-upload (resume with a status query). |
 | `401` | The owner's credentials are no longer recoverable on this server. |
 | `403` | Unknown, malformed or expired handle (one generic body for all). |
 | `405` | Method other than PUT or POST (POST is sent on as PUT). |
-| `409` | Another request on this link is in progress. |
+| `409` | Another request on this link is in progress on this server instance. |
 | `410` | Link closed: upload completed, Google answered 4xx, or 50 requests used. |
 | `411` | No `Content-Length`, or a chunked body. |
 | `413` | Over the size cap (by `Content-Length` or `Content-Range`), or over the link's total. |
@@ -69,8 +71,10 @@ curl --fail-with-body -w '\nHTTP %{http_code}\n' \
 | `503` | Google answered 408 or 429 (retry later; the link stays open). |
 | `504` | Google did not answer in time. |
 
-`401`, `403`, `409`, `410`, `411`, `413` and the header `400`s are decided
-before anything is read from the body or sent to Google.
+`401`, `403`, `409`, `411`, `413`, the header `400`s and the `410` for an
+already closed link are decided before anything is read from the body or sent
+to Google. A `410` caused by Google's 4xx comes after Google has seen the
+request.
 
 ## Security model
 
