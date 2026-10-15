@@ -31,6 +31,7 @@ from auth.service_decorator import require_google_service
 from core.file_limits import download_media_bytes
 from core.http_utils import (
     redact_url as _redact_url,
+    PrivateHostError,
     ssrf_safe_stream as _ssrf_safe_stream,
 )
 from core.utils import (
@@ -1023,6 +1024,20 @@ def upload_url_not_offered_error(routes: tuple[str, ...]) -> UserInputError:
     )
 
 
+def upload_url_hint() -> str:
+    """Pointer to ``return_upload_url`` for refusals a caller can sidestep with it.
+
+    Append only where local file access is disabled and the calling tool offers
+    ``return_upload_url``.
+    """
+    return (
+        "If the file is on the caller's machine, call this tool again with "
+        "return_upload_url=true and mime_type, then PUT the bytes to the URL it "
+        "returns (suited to large or binary files; only offered where local file "
+        "access is disabled)."
+    )
+
+
 def resumable_upload_result(summary: str, upload_url: str, mime_type: str) -> str:
     return (
         f"{summary}\n\n"
@@ -1040,6 +1055,18 @@ async def _stream_url_with_validation(
     url: str, write_chunk: Optional[Callable[[bytes], Awaitable[None]]] = None
 ) -> Tuple[int, Optional[str]]:
     """Stream a remote file with shared status and size validation."""
+    try:
+        return await _stream_url(url, write_chunk)
+    except PrivateHostError as exc:
+        if local_file_access_enabled():
+            raise
+        # Same message, plus the way round it; every caller offers return_upload_url.
+        raise ValueError(f"{exc}. {upload_url_hint()}") from exc
+
+
+async def _stream_url(
+    url: str, write_chunk: Optional[Callable[[bytes], Awaitable[None]]]
+) -> Tuple[int, Optional[str]]:
     total_bytes = 0
     redacted_url = _redact_url(url)
 
