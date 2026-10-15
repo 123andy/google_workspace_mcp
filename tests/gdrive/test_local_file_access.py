@@ -35,6 +35,8 @@ from gdrive.drive_helpers import (  # noqa: E402
 from gdrive.drive_tools import (  # noqa: E402
     create_drive_file,
     import_to_google_doc,
+    import_to_google_sheets,
+    import_to_google_slides,
     update_drive_file,
 )
 
@@ -365,7 +367,7 @@ class TestUploadUrlHint:
                 fileUrl=f"http://{host}:8000/a.pdf",
             )
         assert "URLs pointing to localhost are not allowed" in str(exc.value)
-        assert self.HINT in str(exc.value)
+        assert "return_upload_url=true and mime_type," in str(exc.value)
 
     @pytest.mark.asyncio
     @patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
@@ -386,21 +388,52 @@ class TestUploadUrlHint:
         assert "upload" not in str(exc.value).lower()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "tool, file_name",
+        [
+            (import_to_google_doc, "notes.md"),
+            (import_to_google_sheets, "budget.xlsx"),
+            (import_to_google_slides, "deck.pptx"),
+        ],
+    )
     @patch("gdrive.drive_helpers.resolve_folder_id", new_callable=AsyncMock)
-    async def test_import_localhost_url_names_upload_url(
-        self, mock_folder, monkeypatch
+    async def test_import_localhost_url_names_source_format(
+        self, mock_folder, tool, file_name, monkeypatch
     ):
+        """The import tools take source_format with return_upload_url; they have
+        no mime_type parameter."""
         monkeypatch.setenv("WORKSPACE_MCP_DISABLE_LOCAL_FILES", "true")
         mock_folder.return_value = "root"
         with pytest.raises(Exception) as exc:
-            await _unwrap(import_to_google_doc)(
+            await _unwrap(tool)(
                 service=Mock(),
                 user_google_email="user@example.com",
-                file_name="notes.md",
-                file_url="http://127.0.0.1:8000/notes.md",
+                file_name=file_name,
+                file_url=f"http://127.0.0.1:8000/{file_name}",
             )
         assert "URLs pointing to localhost are not allowed" in str(exc.value)
-        assert self.HINT in str(exc.value)
+        assert "return_upload_url=true and source_format," in str(exc.value)
+        assert "mime_type" not in str(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_update_localhost_url_names_mime_type(self, monkeypatch):
+        """update_drive_file refuses source_format with return_upload_url and
+        takes mime_type instead."""
+        monkeypatch.setenv("WORKSPACE_MCP_DISABLE_LOCAL_FILES", "true")
+        with patch(
+            "gdrive.drive_tools.resolve_drive_item",
+            AsyncMock(return_value=("f1", {"name": "n.txt", "mimeType": "text/plain"})),
+        ):
+            with pytest.raises(Exception) as exc:
+                await _unwrap(update_drive_file)(
+                    service=Mock(),
+                    user_google_email="user@example.com",
+                    file_id="f1",
+                    file_url="http://127.0.0.1:8000/n.txt",
+                )
+        assert "URLs pointing to localhost are not allowed" in str(exc.value)
+        assert "return_upload_url=true and mime_type," in str(exc.value)
+        assert "source_format" not in str(exc.value)
 
     @pytest.mark.asyncio
     @patch("gdrive.drive_helpers.resolve_folder_id", new_callable=AsyncMock)

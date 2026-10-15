@@ -2211,6 +2211,7 @@ async def update_drive_file(
                     if format_map
                     else (target_mime_type or "application/octet-stream")
                 ),
+                upload_type_param="mime_type",
             )
             query_params["media_body"] = media
 
