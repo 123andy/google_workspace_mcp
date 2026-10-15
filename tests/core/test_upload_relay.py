@@ -1092,6 +1092,11 @@ async def test_offer_fails_loud_when_the_route_could_not_serve_the_owner(
     text = await ur.offer_result("Summary.", GURL, "application/pdf", USER)
     assert text.startswith("Error: no upload URL could be issued")
     assert "credentials" in text
+    # The remedy is the user's, worded as for /dl/; nothing for an operator to do.
+    assert text.endswith(
+        "Re-authenticate through this server, then call this tool again."
+    )
+    assert "operator" not in text
     assert "googleapis.com" not in text and "/ul/" not in text
     store.assert_not_called()
     sd._recover_credentials.assert_called_once_with(USER)
@@ -1119,6 +1124,7 @@ async def test_offer_refuses_credentials_that_end_before_the_link_could_be_used(
     monkeypatch.setattr(ur, "store_session", store)
     text = await ur.offer_result("Summary.", GURL, "application/pdf", USER)
     assert text.startswith("Error: no upload URL could be issued")
+    assert "Re-authenticate through this server" in text
     assert "/ul/" not in text
     store.assert_not_called()
 
@@ -1171,6 +1177,13 @@ async def test_offer_fails_loud_when_the_store_is_down(relay_env, monkeypatch):
     monkeypatch.setattr(ur._store, "put", AsyncMock(side_effect=RuntimeError("down")))
     text = await ur.offer_result("Summary.", GURL, "a/b", USER)
     assert text.startswith("Error:") and "googleapis.com" not in text
+
+
+@pytest.mark.asyncio
+async def test_operator_side_failures_keep_the_operator_remedy(relay_env, monkeypatch):
+    monkeypatch.delenv("WORKSPACE_EXTERNAL_URL", raising=False)
+    text = await ur.offer_result("Summary.", GURL, "application/pdf", USER)
+    assert text.endswith("report this to the server operator.")
 
 
 def test_error_text_is_one_line_and_names_no_google_url():

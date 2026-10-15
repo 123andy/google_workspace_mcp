@@ -204,7 +204,7 @@ async def test_owner_the_route_cannot_recover_gets_an_error(
             **kwargs,
         )
     assert text.startswith("Error: no upload URL could be issued")
-    assert "credentials" in text
+    assert "credentials" in text and "Re-authenticate through this server" in text
     assert "googleapis.com" not in text and "/ul/" not in text
 
 

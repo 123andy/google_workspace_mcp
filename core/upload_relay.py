@@ -380,11 +380,15 @@ def _unavailable_reason() -> Optional[str]:
     return None
 
 
-def _error_text(reason: str) -> str:
+def _error_text(
+    reason: str,
+    remedy: str = (
+        "Do not retry against Google directly; report this to the server operator."
+    ),
+) -> str:
     return (
         f"Error: no upload URL could be issued, so nothing will be uploaded: "
-        f"{reason}. Do not retry against Google directly; report this to the "
-        "server operator."
+        f"{reason}. {remedy}"
     )
 
 
@@ -414,10 +418,12 @@ async def offer_result(
     # The route checks the owner per request; a link it would refuse is no link.
     lifetime = await _owner_lifetime(user_email)
     if lifetime < _FIRST_USE_SECONDS:
+        # The remedy is the user's, as for /dl/ (SIGNING_FAILED_ERROR).
         return _error_text(
             "this server could not recover usable credentials for you (none "
             "stored here, or an access token too close to expiry for an upload, "
-            "with no refresh token), and the upload link needs them"
+            "with no refresh token), and the upload link needs them",
+            "Re-authenticate through this server, then call this tool again.",
         )
     if not is_valid_session_url(session_url):
         logger.warning("Upload session URL failed validation; not offered.")
