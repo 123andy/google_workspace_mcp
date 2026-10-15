@@ -345,10 +345,11 @@ _DOC_TO = (
 
 
 def describe(func):
-    """Innermost tool decorator: while the setting is on, the return_upload_url
-    description says the URL is on this server. Read once at import, like the
-    share-restriction note; off, the docstring is untouched."""
-    if not flag_set():
+    """Innermost tool decorator: while upload links are active, the
+    return_upload_url description says the URL is on this server. Read once at
+    import, like the share-restriction note, so the entrypoints set the
+    transport before importing tools; otherwise the docstring is untouched."""
+    if not active():
         return func
     doc = func.__doc__ or ""
     if _DOC_FROM not in doc:
