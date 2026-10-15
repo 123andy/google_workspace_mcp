@@ -420,6 +420,8 @@ class DownloadResult:
     # Exact byte count of ``stream`` when Google declared it; sent as
     # Content-Length so a client can tell a cut transfer from a complete one.
     length: Optional[int] = None
+    # Releases what ``stream`` holds open, for when it is never iterated.
+    close: Optional[Callable[[], Awaitable[None]]] = None
 
 
 class SignedDownloadError(Exception):
@@ -584,6 +586,16 @@ async def _fetch_chat(claims: dict, credentials: Credentials) -> DownloadResult:
         url = chat_media_url(claims.get("rn"))
     except ValueError as exc:
         raise SignedDownloadError(str(exc)) from exc
+    # Sender-supplied. Checked before the stream opens: a type unfit for a header
+    # would otherwise fail only once the response is being built.
+    media_type = claims.get("mt")
+    if not (
+        isinstance(media_type, str)
+        and 0 < len(media_type) <= 255
+        and media_type.isascii()
+        and media_type.isprintable()
+    ):
+        media_type = "application/octet-stream"
     limit = get_max_file_bytes()
     # Redirects are not followed: Google's media endpoint answers directly, so a
     # redirect is unexpected and is treated as a failure rather than chased.
@@ -639,6 +651,10 @@ async def _fetch_chat(claims: dict, credentials: Credentials) -> DownloadResult:
             raise SignedDownloadError(f"Chat media download failed: {exc}") from exc
         raise
 
+    async def close() -> None:
+        await response.aclose()
+        await client.aclose()
+
     async def body() -> AsyncIterator[bytes]:
         sent = 0
         try:
@@ -661,14 +677,14 @@ async def _fetch_chat(claims: dict, credentials: Credentials) -> DownloadResult:
             logger.error("Chat stream interrupted mid-download: %s", exc)
             raise SignedDownloadError(f"Chat stream interrupted: {exc}") from exc
         finally:
-            await response.aclose()
-            await client.aclose()
+            await close()
 
     return DownloadResult(
         filename=claims.get("fn") or "attachment",
-        media_type=claims.get("mt") or "application/octet-stream",
+        media_type=media_type,
         stream=body(),
         length=declared_bytes,
+        close=close,
     )
 
 
@@ -734,16 +750,41 @@ async def serve(token: str) -> Response:
         logger.error("Signed download fetch failed: %s", exc)
         return _error(502, "Failed to fetch the requested resource")
 
-    headers = {
-        **_RESPONSE_HEADERS,
-        "Content-Disposition": _content_disposition(result.filename),
-    }
-    if result.stream is not None:
-        if result.length is not None:
-            headers["Content-Length"] = str(result.length)
-        return StreamingResponse(
-            result.stream, media_type=result.media_type, headers=headers
+    try:
+        headers = {
+            **_RESPONSE_HEADERS,
+            "Content-Disposition": _content_disposition(result.filename),
+        }
+        if result.stream is not None:
+            if result.length is not None:
+                headers["Content-Length"] = str(result.length)
+            return _ClosingStreamingResponse(
+                result.stream,
+                media_type=result.media_type,
+                headers=headers,
+                close=result.close,
+            )
+        return Response(
+            content=result.content, media_type=result.media_type, headers=headers
         )
-    return Response(
-        content=result.content, media_type=result.media_type, headers=headers
-    )
+    except BaseException:
+        if result.close is not None:
+            await result.close()
+        raise
+
+
+class _ClosingStreamingResponse(StreamingResponse):
+    """Runs ``close`` however the response ends, including when the body was
+    never iterated (client gone, or sending the headers failed), where the
+    stream's own cleanup never runs."""
+
+    def __init__(self, *args, close=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._close = close
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            if self._close is not None:
+                await self._close()
