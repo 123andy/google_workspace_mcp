@@ -62,7 +62,9 @@ for n in 2 20 50 101; do dd if=/dev/urandom of=${n}m.bin bs=1048576 count=$n; do
    curl $K --fail-with-body -w '\nHTTP %{http_code} %{time_total}s\n' \
      -H 'Content-Type: application/octet-stream' --upload-file 2m.bin "$UL"
    ```
-   Expect `200`/`201` and the file's JSON (with `id`); the same PUT again gives `410`.
+   Expect `200`/`201` and the file's JSON (with `id`); the same PUT again gives `410`, and a status
+   query (`-X PUT -H 'Content-Length: 0' -H "Content-Range: bytes */$(wc -c < 2m.bin)"`) replays
+   the JSON.
 3. Read it back: `get_drive_file_download_url(file_id=<id>)` returns a `/dl/` link;
    `curl $K --fail -o back.bin "<link>" && cmp 2m.bin back.bin && echo SAME`.
 4. Repeat with `20m.bin` and `50m.bin`, watching the server's memory during the 50 MiB PUT.
