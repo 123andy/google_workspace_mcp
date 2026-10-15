@@ -213,6 +213,7 @@ class TestGuidanceWhenDisabled:
                     file_url=None,
                     source_format=None,
                     format_map=GOOGLE_DOCS_IMPORT_FORMATS,
+                    upload_type_param="source_format",
                 )
         msg = str(exc.value)
         assert "'file_url'" in msg
@@ -235,6 +236,7 @@ class TestGuidanceWhenDisabled:
                     file_url=None,
                     source_format=None,
                     format_map=GOOGLE_DOCS_IMPORT_FORMATS,
+                    upload_type_param="source_format",
                 )
         msg = str(exc.value)
         assert "'content'" in msg and "'base64_content'" in msg

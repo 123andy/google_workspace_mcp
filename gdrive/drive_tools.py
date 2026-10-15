@@ -1225,7 +1225,7 @@ async def create_drive_file(
                         await asyncio.to_thread(spool.write, chunk)
 
                     _total, content_type = await _stream_url_with_validation(
-                        fileUrl, _write_spool
+                        fileUrl, _write_spool, upload_type_param="mime_type"
                     )
                     await asyncio.to_thread(spool.seek, 0)
 
@@ -1263,7 +1263,7 @@ async def create_drive_file(
                         await asyncio.to_thread(temp_file.write, chunk)
 
                     total_bytes, content_type = await _stream_url_with_validation(
-                        fileUrl, _write_chunk
+                        fileUrl, _write_chunk, upload_type_param="mime_type"
                     )
 
                     logger.info(

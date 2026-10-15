@@ -1074,7 +1074,7 @@ async def _stream_url_with_validation(
     url: str,
     write_chunk: Optional[Callable[[bytes], Awaitable[None]]] = None,
     *,
-    upload_type_param: str = "mime_type",
+    upload_type_param: str,
 ) -> Tuple[int, Optional[str]]:
     """Stream a remote file with shared status and size validation.
 
@@ -1121,7 +1121,7 @@ async def _stream_url(
 
 
 async def _download_url_to_bytes(
-    url: str, upload_type_param: str = "mime_type"
+    url: str, *, upload_type_param: str
 ) -> Tuple[BinaryIO, Optional[str]]:
     """Download a remote file into a spooled temporary file with bounded streaming."""
     spool = SpooledTemporaryFile(max_size=UPLOAD_CHUNK_SIZE_BYTES)
@@ -1310,7 +1310,7 @@ async def _resolve_import_media(
     base64_sha256: Optional[str] = None,
     format_map: Optional[Dict[str, str]] = None,
     passthrough_mime_type: Optional[str] = None,
-    upload_type_param: str = "source_format",
+    upload_type_param: str,
 ) -> Tuple[MediaIoBaseUpload, str, Optional[BinaryIO]]:
     """
     Resolve a content source into an upload ``MediaIoBaseUpload`` and source MIME type.
@@ -1428,7 +1428,7 @@ async def _resolve_import_media(
             raise ValueError(f"file_url must be http:// or https://, got: {file_url}")
 
         remote_file_data, remote_content_type = await _download_url_to_bytes(
-            file_url, upload_type_param
+            file_url, upload_type_param=upload_type_param
         )
 
         # Prefer the response Content-Type, falling back to URL-based detection.
@@ -1725,6 +1725,7 @@ async def _import_with_conversion(
         base64_content=base64_content,
         base64_sha256=base64_sha256,
         format_map=format_map,
+        upload_type_param="source_format",
     )
 
     # Clean up file name (remove extension since it becomes a Google Apps file)
