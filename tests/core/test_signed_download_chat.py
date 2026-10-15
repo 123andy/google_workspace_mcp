@@ -343,7 +343,16 @@ def _tracked():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "mt", ["text/plain\r\nX-Evil: 1", "image/日本", "a\tb", 7, "x" * 300]
+    "mt",
+    [
+        "text/plain\r\nX-Evil: 1",
+        "image/日本",
+        "a\tb",
+        7,
+        "x" * 300,
+        " text/plain",
+        "text/plain ",
+    ],
 )
 async def test_type_unfit_for_a_header_becomes_octet_stream(chat_endpoint, mt):
     chat_endpoint["handler"] = _ok()

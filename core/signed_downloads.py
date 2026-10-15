@@ -224,6 +224,20 @@ def clamp_ttl(
     return int(min(max_seconds, left))
 
 
+def header_safe_media_type(value: object) -> bool:
+    """A MIME type fit for a response header: 1-255 printable ASCII characters
+    and no spaces at the ends. h11 (uvicorn's HTTP/1.1) refuses a header value
+    that starts or ends with a space, so the client would see the connection
+    drop with no response."""
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 255
+        and value.isascii()
+        and value.isprintable()
+        and value == value.strip()
+    )
+
+
 def format_ttl(seconds: float) -> str:
     return (
         f"{int(seconds)} seconds" if seconds < 120 else f"~{int(seconds // 60)} minutes"
@@ -594,12 +608,7 @@ async def _fetch_chat(claims: dict, credentials: Credentials) -> DownloadResult:
     # Sender-supplied. Checked before the stream opens: a type unfit for a header
     # would otherwise fail only once the response is being built.
     media_type = claims.get("mt")
-    if not (
-        isinstance(media_type, str)
-        and 0 < len(media_type) <= 255
-        and media_type.isascii()
-        and media_type.isprintable()
-    ):
+    if not header_safe_media_type(media_type):
         media_type = "application/octet-stream"
     limit = get_max_file_bytes()
     # Redirects are not followed: Google's media endpoint answers directly, so a

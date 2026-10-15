@@ -190,17 +190,6 @@ def is_valid_session_url(url: object) -> bool:
 # --- Handle store --------------------------------------------------------------------
 
 
-def _valid_mime_type(value: object) -> bool:
-    """A header-safe MIME type: printable ASCII, no spaces at the ends."""
-    return (
-        isinstance(value, str)
-        and 0 < len(value) <= 255
-        and value.isascii()
-        and value.isprintable()
-        and value == value.strip()
-    )
-
-
 def _build_store():
     """Encrypted shared backend when configured, else in-process memory."""
     global _store, _store_built
@@ -250,7 +239,7 @@ async def store_session(
     if (
         not is_valid_session_url(session_url)
         or not user_email
-        or not _valid_mime_type(mime_type)
+        or not signed_downloads.header_safe_media_type(mime_type)
         or not 0 < lifetime <= _MAX_LIFETIME_SECONDS
     ):
         return None
@@ -301,7 +290,7 @@ async def _load(handle: str) -> Optional[dict]:
         return None
     if not (isinstance(record.get("sub"), str) and record["sub"]):
         return None
-    if not _valid_mime_type(record.get("mt")):
+    if not signed_downloads.header_safe_media_type(record.get("mt")):
         return None
     if record.get("state") not in ("new", "active", "done", "dead"):
         return None
@@ -323,10 +312,10 @@ def _valid_reply(reply: object) -> bool:
         and reply.get("status") in (200, 201)
         and isinstance(reply.get("body"), str)
         and len(reply["body"]) <= _MAX_RESPONSE_BYTES
-        and isinstance(reply.get("type"), str)
-        and len(reply["type"]) <= 255
-        and reply["type"].isascii()
-        and reply["type"].isprintable()
+        and (
+            reply.get("type") == ""
+            or signed_downloads.header_safe_media_type(reply.get("type"))
+        )
     )
 
 
@@ -711,10 +700,11 @@ async def _relay(
     if status in (200, 201):
         record["state"] = "done"
         if complete:
+            safe_type = signed_downloads.header_safe_media_type(google_type)
             record["reply"] = {
                 "status": status,
                 "body": body.decode("utf-8", errors="replace"),
-                "type": google_type if _valid_mime_type(google_type) else "",
+                "type": google_type if safe_type else "",
             }
     elif status is not None and _closes_link(status):
         record["state"] = "dead"
@@ -751,7 +741,7 @@ def _upstream_response(
                 headers=_RESPONSE_HEADERS,
             )
         headers = dict(_RESPONSE_HEADERS)
-        if google_type and "\n" not in google_type and "\r" not in google_type:
+        if signed_downloads.header_safe_media_type(google_type):
             headers["Content-Type"] = google_type
         return Response(content=body, status_code=status, headers=headers)
     if status == 308:

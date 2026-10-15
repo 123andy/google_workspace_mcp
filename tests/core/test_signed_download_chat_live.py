@@ -82,21 +82,26 @@ def _upstream(monkeypatch, handler):
     )
 
 
-def _link():
+def _link(mime_type=None):
     return sd.mint_url(
         source="chat",
         user_email="u@example.com",
         ref={"rn": "spaces/S/attachments/A"},
         ttl_seconds=300,
+        mime_type=mime_type,
     )
 
 
-async def _fetch(port):
+async def _fetch(port, mime_type=None):
     """Return (status, bytes received); raises if the client sees a broken transfer."""
-    path = _link().split(f"127.0.0.1:{port}")[1]
+    response = await _get(port, mime_type)
+    return response.status_code, response.content
+
+
+async def _get(port, mime_type=None):
+    path = _link(mime_type).split(f"127.0.0.1:{port}")[1]
     async with RealClient(base_url=f"http://127.0.0.1:{port}") as http:
-        response = await http.get(path)
-        return response.status_code, response.content
+        return await http.get(path)
 
 
 @pytest.mark.asyncio
@@ -152,3 +157,22 @@ async def test_no_declared_length_is_refused_with_a_generic_502(live, monkeypatc
     status, body = await _fetch(live)
     assert status == 502
     assert b"Content-Length" not in body and b"x" * 10 not in body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mime_type", [" text/plain", "application/pdf "])
+async def test_type_with_edge_whitespace_still_downloads(live, monkeypatch, mime_type):
+    """uvicorn's h11 refuses a header value with spaces at its ends, so such a
+    type reaching the response would drop the connection after the 200."""
+    _upstream(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            headers={"content-length": str(SENT)},
+            stream=_Cut(SENT, error=False),
+        ),
+    )
+    response = await _get(live, mime_type)
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/octet-stream"
+    assert len(response.content) == SENT
