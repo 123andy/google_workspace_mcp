@@ -584,6 +584,14 @@ async def _serve_held(handle: str, request: Request) -> Response:
     if length > cap:
         return _error(413, f"File exceeds this server's upload limit of {cap} bytes")
     content_range = request.headers.get("content-range")
+    if content_range is None and length == 0:
+        # Google would take a bare empty PUT as the whole file and complete it.
+        return _error(
+            400,
+            "An empty request needs Content-Range: 'bytes */<total size>' asks "
+            "how much has arrived. For an empty file, use the tool's inline "
+            "content instead.",
+        )
     if content_range is not None:
         problem = _check_content_range(content_range, length, cap)
         if problem is not None:
