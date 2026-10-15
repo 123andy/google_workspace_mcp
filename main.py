@@ -9,7 +9,7 @@ from functools import partial
 from importlib import metadata, import_module
 from typing import NoReturn
 from dotenv import load_dotenv
-from core import signed_downloads
+from core import signed_downloads, upload_relay
 from core.startup_ui import StartupDisplay, collapse_home, wordmark_lines
 
 # Prevent any stray startup output on macOS (e.g. platform identifiers) from
@@ -679,11 +679,13 @@ def main():
 
     validate_streamable_http_auth(args.transport)
     signed_downloads.log_if_ignored(args.transport)
+    upload_relay.log_if_ignored(args.transport)
     from core.download_handles import warn_retired_settings
 
     warn_retired_settings()  # fork-only: settings renamed when downloads went upstream
     try:
         signed_downloads.validate_startup(args.transport)
+        upload_relay.validate_startup(args.transport)
     except ValueError as exc:
         parser.error(str(exc))
     resolve_callback_port_for_transport(args.transport)
