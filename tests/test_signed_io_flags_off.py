@@ -1,10 +1,20 @@
-"""With the signed-link settings off, tool output and routes are exactly what they
-were before signed uploads (and Chat signed links) existed.
+"""With the signed-link settings off, the upload tools' results, the /ul/ path and
+the Chat download and listing results are what they were before signed uploads
+(and Chat signed links) existed.
 
 The expected strings are literals on purpose, and the file imports nothing
 added by that work, so the same file run against the pre-feature tree must pass
-too: that is the byte-for-byte check. The upload-link setting is also set to
-"true" under stdio, where it is ignored, to show it changes nothing there."""
+too: that is the byte-for-byte check for what it covers. The upload-link setting
+is also set to "true" under stdio, where it is ignored.
+
+Not covered, because it does change with these settings off (docs/
+signed-upload-relay.md has the list): create_drive_file's description and its
+fileUrl text; the return_upload_url hint on file://, localhost and
+private-network refusals under WORKSPACE_MCP_DISABLE_LOCAL_FILES=true; the
+descriptions, not the results, of download_chat_attachment,
+get_drive_file_download_url and get_gmail_attachment_content; the pure-ASGI
+session middleware; PrivateHostError as the class of those refusals; and
+access-log redaction."""
 
 from unittest.mock import AsyncMock, Mock, patch
 
