@@ -491,6 +491,11 @@ async def test_over_cap_is_413_before_google(client, google, monkeypatch):
     handle = await _handle()
     response = await client.put(f"/ul/{handle}", content=b"x" * 1001)
     assert response.status_code == 413
+    error = response.json()["error"]
+    # The model must be told what to do instead, not just that it failed.
+    assert "larger than this server's upload limit" in error
+    assert "Do not retry" in error
+    assert "upload the file to Drive themselves" in error
     assert google.requests == []
     assert (await _record(handle))["reqs"] == 0  # not counted
 
@@ -575,6 +580,8 @@ async def test_total_volume_is_capped_at_twice_the_cap(client, google, monkeypat
     await ur._store.put(handle, record, collection=ur._COLLECTION)
     response = await client.put(f"/ul/{handle}", content=b"x" * 501)
     assert response.status_code == 413
+    assert "new link" in response.json()["error"]
+    assert "upload the file to Drive themselves" in response.json()["error"]
     response = await client.put(f"/ul/{handle}", content=b"x" * 500)
     assert response.status_code == 200
 
@@ -1035,6 +1042,9 @@ async def test_offer_returns_a_link_on_this_server(relay_env):
     assert "100 MiB" in text and "15 minutes" in text and "2 hours" in text
     assert "--fail-with-body" in text and "Content-Type: application/pdf" in text
     assert "at most 50 requests" in text
+    assert (
+        "for a larger file do not try, ask the user to upload the file to Drive" in text
+    )
     assert "if its body says the upload completed, do not upload again" in text
     assert "the same query returns the file's metadata again, until that" in text
     assert "status queries included" in text
