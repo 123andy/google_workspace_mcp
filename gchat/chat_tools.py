@@ -694,11 +694,14 @@ async def download_chat_attachment(
     # OAuth 2.1 (no refresh_token). The attachment's downloadUri points to
     # chat.google.com which requires browser cookies.
     if not media_resource and not att_name:
-        if signed_downloads.enabled():
+        if not signed_downloads.enabled():
+            return f"No resource name available for attachment '{filename}'."
+        # A Drive file falls through to the Drive guidance below: the missing
+        # name is not its problem, and the Drive tools are the way to it.
+        if not _is_drive_attachment(att):
             return (
                 f"Error: cannot offer attachment '{filename}': it has no resource name."
             )
-        return f"No resource name available for attachment '{filename}'."
 
     # Prefer attachmentDataRef.resourceName for the media endpoint
     resource_name = media_resource or att_name

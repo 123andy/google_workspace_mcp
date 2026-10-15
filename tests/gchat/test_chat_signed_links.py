@@ -156,8 +156,8 @@ async def test_unsafe_resource_name_is_refused_before_minting(signed_env):
     offer.assert_not_called()
 
 
-def _nameless_service():
-    service = chat_service(resource_name=None)
+def _nameless_service(**extra):
+    service = chat_service(resource_name=None, **extra)
     message = service.spaces().messages().get().execute.return_value
     del message["attachment"][0]["name"]
     return service
@@ -165,12 +165,32 @@ def _nameless_service():
 
 @pytest.mark.asyncio
 async def test_attachment_without_any_resource_name_is_an_error(signed_env):
+    # Chat-hosted (it has a data ref), but the ref names nothing.
+    service = _nameless_service(attachmentDataRef={"resourceName": ""})
     with patch.object(sd, "offer_url") as offer:
-        text = await call_tool(service=_nameless_service())
+        text = await call_tool(service=service)
 
     assert text == (
         "Error: cannot offer attachment 'report.pdf': it has no resource name."
     )
+    offer.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra",
+    [{"source": "DRIVE_FILE", "driveDataRef": {"driveFileId": "1AbCdEf"}}, {}],
+    ids=["drive-source", "no-data-ref"],
+)
+async def test_nameless_drive_file_gets_the_drive_guidance(signed_env, extra):
+    """The Drive-file check comes first: a missing name is not the reason, and
+    the Drive tools are the way to the file."""
+    with patch.object(sd, "offer_url") as offer:
+        text = await call_tool(service=_nameless_service(**extra))
+
+    assert text.startswith("Error: attachment 'report.pdf' is a Google Drive file")
+    assert ("1AbCdEf" in text) is bool(extra)
+    assert "no resource name" not in text
     offer.assert_not_called()
 
 
