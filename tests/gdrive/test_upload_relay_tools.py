@@ -251,7 +251,30 @@ def test_flag_on_rewrites_each_upload_tools_description(monkeypatch, name):
     assert ur._DOC_FROM not in copy.__doc__
     assert "upload URL on this server" in copy.__doc__
     assert "directly (no Authorization header)" not in copy.__doc__
+    assert "bytes to (" not in copy.__doc__
     assert copy.__doc__.count("return_upload_url (bool)") == 1
+
+
+def test_update_description_reads_as_a_sentence(monkeypatch):
+    import gdrive.drive_tools as drive_tools
+
+    fn = drive_tools.update_drive_file
+    fn = fn.fn if hasattr(fn, "fn") else fn
+    while hasattr(fn, "__wrapped__"):
+        fn = fn.__wrapped__
+    monkeypatch.setenv(ur.FLAG_ENV, "true")
+
+    def copy():
+        pass
+
+    copy.__doc__ = fn.__doc__
+    ur.describe(copy)
+    flat = " ".join(copy.__doc__.split())
+    assert (
+        "Return an upload URL on this server (relayed to a Google resumable-upload "
+        "session) for the replacement bytes (PUT, no Authorization header); any "
+        "metadata changes" in flat
+    )
 
 
 def test_tool_doc_rewrite_is_registered_on_each_tool():

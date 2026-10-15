@@ -250,6 +250,14 @@ async def test_store_refuses_an_invalid_session_url(relay_env):
         {"sub": ""},
         {"state": "weird"},
         {"bytes": "1"},
+        {"bytes": -1},
+        {"reqs": True},
+        {"mt": 5},
+        {"mt": "text/pl\u00e4in"},
+        {"mt": "text/plain\r\nX-Evil: 1"},
+        {"hard_exp": time.time() + 10 * 3600},
+        {"reply": {"status": 500, "body": "", "type": ""}},
+        {"reply": {"status": 200, "body": "x" * 70_000, "type": ""}},
     ],
 )
 async def test_poisoned_or_expired_records_are_unknown(relay_env, change):
@@ -258,6 +266,14 @@ async def test_poisoned_or_expired_records_are_unknown(relay_env, change):
     record.update(change)
     await ur._store.put(handle, record, collection=ur._COLLECTION)
     assert await ur._load(handle) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mime", ["", None, 7, "a\u00e9/b", "text/plain\r\n", " text/plain"]
+)
+async def test_store_refuses_a_mime_type_unfit_for_a_header(relay_env, mime):
+    assert await ur.store_session(GURL, USER, mime) is None
 
 
 @pytest.mark.asyncio
@@ -643,6 +659,76 @@ async def test_second_concurrent_request_is_409(client, google):
     assert len(google.requests) == 1
 
 
+@pytest.mark.asyncio
+async def test_record_is_read_only_once_the_handle_is_held(client, google, monkeypatch):
+    """A second request must not read the record while the first is still
+    running: it would act on a stale copy (a link already done, or counters
+    about to be overwritten)."""
+    handle = await _handle()
+    real_get = ur._store.get
+    loading, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_get(key, collection=None):
+        record = await real_get(key, collection=collection)
+        if not loading.is_set():
+            loading.set()
+            await release.wait()
+        return record
+
+    monkeypatch.setattr(ur._store, "get", slow_get)
+    first = asyncio.create_task(client.put(f"/ul/{handle}", content=b"abcd"))
+    await asyncio.wait_for(loading.wait(), 5)
+    second = await client.put(f"/ul/{handle}", content=b"ab")
+    assert second.status_code == 409
+    release.set()
+    assert (await first).status_code == 200
+    assert len(google.requests) == 1
+    record = await _record(handle)
+    assert (record["state"], record["reqs"], record["bytes"]) == ("done", 1, 4)
+
+
+@pytest.mark.asyncio
+async def test_unexpected_failure_is_502_without_a_traceback(client, google, caplog):
+    def reply(request, body):
+        raise RuntimeError("boom " + str(request.url))
+
+    google.reply = reply
+    handle = await _handle()
+    with caplog.at_level(logging.DEBUG, logger="core.upload_relay"):
+        response = await client.put(f"/ul/{handle}", content=b"x")
+    assert response.status_code == 502
+    assert handle not in ur._in_flight
+    assert "ABCdef123_secret" not in caplog.text
+    assert (await _record(handle))["state"] == "active"
+
+
+# --- a completed link -------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_status_query_on_a_completed_link_replays_googles_reply(client, google):
+    google.reply = lambda request, body: httpx.Response(
+        201, json={"id": "FILE9"}, headers={"Content-Type": "application/json"}
+    )
+    handle = await _handle()
+    assert (await client.put(f"/ul/{handle}", content=b"abc")).status_code == 201
+    query = await client.put(
+        f"/ul/{handle}", content=b"", headers={"Content-Range": "bytes */3"}
+    )
+    assert query.status_code == 201
+    assert query.json() == {"id": "FILE9"}
+    assert query.headers["content-type"] == "application/json"
+    assert query.headers["cache-control"] == "no-store"
+    assert len(google.requests) == 1  # answered from the record, not Google
+    for other in (
+        {"content": b"x"},
+        {"content": b"", "headers": {"Content-Range": "bytes */*"}},
+        {"content": b"x", "headers": {"Content-Range": "bytes 0-0/3"}},
+    ):
+        assert (await client.put(f"/ul/{handle}", **other)).status_code == 410
+    assert len(google.requests) == 1
+
+
 # --- lifetime ------------------------------------------------------------------------
 
 
@@ -746,6 +832,10 @@ def test_flag_on_mounts_the_route_once(relay_env):
 @pytest.mark.asyncio
 async def test_flag_off_ul_answers_as_an_unknown_path(monkeypatch):
     monkeypatch.delenv(ur.FLAG_ENV, raising=False)
+    before = list(server._additional_http_routes)
+    core_server._upload_relay_route_registered = False
+    core_server._ensure_upload_relay_route()
+    assert server._additional_http_routes == before
     transport = httpx.ASGITransport(app=server.http_app())
     async with httpx.AsyncClient(transport=transport, base_url=EXTERNAL) as http:
         ul = await http.put("/ul/" + "A" * 22, content=b"x")

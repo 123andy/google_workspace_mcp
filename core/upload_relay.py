@@ -14,11 +14,13 @@ MIME type, limits) sits in the shared KV store, Fernet-encrypted under its own
 salt. The session URL is validated when stored and again when loaded, so the
 relay can only ever reach Google's upload endpoint.
 
-Per link: one request at a time; at most ``_MAX_REQUESTS`` requests and twice
-the size cap in total; first use within ``_FIRST_USE_SECONDS``, then expiry
-slides with use up to ``_MAX_LIFETIME_SECONDS`` after minting. A completed
-upload or a Google 4xx closes the link (410). The relay answers only after
-Google has, so an upload that fails partway never looks like a success.
+Per link: one request at a time (per process); at most ``_MAX_REQUESTS``
+requests and twice the size cap in total; first use within
+``_FIRST_USE_SECONDS``, then expiry slides with use up to
+``_MAX_LIFETIME_SECONDS`` after minting. A completed upload or a Google 4xx
+closes the link (410); a status query on a completed link replays Google's
+reply. The relay answers only after Google has, so an upload that fails partway
+never looks like a success.
 
 Off by default. Off, the route is not mounted and every tool behaves exactly as
 without this module. Needs signed download links on (their external URL and
@@ -184,6 +186,17 @@ def is_valid_session_url(url: object) -> bool:
 # --- Handle store --------------------------------------------------------------------
 
 
+def _valid_mime_type(value: object) -> bool:
+    """A header-safe MIME type: printable ASCII, no spaces at the ends."""
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 255
+        and value.isascii()
+        and value.isprintable()
+        and value == value.strip()
+    )
+
+
 def _build_store():
     """Encrypted shared backend when configured, else in-process memory."""
     global _store, _store_built
@@ -225,7 +238,11 @@ async def store_session(
     session_url: str, user_email: str, mime_type: str
 ) -> Optional[str]:
     """Store a validated session URL under a fresh handle; None on any failure."""
-    if not is_valid_session_url(session_url) or not user_email:
+    if (
+        not is_valid_session_url(session_url)
+        or not user_email
+        or not _valid_mime_type(mime_type)
+    ):
         return None
     store = _build_store()
     if store is None:
@@ -270,17 +287,39 @@ async def _load(handle: str) -> Optional[dict]:
     exp, hard_exp = record.get("exp"), record.get("hard_exp")
     if not all(isinstance(v, (int, float)) for v in (exp, hard_exp)):
         return None
-    if min(exp, hard_exp) < now:
+    if min(exp, hard_exp) < now or hard_exp > now + _MAX_LIFETIME_SECONDS + 60:
         return None
     if not is_valid_session_url(record.get("gurl")):
         return None
     if not (isinstance(record.get("sub"), str) and record["sub"]):
         return None
+    if not _valid_mime_type(record.get("mt")):
+        return None
     if record.get("state") not in ("new", "active", "done", "dead"):
         return None
-    if not all(isinstance(record.get(k), int) for k in ("bytes", "reqs")):
+    counts = [record.get(k) for k in ("bytes", "reqs")]
+    if not all(
+        isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in counts
+    ):
+        return None
+    reply = record.get("reply")
+    if reply is not None and not _valid_reply(reply):
         return None
     return record
+
+
+def _valid_reply(reply: object) -> bool:
+    """Google's completion reply, kept so a caller that missed it can ask again."""
+    return (
+        isinstance(reply, dict)
+        and reply.get("status") in (200, 201)
+        and isinstance(reply.get("body"), str)
+        and len(reply["body"]) <= _MAX_RESPONSE_BYTES
+        and isinstance(reply.get("type"), str)
+        and len(reply["type"]) <= 255
+        and reply["type"].isascii()
+        and reply["type"].isprintable()
+    )
 
 
 async def _save(handle: str, record: dict) -> None:
@@ -314,7 +353,14 @@ def describe(func):
     if _DOC_FROM not in doc:
         logger.warning("%s: no return_upload_url text to update", func.__name__)
         return func
-    func.__doc__ = doc.replace(_DOC_FROM, _DOC_TO).replace(
+    doc = doc.replace(_DOC_FROM, _DOC_TO)
+    # update_drive_file: "... URL to PUT the replacement bytes to directly (...)".
+    doc = re.sub(
+        r"to(\s+)PUT the replacement bytes to directly \(no Authorization header\)",
+        r"for\1the replacement bytes (PUT, no Authorization header)",
+        doc,
+    )
+    func.__doc__ = doc.replace(
         " directly (no Authorization header)", " (no Authorization header)"
     )
     return func
@@ -438,9 +484,9 @@ async def _read_capped(response: httpx.Response) -> tuple[bytes, bool]:
     return bytes(data), True
 
 
-def _client_body(request: Request, length: int, counter: list[int]):
+def _client_body(request: Request, length: int, counter: list[int], deadline: float):
     """The caller's body as it arrives, never buffered whole; raises if it ends
-    short, runs long, or stalls."""
+    short, runs long, stalls, or is still arriving at the link's hard expiry."""
 
     async def body():
         stream = request.stream().__aiter__()
@@ -453,6 +499,8 @@ def _client_body(request: Request, length: int, counter: list[int]):
                 break
             except asyncio.TimeoutError as exc:
                 raise _ClientBodyError("client stopped sending") from exc
+            if time.time() > deadline:
+                raise _ClientBodyError("link expired mid-upload")
             if not chunk:
                 continue
             counter[0] += len(chunk)
@@ -470,10 +518,44 @@ async def serve(request: Request) -> Response:
     if not active():  # mounted only when on; stay inert if that ever changes
         return _error(404, "Not found")
     handle = request.path_params.get("handle", "")
+    if not isinstance(handle, str) or not _HANDLE_RE.fullmatch(handle):
+        return _error(403, "Invalid or expired upload link")
+    if handle in _in_flight:
+        return _error(409, "Another upload to this link is in progress")
+    # No await between the check above and this add: one relay per handle in this
+    # process, and the record is read only once the handle is held.
+    _in_flight.add(handle)
+    try:
+        return await _serve_held(handle, request)
+    finally:
+        _in_flight.discard(handle)
+
+
+def _is_status_query(request: Request) -> bool:
+    content_range = (request.headers.get("content-range") or "").strip()
+    return (
+        request.headers.get("content-length") == "0"
+        and _CONTENT_RANGE_RE.fullmatch(content_range) is not None
+        and content_range.startswith("bytes */")
+        and not content_range.endswith("/*")
+    )
+
+
+async def _serve_held(handle: str, request: Request) -> Response:
     record = await _load(handle)
     if record is None:
         return _error(403, "Invalid or expired upload link")
     if record["state"] == "done":
+        reply = record.get("reply")
+        if reply and _is_status_query(request):
+            # A caller that missed the completion reply can still learn the file id.
+            return Response(
+                content=reply["body"].encode("utf-8"),
+                status_code=reply["status"],
+                headers={**_RESPONSE_HEADERS, "Content-Type": reply["type"]}
+                if reply["type"]
+                else _RESPONSE_HEADERS,
+            )
         return _error(410, "This upload link has been used; the upload completed.")
     if record["state"] == "dead" or record["reqs"] >= _MAX_REQUESTS:
         return _error(
@@ -500,18 +582,11 @@ async def serve(request: Request) -> Response:
     if record["bytes"] + length > 2 * cap:
         return _error(413, "This link has carried its maximum total upload volume")
 
-    if handle in _in_flight:
-        return _error(409, "Another upload to this link is in progress")
-    # No await between the check above and this add: one relay per handle.
-    _in_flight.add(handle)
-    try:
-        if not await _owner_usable(record["sub"]):
-            return _error(
-                401, "The upload owner's credentials are not recoverable on this server"
-            )
-        return await _relay(handle, record, request, length, content_range)
-    finally:
-        _in_flight.discard(handle)
+    if not await _owner_usable(record["sub"]):
+        return _error(
+            401, "The upload owner's credentials are not recoverable on this server"
+        )
+    return await _relay(handle, record, request, length, content_range)
 
 
 async def _relay(
@@ -525,9 +600,10 @@ async def _relay(
     if content_range is not None:
         headers["Content-Range"] = content_range.strip()
     sent = [0]
-    content = _client_body(request, length, sent) if length else b""
+    content = _client_body(request, length, sent, record["hard_exp"]) if length else b""
     client = httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT, follow_redirects=False)
     status: Optional[int] = None
+    body, complete, google_type, google_range = b"", False, "", ""
     try:
         upstream = await client.send(
             client.build_request(
@@ -556,6 +632,9 @@ async def _relay(
     except httpx.HTTPError as exc:
         logger.warning("Upload relay: Google request failed (%s)", type(exc).__name__)
         response = _error(502, "The upload to Google failed")
+    except Exception as exc:  # never a traceback (it could carry the session URL)
+        logger.warning("Upload relay: unexpected failure (%s)", type(exc).__name__)
+        response = _error(502, "The upload to Google failed")
     else:
         response = _upstream_response(status, body, complete, google_type, google_range)
     finally:
@@ -568,6 +647,12 @@ async def _relay(
         record["state"] = "active"
     if status in (200, 201):
         record["state"] = "done"
+        if complete:
+            record["reply"] = {
+                "status": status,
+                "body": body.decode("utf-8", errors="replace"),
+                "type": google_type if _valid_mime_type(google_type) else "",
+            }
     elif status is not None and _closes_link(status):
         record["state"] = "dead"
     record["exp"] = min(now + _IDLE_SECONDS, record["hard_exp"])

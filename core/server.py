@@ -534,7 +534,7 @@ def _ensure_upload_relay_route() -> None:
     global _upload_relay_route_registered
     from core import upload_relay
 
-    if _upload_relay_route_registered or not upload_relay.flag_set():
+    if _upload_relay_route_registered or not upload_relay.active():
         return
     server.custom_route(upload_relay.ROUTE_PATH, methods=["PUT", "POST"])(
         upload_relay.serve

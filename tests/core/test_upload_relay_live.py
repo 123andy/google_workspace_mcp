@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import json
 import socket
+import time
 import tracemalloc
 from unittest.mock import Mock
 
@@ -252,3 +253,52 @@ async def test_google_never_answering_is_504(live, monkeypatch):
         response = await http.put(url, content=b"x" * 1000)
     assert response.status_code == 504
     assert (await ur._load(handle))["state"] == "active"
+
+
+async def _start_raw_put(port, path, length):
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(
+        f"PUT {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        f"Content-Length: {length}\r\n\r\n".encode()
+    )
+    writer.write(b"q" * 65536)
+    await writer.drain()
+    return reader, writer
+
+
+@pytest.mark.asyncio
+async def test_client_that_stalls_mid_body_is_cut_off(live, monkeypatch):
+    google, url, handle, port = live
+    google.mode = "watch"
+    monkeypatch.setattr(ur, "_CLIENT_IDLE_SECONDS", 1.0)
+    path = url.split(f":{port}", 1)[1]
+    reader, writer = await _start_raw_put(port, path, MIB)
+    try:
+        status_line = await asyncio.wait_for(reader.readline(), 10)
+        assert status_line.startswith(b"HTTP/1.1 400")
+        await asyncio.wait_for(google.peer_vanished.wait(), 10)
+    finally:
+        writer.transport.abort()
+    assert not ur._in_flight
+    assert (await ur._load(handle))["state"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_body_still_arriving_at_the_hard_expiry_is_cut_off(live):
+    google, url, handle, port = live
+    google.mode = "watch"
+    record = await ur._store.get(handle, collection=ur._COLLECTION)
+    record["hard_exp"] = record["exp"] = time.time() + 1.0
+    await ur._store.put(handle, record, collection=ur._COLLECTION)
+    path = url.split(f":{port}", 1)[1]
+    reader, writer = await _start_raw_put(port, path, MIB)
+    try:
+        await asyncio.sleep(1.5)
+        writer.write(b"q" * 65536)
+        await writer.drain()
+        status_line = await asyncio.wait_for(reader.readline(), 10)
+        assert status_line.startswith(b"HTTP/1.1 400")
+        await asyncio.wait_for(google.peer_vanished.wait(), 10)
+    finally:
+        writer.transport.abort()
+    assert not ur._in_flight
