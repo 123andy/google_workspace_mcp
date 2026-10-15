@@ -76,6 +76,10 @@ def test_session_url_accepts_googles_upload_endpoint(url):
         "https://www.googleapis.com/drive/v3/files?upload_id=X",
         "https://www.googleapis.com/upload/storage/v1/b/x/o?upload_id=X",
         "https://www.googleapis.com/upload/drive/v3/files/../../../evil?upload_id=X",
+        # Not normalised by httpx, so only the ".." check refuses these.
+        "https://www.googleapis.com/upload/drive/v3/files/%2e%2e/%2e%2e/x?upload_id=X",
+        "https://www.googleapis.com/upload/drive/v3/files/%2E%2E/x?upload_id=X",
+        "https://www.googleapis.com/upload/drive/v3/files/.%2e/x?upload_id=X",
         "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable",
         "https://www.googleapis.com/upload/drive/v3/files?upload_id=",
         "https://www.googleapis.com/upload/drive/v3/files?upload_id=" + "x" * 5000,
