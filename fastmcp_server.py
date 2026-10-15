@@ -88,9 +88,10 @@ install_noisy_log_filters()
 
 # Same entrypoint rule as the file limits above: refuse to start with signed
 # download URLs on but unservable (this entrypoint is always streamable-http).
-from core import signed_downloads
+from core import signed_downloads, upload_relay
 
 signed_downloads.validate_startup("streamable-http")
+upload_relay.validate_startup("streamable-http")
 
 if _fastmcp_cloud_overrides:
     for key, previous, new_value in _fastmcp_cloud_overrides:
