@@ -426,6 +426,17 @@ async def test_status_query_without_range_and_a_bad_range_is_dropped(client, goo
 
 
 @pytest.mark.asyncio
+async def test_status_query_without_a_size_says_what_is_missing(client, google):
+    handle = await _handle()
+    response = await client.put(
+        f"/ul/{handle}", content=b"", headers={"Content-Range": "bytes */*"}
+    )
+    assert response.status_code == 400
+    assert "bytes */<total size>" in response.json()["error"]
+    assert google.requests == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "content_range, body, status",
     [
@@ -754,7 +765,26 @@ async def test_status_query_on_a_completed_link_replays_googles_reply(client, go
         {"content": b"", "headers": {"Content-Range": "bytes */*"}},
         {"content": b"x", "headers": {"Content-Range": "bytes 0-0/3"}},
     ):
-        assert (await client.put(f"/ul/{handle}", **other)).status_code == 410
+        closed = await client.put(f"/ul/{handle}", **other)
+        assert closed.status_code == 410
+        # A caller that lost the 201 must not upload a second copy.
+        message = closed.json()["error"]
+        assert "completed; do not upload again" in message
+        assert "'Content-Range: bytes */<total size>'" in message
+    assert len(google.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_completed_link_without_a_kept_reply_says_so(client, google):
+    google.reply = lambda request, body: httpx.Response(200, content=b"x" * 70_000)
+    handle = await _handle()
+    assert (await client.put(f"/ul/{handle}", content=b"abc")).status_code == 200
+    query = await client.put(
+        f"/ul/{handle}", content=b"", headers={"Content-Range": "bytes */3"}
+    )
+    assert query.status_code == 410
+    assert "do not upload again" in query.json()["error"]
+    assert "not kept" in query.json()["error"]
     assert len(google.requests) == 1
 
 
@@ -913,6 +943,9 @@ async def test_offer_returns_a_link_on_this_server(relay_env):
     assert "googleapis.com" not in text and "upload_id" not in text
     assert "100 MiB" in text and "15 minutes" in text and "2 hours" in text
     assert "--fail-with-body" in text and "Content-Type: application/pdf" in text
+    assert "at most 50 requests" in text
+    assert "if its body says the upload completed, do not upload again" in text
+    assert "the same query returns the file's metadata again" in text
     handle = text.split("/ul/")[1].split()[0].strip("'")
     assert (await ur._load(handle))["mt"] == "application/pdf"
 
