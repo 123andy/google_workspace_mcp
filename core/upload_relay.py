@@ -439,7 +439,8 @@ async def offer_result(
         "Send the bytes with a single PUT, e.g.:\n"
         "  curl --fail-with-body -w '\\nHTTP %{http_code}\\n' "
         f"-H 'Content-Type: {mime_type}' --upload-file \"/path/to/file\" '{url}'\n\n"
-        f"The file may be at most {_size_text(cap)}. Content-Length is required "
+        f"The file may be at most {_size_text(cap)}; for a larger file do not try, "
+        f"{_MANUAL_UPLOAD} Content-Length is required "
         "(curl sends it for a regular file; chunked bodies get 411). Success is "
         "HTTP 200 or 201 with the file's metadata as JSON (including its id); the "
         "file is created or updated only then. Start within "
@@ -471,6 +472,22 @@ def _error(status: int, message: str) -> Response:
     )
 
 
+_MANUAL_UPLOAD = (
+    "ask the user to upload the file to Drive themselves (drive.google.com, "
+    "New > File upload, or the Drive desktop app) and to share the file or its "
+    "link with you."
+)
+
+
+def _too_large(cap: int) -> Response:
+    return _error(
+        413,
+        f"The file is larger than this server's upload limit of {_size_text(cap)}. "
+        "Do not retry this upload or request another link for this file; "
+        + _MANUAL_UPLOAD,
+    )
+
+
 _FIND_IT = "find the file in Drive by name."
 _COMPLETED = "The upload completed; do not upload again."
 _OWNER_UNUSABLE = "The upload owner's credentials are not recoverable on this server"
@@ -489,7 +506,7 @@ def _check_content_range(value: str, length: int, cap: int) -> Optional[Response
         return _error(400, "Malformed Content-Range")
     start, end, total = match.groups()
     if total != "*" and int(total) > cap:
-        return _error(413, f"File exceeds this server's upload limit of {cap} bytes")
+        return _too_large(cap)
     if start is None:
         # Status query: "bytes */total" carries no body.
         if total == "*":
@@ -501,7 +518,7 @@ def _check_content_range(value: str, length: int, cap: int) -> Optional[Response
     if last < first or (total != "*" and last >= int(total)):
         return _error(400, "Content-Range is inconsistent")
     if last >= cap:
-        return _error(413, f"File exceeds this server's upload limit of {cap} bytes")
+        return _too_large(cap)
     if length != last - first + 1:
         return _error(400, "Content-Length does not match Content-Range")
     return None
@@ -617,7 +634,7 @@ async def _serve_held(handle: str, request: Request) -> Response:
     length = int(raw_length)
     cap = max_bytes()
     if length > cap:
-        return _error(413, f"File exceeds this server's upload limit of {cap} bytes")
+        return _too_large(cap)
     content_range = request.headers.get("content-range")
     if content_range is None and length == 0:
         # Google would take a bare empty PUT as the whole file and complete it.
@@ -632,7 +649,12 @@ async def _serve_held(handle: str, request: Request) -> Response:
         if problem is not None:
             return problem
     if record["bytes"] + length > 2 * cap:
-        return _error(413, "This link has carried its maximum total upload volume")
+        return _error(
+            413,
+            "This link has carried its maximum total upload volume. If the file is "
+            "within the size limit, call the tool again for a new link; otherwise "
+            + _MANUAL_UPLOAD,
+        )
 
     if not await _owner_usable(record["sub"]):
         return _error(401, _OWNER_UNUSABLE)
