@@ -156,6 +156,34 @@ async def test_unsafe_resource_name_is_refused_before_minting(signed_env):
     offer.assert_not_called()
 
 
+def _nameless_service():
+    service = chat_service(resource_name=None)
+    message = service.spaces().messages().get().execute.return_value
+    del message["attachment"][0]["name"]
+    return service
+
+
+@pytest.mark.asyncio
+async def test_attachment_without_any_resource_name_is_an_error(signed_env):
+    with patch.object(sd, "offer_url") as offer:
+        text = await call_tool(service=_nameless_service())
+
+    assert text == (
+        "Error: cannot offer attachment 'report.pdf': it has no resource name."
+    )
+    offer.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_attachment_without_any_resource_name_unchanged_when_off(
+    signed_env, monkeypatch
+):
+    monkeypatch.delenv("WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS", raising=False)
+    text = await call_tool(service=_nameless_service())
+
+    assert text == "No resource name available for attachment 'report.pdf'."
+
+
 @pytest.mark.asyncio
 async def test_drive_file_attachment_is_an_error_and_mints_no_link(signed_env):
     with patch.object(sd, "offer_url") as offer:
