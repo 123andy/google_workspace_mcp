@@ -28,7 +28,7 @@ from mcp.types import (
 
 from auth.service_decorator import require_google_service
 from auth.oauth_config import is_stateless_mode
-from core import download_handles, signed_downloads
+from core import download_handles, signed_downloads, upload_relay
 from core.attachment_storage import get_attachment_storage, get_attachment_url
 from core.file_limits import (
     FileTooLargeError,
@@ -94,11 +94,11 @@ from gdrive.drive_helpers import (
     resolve_drive_item,
     resolve_file_type_mime,
     resolve_folder_id,
-    resumable_upload_result,
     share_restriction_doc_note,
     share_restriction_message,
     upload_url_hint,
     upload_url_not_offered_error,
+    upload_url_result,
     validate_existing_permission_target,
     validate_expiration_time,
     validate_share_role,
@@ -959,6 +959,7 @@ async def create_drive_folder(
 @hide_remote_only_args("return_upload_url")
 @handle_http_errors("create_drive_file", service_type="drive")
 @require_google_service("drive", "drive_file")
+@upload_relay.describe
 async def create_drive_file(
     service,
     user_google_email: str,
@@ -1043,11 +1044,12 @@ async def create_drive_file(
             },
         )
         logger.info("[create_drive_file] Returned resumable upload URL.")
-        return resumable_upload_result(
+        return await upload_url_result(
             f"Resumable upload session created for new file '{file_name}' "
             f"(folder '{folder_id}', for {user_google_email}).",
             upload_url,
             mime_type,
+            user_google_email,
         )
 
     mime_type = mime_type or "text/plain"
@@ -1344,6 +1346,7 @@ async def create_drive_file(
 @hide_remote_only_args("return_upload_url")
 @handle_http_errors("import_to_google_doc", service_type="drive")
 @require_google_service("drive", "drive_file")
+@upload_relay.describe
 async def import_to_google_doc(
     service,
     user_google_email: str,
@@ -1431,6 +1434,7 @@ async def import_to_google_doc(
 @hide_remote_only_args("return_upload_url")
 @handle_http_errors("import_to_google_slides", service_type="drive")
 @require_google_service("drive", "drive_file")
+@upload_relay.describe
 async def import_to_google_slides(
     service,
     user_google_email: str,
@@ -1511,6 +1515,7 @@ async def import_to_google_slides(
 @hide_remote_only_args("return_upload_url")
 @handle_http_errors("import_to_google_sheets", service_type="drive")
 @require_google_service("drive", "drive_file")
+@upload_relay.describe
 async def import_to_google_sheets(
     service,
     user_google_email: str,
@@ -1872,6 +1877,7 @@ async def check_drive_file_public_access(
 @hide_remote_only_args("return_upload_url")
 @handle_http_errors("update_drive_file", is_read_only=False, service_type="drive")
 @require_google_service("drive", "drive_file")
+@upload_relay.describe
 async def update_drive_file(
     service,
     user_google_email: str,
@@ -2150,11 +2156,12 @@ async def update_drive_file(
             },
         )
         logger.info(f"[update_drive_file] Returned resumable upload URL for {file_id}.")
-        return resumable_upload_result(
+        return await upload_url_result(
             "Resumable upload session created to replace the content of "
             f"'{current_file.get('name', file_id)}' (ID {file_id}, for {user_google_email}).",
             upload_url,
             upload_mime,
+            user_google_email,
         )
 
     # Native Google files take replacement content through Drive's import conversion
