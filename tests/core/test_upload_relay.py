@@ -466,6 +466,28 @@ async def test_over_cap_is_413_before_google(client, google, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["PUT", "POST"])
+async def test_empty_body_without_content_range_is_400_before_google(
+    client, google, method
+):
+    """Sent on, an empty PUT would complete the session as an empty file (for
+    update_drive_file: blank the file)."""
+    handle = await _handle()
+    response = await client.request(method, f"/ul/{handle}", content=b"")
+    assert response.status_code == 400
+    assert "Content-Range" in response.json()["error"]
+    assert google.requests == []
+    record = await _record(handle)
+    assert (record["state"], record["reqs"]) == ("new", 0)
+    # The status query form is still relayed.
+    google.reply = lambda request, body: httpx.Response(308)
+    query = await client.put(
+        f"/ul/{handle}", content=b"", headers={"Content-Range": "bytes */10"}
+    )
+    assert query.status_code == 308 and len(google.requests) == 1
+
+
+@pytest.mark.asyncio
 async def test_chunked_body_is_411(client, google):
     handle = await _handle()
 
