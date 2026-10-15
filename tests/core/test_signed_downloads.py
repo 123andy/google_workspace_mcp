@@ -666,6 +666,16 @@ class TestUsability:
         # 300 s on the clock: usable for 75 s, URL gets 45 s.
         assert sd.clamp_ttl(self._creds(300), now=self.NOW) == 300 - 225 - 30
 
+    def test_a_longer_cap_still_ends_before_usability(self):
+        creds = self._creds(3600)
+        assert sd.clamp_ttl(creds, now=self.NOW, max_seconds=7200) == 3600 - 225 - 30
+        assert (
+            sd.clamp_ttl(
+                self._creds(-3600, refresh_token="1//r"), now=self.NOW, max_seconds=7200
+            )
+            == 7200
+        )
+
     @pytest.mark.parametrize("seconds", [-120, 0, 200, 255])
     def test_inside_threshold_or_margin_is_non_positive(self, seconds):
         assert sd.clamp_ttl(self._creds(seconds), now=self.NOW) <= 0

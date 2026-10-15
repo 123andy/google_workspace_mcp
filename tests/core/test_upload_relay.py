@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
@@ -285,6 +286,12 @@ async def test_poisoned_or_expired_records_are_unknown(relay_env, change):
 )
 async def test_store_refuses_a_mime_type_unfit_for_a_header(relay_env, mime):
     assert await ur.store_session(GURL, USER, mime) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lifetime", [0, -1, ur._MAX_LIFETIME_SECONDS + 1])
+async def test_store_refuses_a_lifetime_outside_the_hard_limit(relay_env, lifetime):
+    assert await ur.store_session(GURL, USER, "a/b", lifetime=lifetime) is None
 
 
 @pytest.mark.asyncio
@@ -1006,6 +1013,75 @@ async def test_offer_fails_loud_when_the_route_could_not_serve_the_owner(
     assert "googleapis.com" not in text and "/ul/" not in text
     store.assert_not_called()
     sd._recover_credentials.assert_called_once_with(USER)
+
+
+def _expiring(seconds_usable):
+    """Credentials with no refresh token, usable by the route for this long."""
+    expiry = datetime.now(timezone.utc).replace(tzinfo=None) + (
+        sd.REFRESH_THRESHOLD + timedelta(seconds=seconds_usable)
+    )
+    return Credentials(token="t", expiry=expiry)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("usable", [2, ur._FIRST_USE_SECONDS + 20])
+async def test_offer_refuses_credentials_that_end_before_the_link_could_be_used(
+    relay_env, monkeypatch, usable
+):
+    """A link must not outlive the owner's credentials (the route would 401 every
+    PUT), and needs at least its first-use window on them."""
+    monkeypatch.setattr(
+        sd, "_recover_credentials", Mock(return_value=_expiring(usable))
+    )
+    store = AsyncMock()
+    monkeypatch.setattr(ur, "store_session", store)
+    text = await ur.offer_result("Summary.", GURL, "application/pdf", USER)
+    assert text.startswith("Error: no upload URL could be issued")
+    assert "/ul/" not in text
+    store.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_offer_caps_the_link_to_credentials_that_cannot_be_refreshed(
+    relay_env, monkeypatch
+):
+    usable = 40 * 60
+    monkeypatch.setattr(
+        sd, "_recover_credentials", Mock(return_value=_expiring(usable))
+    )
+    before = time.time()
+    text = await ur.offer_result("Summary.", GURL, "application/pdf", USER)
+    handle = text.split("/ul/")[1].split()[0].strip("'")
+    record = await ur._load(handle)
+    # Ends with /dl/'s margin before the route would stop accepting the owner.
+    assert record["hard_exp"] == pytest.approx(
+        before + usable - sd._EXPIRY_MARGIN_SECONDS, abs=3
+    )
+    assert record["exp"] == pytest.approx(before + ur._FIRST_USE_SECONDS, abs=3)
+    assert "for at most 39 minutes" in text and "2 hours" not in text
+    assert "15 minutes" in text
+
+
+@pytest.mark.asyncio
+async def test_offer_with_refreshable_credentials_gets_the_full_lifetime(
+    relay_env, monkeypatch
+):
+    creds = _expiring(-3600)
+    creds = Credentials(
+        token="t",
+        refresh_token="r",
+        token_uri="https://oauth2.example.com/token",
+        client_id="c",
+        client_secret="s",
+        expiry=creds.expiry,
+    )
+    monkeypatch.setattr(sd, "_recover_credentials", Mock(return_value=creds))
+    before = time.time()
+    text = await ur.offer_result("Summary.", GURL, "application/pdf", USER)
+    handle = text.split("/ul/")[1].split()[0].strip("'")
+    record = await ur._load(handle)
+    assert record["hard_exp"] == pytest.approx(before + ur._MAX_LIFETIME_SECONDS, abs=3)
+    assert "for at most 2 hours" in text
 
 
 @pytest.mark.asyncio
