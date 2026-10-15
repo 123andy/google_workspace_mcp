@@ -211,12 +211,17 @@ def usable_seconds(
     return (expiry - REFRESH_THRESHOLD - ref).total_seconds()
 
 
-def clamp_ttl(credentials: Credentials, *, now: Optional[datetime] = None) -> int:
-    """URL lifetime that ends before the credentials stop being usable; <= 0 means
-    do not mint. Deliberately not floored: a minimum would let a URL outlive the
-    credentials that serve it."""
+def clamp_ttl(
+    credentials: Credentials,
+    *,
+    now: Optional[datetime] = None,
+    max_seconds: int = URL_TTL_SECONDS,
+) -> int:
+    """Link lifetime (at most ``max_seconds``) that ends before the credentials
+    stop being usable; <= 0 means do not mint. Deliberately not floored: a
+    minimum would let a link outlive the credentials that serve it."""
     left = usable_seconds(credentials, now=now) - _EXPIRY_MARGIN_SECONDS
-    return int(min(URL_TTL_SECONDS, left))
+    return int(min(max_seconds, left))
 
 
 def format_ttl(seconds: float) -> str:

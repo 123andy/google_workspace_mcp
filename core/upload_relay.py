@@ -17,9 +17,11 @@ relay can only ever reach Google's upload endpoint.
 Per link: one request at a time (per process); at most ``_MAX_REQUESTS``
 requests and twice the size cap in total; first use within
 ``_FIRST_USE_SECONDS``, then expiry slides with use up to
-``_MAX_LIFETIME_SECONDS`` after minting. A completed upload or a Google 4xx
-closes the link (410); a status query on a completed link replays Google's
-reply. The relay answers only after Google has, so an upload that fails partway
+``_MAX_LIFETIME_SECONDS`` after minting, or less where the owner's credentials
+cannot be refreshed: like a ``/dl/`` URL, the link ends before they do, and it
+is not issued with less than the first-use window left. A completed upload or
+a Google 4xx closes the link (410); a status query on a completed link replays
+Google's reply. The relay answers only after Google has, so an upload that fails partway
 never looks like a success.
 
 Off by default. Off, the route is not mounted and every tool behaves exactly as
@@ -237,13 +239,19 @@ def _build_store():
 
 
 async def store_session(
-    session_url: str, user_email: str, mime_type: str
+    session_url: str,
+    user_email: str,
+    mime_type: str,
+    *,
+    lifetime: int = _MAX_LIFETIME_SECONDS,
 ) -> Optional[str]:
-    """Store a validated session URL under a fresh handle; None on any failure."""
+    """Store a validated session URL under a fresh handle that dies ``lifetime``
+    seconds from now (at most ``_MAX_LIFETIME_SECONDS``); None on any failure."""
     if (
         not is_valid_session_url(session_url)
         or not user_email
         or not _valid_mime_type(mime_type)
+        or not 0 < lifetime <= _MAX_LIFETIME_SECONDS
     ):
         return None
     store = _build_store()
@@ -255,16 +263,14 @@ async def store_session(
         "gurl": session_url,
         "sub": user_email,
         "mt": mime_type,
-        "exp": now + _FIRST_USE_SECONDS,
-        "hard_exp": now + _MAX_LIFETIME_SECONDS,
+        "exp": now + min(_FIRST_USE_SECONDS, lifetime),
+        "hard_exp": now + lifetime,
         "state": "new",
         "bytes": 0,
         "reqs": 0,
     }
     try:
-        await store.put(
-            handle, record, collection=_COLLECTION, ttl=_MAX_LIFETIME_SECONDS
-        )
+        await store.put(handle, record, collection=_COLLECTION, ttl=lifetime)
     except Exception as exc:
         logger.warning("Failed to store upload handle: %s", type(exc).__name__)
         return None
@@ -397,6 +403,16 @@ def _size_text(n: int) -> str:
     return f"{mib:g} MiB" if mib >= 1 else f"{n} bytes"
 
 
+def _lifetime_text(seconds: int) -> str:
+    if seconds >= _MAX_LIFETIME_SECONDS:
+        return f"{_MAX_LIFETIME_SECONDS // 3600} hours"
+    # Rounded down: the text never promises more than the link has.
+    return (
+        f"{seconds // 60} minutes (the access token this server holds for you "
+        "cannot be refreshed and runs out then)"
+    )
+
+
 async def offer_result(
     summary: str, session_url: str, mime_type: str, user_email: str
 ) -> str:
@@ -405,17 +421,18 @@ async def offer_result(
     reason = _unavailable_reason()
     if reason:
         return _error_text(reason)
-    # The route makes the same check per request; a link it would refuse is no link.
-    if not await _owner_usable(user_email):
+    # The route checks the owner per request; a link it would refuse is no link.
+    lifetime = await _owner_lifetime(user_email)
+    if lifetime < _FIRST_USE_SECONDS:
         return _error_text(
             "this server could not recover usable credentials for you (none "
-            "stored here, or an access token about to expire with no refresh "
-            "token), and the upload link needs them"
+            "stored here, or an access token too close to expiry for an upload, "
+            "with no refresh token), and the upload link needs them"
         )
     if not is_valid_session_url(session_url):
         logger.warning("Upload session URL failed validation; not offered.")
         return _error_text("Google returned an unexpected upload session URL")
-    handle = await store_session(session_url, user_email, mime_type)
+    handle = await store_session(session_url, user_email, mime_type, lifetime=lifetime)
     if handle is None:
         return _error_text("the upload link could not be stored")
     url = f"{signed_downloads._base_url()}/ul/{handle}"
@@ -431,8 +448,8 @@ async def offer_result(
         "HTTP 200 or 201 with the file's metadata as JSON (including its id); the "
         "file is created or updated only then. Start within "
         f"{_FIRST_USE_SECONDS // 60} minutes; the link then stays valid while in "
-        f"use, for at most {_MAX_LIFETIME_SECONDS // 3600} hours, and closes once "
-        "the upload completes. If a PUT is cut off or its reply is lost, send a PUT "
+        f"use, for at most {_lifetime_text(lifetime)}, and closes once the upload "
+        "completes. If a PUT is cut off or its reply is lost, send a PUT "
         "with 'Content-Range: bytes */<total size>' and 'Content-Length: 0': a 308 "
         "reply's Range header shows the bytes received (none if absent), so send "
         "the rest with Content-Range; after a completed upload the same query "
@@ -478,6 +495,18 @@ def _check_content_range(value: str, length: int, cap: int) -> Optional[Response
     if length != last - first + 1:
         return _error(400, "Content-Length does not match Content-Range")
     return None
+
+
+async def _owner_lifetime(user_email: str) -> int:
+    """Seconds a new link may live on the owner's credentials, clamped as
+    ``/dl/`` clamps its URLs so the link ends before the route would refuse
+    the owner; <= 0 when they are unrecoverable or unusable."""
+    credentials = await asyncio.to_thread(
+        signed_downloads._recover_credentials, user_email
+    )
+    if credentials is None:
+        return 0
+    return signed_downloads.clamp_ttl(credentials, max_seconds=_MAX_LIFETIME_SECONDS)
 
 
 async def _owner_usable(user_email: str) -> bool:

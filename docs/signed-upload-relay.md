@@ -78,6 +78,7 @@ curl --fail-with-body -w '\nHTTP %{http_code}\n' \
 | --- | --- |
 | Time to first use | 15 minutes |
 | Expiry after use | 15 minutes after the last request, never more than 2 hours after minting (a body still arriving then is cut off) |
+| Owner without a refresh token | the link ends 30 s before the owner's access token stops being usable here, if that is sooner than 2 hours (the tool result gives the shorter limit); with under 15 minutes of it left, no link is issued |
 | Requests | 50, status queries included |
 | Bytes in total | twice the size cap |
 | Concurrency | one request at a time per server instance (`409` for a second); see [More than one instance](#more-than-one-instance) |
