@@ -75,7 +75,8 @@ _store_built = False
 
 
 def flag_set() -> bool:
-    return os.getenv(FLAG_ENV, "false").strip().lower() == "true"
+    # Parsed exactly like the signed-download flag it depends on.
+    return os.getenv(FLAG_ENV, "false").lower() == "true"
 
 
 def active() -> bool:
