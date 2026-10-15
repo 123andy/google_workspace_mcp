@@ -178,6 +178,7 @@ def is_valid_session_url(url: object) -> bool:
         or parsed.fragment
     ):
         return False
+    # httpx removes literal dot segments but keeps %2e%2e, which .path decodes.
     path = parsed.path
     if not path.startswith("/upload/drive/v3/files") or ".." in path:
         return False
