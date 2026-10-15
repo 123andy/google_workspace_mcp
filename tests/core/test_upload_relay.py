@@ -390,6 +390,14 @@ async def test_google_response_headers_are_allowlisted(client, google):
     assert "LEAK" not in str(response.headers)
 
 
+@pytest.mark.parametrize(
+    "google_type", [" application/json", "application/json ", "a/\u00e9", "a\tb"]
+)
+def test_a_google_type_unfit_for_a_header_is_dropped(google_type):
+    response = ur._upstream_response(200, b"{}", True, google_type, "")
+    assert "content-type" not in response.headers
+
+
 @pytest.mark.asyncio
 async def test_oversized_google_reply_is_not_relayed(client, google):
     google.reply = lambda request, body: httpx.Response(200, content=b"x" * 70_000)
