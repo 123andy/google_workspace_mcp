@@ -29,6 +29,7 @@ from googleapiclient.http import HttpRequest, MediaIoBaseDownload, MediaIoBaseUp
 
 from auth.service_decorator import require_google_service
 from core.attachment_storage import resolve_local_attachment
+from core import upload_relay
 from core.file_limits import download_media_bytes
 from core.http_utils import (
     PrivateHostError,
@@ -1089,10 +1090,26 @@ def upload_url_not_offered_error(routes: tuple[str, ...]) -> UserInputError:
 
 def upload_url_hint(type_param: str) -> str:
     """Point a refusal at ``return_upload_url``, naming the tool's ``type_param``."""
+    target = (
+        "the upload URL it returns on this server"
+        if upload_relay.active()
+        else "the URL it returns"
+    )
     return (
         "If the file is on the caller's machine, call this tool again with "
-        f"return_upload_url=true and {type_param}, then PUT the bytes to the URL it "
-        "returns."
+        f"return_upload_url=true and {type_param}, then PUT the bytes to {target}."
+    )
+
+
+async def upload_url_result(
+    summary: str, upload_url: str, mime_type: str, user_google_email: str
+) -> str:
+    """``resumable_upload_result``, unless signed upload links are on: then the
+    session goes behind a ``/ul/`` link on this server (``core.upload_relay``)."""
+    if not upload_relay.active():
+        return resumable_upload_result(summary, upload_url, mime_type)
+    return await upload_relay.offer_result(
+        summary, upload_url, mime_type, user_google_email
     )
 
 
@@ -1792,12 +1809,13 @@ async def _import_with_conversion(
             },
         )
         logger.info(f"[{tool_name}] Returned resumable upload URL.")
-        return resumable_upload_result(
+        return await upload_url_result(
             f"Resumable upload session created to import '{doc_name}' as {target_label} "
             f"({source_mime_type} → {target_mime_type}, folder '{folder_id}', "
             f"for {user_google_email}).",
             upload_url,
             source_mime_type,
+            user_google_email,
         )
 
     media, source_mime_type, remote_file_data = await _resolve_import_media(
