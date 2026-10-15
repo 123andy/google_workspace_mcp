@@ -62,7 +62,8 @@ for n in 2 20 50 101; do dd if=/dev/urandom of=${n}m.bin bs=1048576 count=$n; do
    curl $K --fail-with-body -w '\nHTTP %{http_code} %{time_total}s\n' \
      -H 'Content-Type: application/octet-stream' --upload-file 2m.bin "$UL"
    ```
-   Expect `200`/`201` and the file's JSON (with `id`); the same PUT again gives `410`, and a status
+   Expect `200`/`201` and the file's JSON (with `id`); the same PUT again gives `410` (body: the
+   upload completed, do not upload again), and a status
    query (`-X PUT -H 'Content-Length: 0' -H "Content-Range: bytes */$(wc -c < 2m.bin)"`) replays
    the JSON.
 3. Read it back: `get_drive_file_download_url(file_id=<id>)` returns a `/dl/` link;
@@ -91,7 +92,8 @@ for n in 2 20 50 101; do dd if=/dev/urandom of=${n}m.bin bs=1048576 count=$n; do
 8. The other tools: `import_to_google_doc(..., source_format="docx", return_upload_url=true)` with a
    real `.docx`, and `update_drive_file(file_id=..., mime_type=..., return_upload_url=true)`.
 9. Refusals on a fresh link (they do not use it up): GET → `405`; a changed handle → `403`;
-   `-H 'Transfer-Encoding: chunked'` → `411`.
+   `-H 'Transfer-Encoding: chunked'` → `411`; `-X PUT -H 'Content-Length: 0'` with no
+   `Content-Range` → `400`.
 
 ### Slow uploads through the proxy
 

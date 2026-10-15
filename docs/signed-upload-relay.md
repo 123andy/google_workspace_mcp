@@ -15,11 +15,28 @@ this server, and Google's session URL never leaves it.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `WORKSPACE_MCP_SIGNED_UPLOAD_URLS` | `false` | Turn the feature on. Needs `WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS=true` (its external-URL and key checks); the server refuses to start otherwise. Ignored (with a warning) over stdio, except that the tool descriptions, read at import, still mention the upload URL. |
+| `WORKSPACE_MCP_SIGNED_UPLOAD_URLS` | `false` | Turn the feature on. Needs `WORKSPACE_MCP_SIGNED_DOWNLOAD_URLS=true` (its external-URL and key checks); the server refuses to start otherwise. Ignored (with a warning) over stdio, where the tools return Google's URL and their descriptions say so. |
 | `WORKSPACE_MCP_SIGNED_UPLOAD_MAX_BYTES` | `104857600` (100 MiB) | Largest file one link accepts. Invalid values fail startup. |
 
-Off, nothing changes: `/ul/` is not mounted (it answers like any unknown
-path), and every tool result, description and error text is what it was.
+Off, the relay does nothing: `/ul/` is not mounted (it answers like any
+unknown path), and the upload tools return Google's session URL with the
+same result text and descriptions as a build without the relay.
+
+Changes that ship alongside it but sit behind neither setting:
+
+- `create_drive_file`'s description: `fileUrl` promises `file://` only where
+  local files are enabled, and the tool mentions upload URLs.
+- With `WORKSPACE_MCP_DISABLE_LOCAL_FILES=true`, the upload tools' refusals of
+  `file://`, localhost and private-network sources point at
+  `return_upload_url`.
+- Those localhost and private-network refusals raise `PrivateHostError`, a
+  `ValueError` subclass with the same message; tracebacks name the new class.
+- The descriptions of `download_chat_attachment`,
+  `get_drive_file_download_url` and `get_gmail_attachment_content` describe
+  the signed-link behaviour; their results with signing off are unchanged.
+- The session middleware is pure ASGI (a response body that fails midway now
+  aborts instead of ending as a clean `200`), and the access log redacts
+  capability paths (`/dl/`, `/ul/`, `/attachments/signed/`, `/auth/`).
 
 `return_upload_url` is still offered only where local file access is disabled
 (`WORKSPACE_MCP_DISABLE_LOCAL_FILES=true` or stateless mode).
@@ -36,12 +53,24 @@ curl --fail-with-body -w '\nHTTP %{http_code}\n' \
   bodies get `411`.
 - Success is `200`/`201` with Google's JSON file metadata, including `id`.
 - Resumable uploads pass through: a PUT with `Content-Range: bytes */<total>`
-  and `Content-Length: 0` asks how much arrived (`308`, with `Range` if any
-  bytes are committed), and the rest is sent with `Content-Range`.
-- `410` means the link is closed (completed, refused by Google, or used up):
-  call the tool again. After a completed upload, the status query above still
-  returns Google's completion reply (kept with the link), so a caller that
-  missed it can read the file id.
+  and `Content-Length: 0` (the status query) asks how much arrived (`308`, with
+  `Range` if any bytes are committed), and the rest is sent with
+  `Content-Range`. If an upload is cut off (dropped connection, timeout,
+  server restart), send the status query and continue from there. The total
+  must be given: `bytes */*` gets `400`.
+- An empty request must carry `Content-Range`. A bare empty PUT gets `400`:
+  Google would take it as the whole file and complete the upload empty (for
+  `update_drive_file`, blanking the file). Use the tool's inline content for
+  an empty file.
+- `410` means the link is closed. If its body says the upload completed, do
+  not upload again: the status query returns Google's completion reply (kept
+  with the link), file id included, or, where that reply could not be kept,
+  the body says to find the file by name. Otherwise (refused by Google, or
+  used up) call the tool again.
+- A link takes at most 50 requests, status queries included. A file sent in
+  `Content-Range` chunks therefore needs chunks of at least 1/50 of its size
+  on average (2 MiB for a 100 MiB file); non-final chunks must be multiples of
+  256 KiB.
 
 ## Limits per link
 
@@ -49,9 +78,9 @@ curl --fail-with-body -w '\nHTTP %{http_code}\n' \
 | --- | --- |
 | Time to first use | 15 minutes |
 | Expiry after use | 15 minutes after the last request, never more than 2 hours after minting (a body still arriving then is cut off) |
-| Requests | 50 |
+| Requests | 50, status queries included |
 | Bytes in total | twice the size cap |
-| Concurrency | one request at a time per server instance (`409` for a second) |
+| Concurrency | one request at a time per server instance (`409` for a second); see [More than one instance](#more-than-one-instance) |
 
 ## Status codes
 
@@ -59,12 +88,12 @@ curl --fail-with-body -w '\nHTTP %{http_code}\n' \
 | --- | --- |
 | `200`/`201` | Google completed the upload; body is its JSON. The link closes. |
 | `308` | Google has part of the file; `Range` says how much. |
-| `400` | Malformed `Content-Length` or `Content-Range`, or the body did not arrive as declared: cut short, more than declared, no data for 60 s, still arriving at the 2-hour limit, or a server restart mid-upload (resume with a status query). |
+| `400` | Malformed `Content-Length` or `Content-Range`, an empty request without `Content-Range`, or the body did not arrive as declared: cut short, more than declared, no data for 60 s, or still arriving at the 2-hour limit. |
 | `401` | The owner's credentials are no longer recoverable on this server. |
 | `403` | Unknown, malformed or expired handle (one generic body for all). |
 | `405` | Method other than PUT or POST (POST is sent on as PUT). |
 | `409` | Another request on this link is in progress on this server instance. |
-| `410` | Link closed: upload completed, Google answered 4xx, or 50 requests used. |
+| `410` | Link closed: upload completed (the body says so and how to read the file id), Google answered 4xx, or 50 requests used. |
 | `411` | No `Content-Length`, or a chunked body. |
 | `413` | Over the size cap (by `Content-Length` or `Content-Range`), or over the link's total. |
 | `502` | Google answered 5xx or an unexpected status, or the connection to Google failed. |
@@ -86,15 +115,17 @@ request.
 - **The relay can only reach Google's upload endpoint.** The session URL is
   validated when stored and again when loaded: `https`, host exactly
   `www.googleapis.com`, default port, no userinfo, fragment, backslash,
-  whitespace or non-ASCII, path under `/upload/drive/v3/files`, an
-  `upload_id`. Nothing in the request chooses the destination, and redirects
-  are not followed.
-- **Headers are allowlisted both ways.** Upstream gets only `Content-Length`,
-  `Content-Range` and the MIME type fixed when the link was minted; the
-  caller's `Authorization`, cookies and forwarding headers are dropped, and no
-  credential is added (the session URL authorizes itself). Back to the caller go
-  only `Content-Type` on success and a well-formed `Range` on `308`; never
-  `Location` or Google's upload-ID header.
+  whitespace or non-ASCII, path under `/upload/drive/v3/files` with no dot
+  segments (percent-encoded ones included), an `upload_id`. Nothing in the
+  request chooses the destination, and redirects are not followed.
+- **Headers are allowlisted both ways.** Upstream gets `Content-Length`,
+  `Content-Range` and the MIME type fixed when the link was minted, plus the
+  headers the HTTP client adds itself (`Host`, `User-Agent`, `Accept`,
+  `Accept-Encoding`, `Connection`). Nothing comes from the caller: its
+  `Content-Type`, `Authorization`, cookies and forwarding headers are dropped,
+  and no credential is added (the session URL authorizes itself). Back to the
+  caller go only `Content-Type` on success and a well-formed `Range` on `308`;
+  never `Location` or Google's upload-ID header.
 - **Revocation parity with `/dl/`.** Each request checks that the owner's
   credentials are still recoverable and usable here. This catches deleted or
   unrefreshable credentials, not a revocation made at Google.
@@ -108,6 +139,22 @@ request.
 - **Residual risk.** A leaked live handle lets someone write into that one
   file until the link closes or expires: the same exposure as a leaked Google
   session URL today, but bounded to 2 hours and closable.
+
+## More than one instance
+
+The one-request-per-link lock lives in each server process. With more than
+one replica, or while old and new pods overlap in a rolling update, two
+requests for the same link can run at once on different instances. Each
+reads the record, relays, and writes back its own counts, so:
+
+- the request and byte limits per link become soft (one write can overwrite
+  another's counts);
+- a write from a request that started before the upload completed can mark
+  a finished link open again, so a later PUT reaches Google's finished
+  session instead of getting `410`.
+
+Google's session still decides what is stored. Run a single replica until a
+shared lock exists; a link in use during a rollout has the same exposure.
 
 ## Running it behind a proxy
 
