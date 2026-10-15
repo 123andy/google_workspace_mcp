@@ -926,6 +926,30 @@ async def test_offer_fails_loud_on_an_unexpected_session_url(relay_env):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "creds",
+    [
+        None,  # nothing stored for the user, e.g. a service-account deployment
+        Credentials(token=None),  # no access token and no refresh token
+    ],
+    ids=["unrecoverable", "unusable"],
+)
+async def test_offer_fails_loud_when_the_route_could_not_serve_the_owner(
+    relay_env, monkeypatch, creds
+):
+    """Parity with /dl/: offer_url mints nothing the route would answer 401."""
+    monkeypatch.setattr(sd, "_recover_credentials", Mock(return_value=creds))
+    store = AsyncMock()
+    monkeypatch.setattr(ur, "store_session", store)
+    text = await ur.offer_result("Summary.", GURL, "application/pdf", USER)
+    assert text.startswith("Error: no upload URL could be issued")
+    assert "credentials" in text
+    assert "googleapis.com" not in text and "/ul/" not in text
+    store.assert_not_called()
+    sd._recover_credentials.assert_called_once_with(USER)
+
+
+@pytest.mark.asyncio
 async def test_offer_fails_loud_when_the_store_is_down(relay_env, monkeypatch):
     monkeypatch.setattr(ur._store, "put", AsyncMock(side_effect=RuntimeError("down")))
     text = await ur.offer_result("Summary.", GURL, "a/b", USER)
