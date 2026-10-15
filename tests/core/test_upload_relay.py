@@ -113,6 +113,13 @@ def test_startup_rejects_a_bad_cap(monkeypatch, raw):
         ur.validate_startup("streamable-http")
 
 
+@pytest.mark.parametrize("raw", ["true", "TRUE", "True", " true", "true ", "1", ""])
+def test_flag_parses_like_the_download_flag(monkeypatch, raw):
+    monkeypatch.setenv(ur.FLAG_ENV, raw)
+    monkeypatch.setenv(sd.FLAG_ENV, raw)
+    assert ur.flag_set() == sd._flag_set()
+
+
 def test_cap_default_and_override(monkeypatch):
     monkeypatch.delenv(ur.MAX_BYTES_ENV, raising=False)
     assert ur.max_bytes() == 100 * 1024 * 1024
