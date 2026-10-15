@@ -319,3 +319,78 @@ async def test_oversized_attachment_is_refused(app, chat_endpoint, monkeypatch):
         response = await http.get(_link())
     # The cap trips on the declared length, before any byte is sent.
     assert response.status_code == 502
+
+
+# --- sender-supplied type, and a body that never starts ------------------------
+
+
+class _TrackedStream(_Stream):
+    def __init__(self, chunks):
+        super().__init__(chunks)
+        self.closed = False
+
+    async def aclose(self):
+        self.closed = True
+
+
+def _tracked():
+    stream = _TrackedStream([PAYLOAD])
+    handler = lambda request: httpx.Response(  # noqa: E731
+        200, headers={"content-length": str(len(PAYLOAD))}, stream=stream
+    )
+    return stream, handler
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mt", ["text/plain\r\nX-Evil: 1", "image/日本", "a\tb", 7, "x" * 300]
+)
+async def test_type_unfit_for_a_header_becomes_octet_stream(chat_endpoint, mt):
+    chat_endpoint["handler"] = _ok()
+    result = await sd._fetch_chat({**CLAIMS, "mt": mt}, CREDS)
+    assert result.media_type == "application/octet-stream"
+    assert await _drain(result) == PAYLOAD
+
+
+@pytest.mark.asyncio
+async def test_link_with_an_unsafe_type_still_downloads(app, chat_endpoint):
+    client, _ = app
+    stream, chat_endpoint["handler"] = _tracked()
+    url = sd.mint_url(
+        source="chat",
+        user_email=USER,
+        ref={"rn": RN},
+        ttl_seconds=300,
+        filename="r.bin",
+        mime_type="image/日本",
+    )
+    async with client() as http:
+        response = await http.get(url)
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/octet-stream"
+    assert response.content == PAYLOAD
+    assert stream.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure", [OSError("client gone"), RuntimeError("header refused")]
+)
+async def test_upstream_is_closed_when_the_body_never_starts(
+    app, chat_endpoint, failure
+):
+    """The generator's own cleanup cannot run if it is never iterated."""
+    stream, chat_endpoint["handler"] = _tracked()
+    response = await sd.serve(_link().rsplit("/", 1)[1])
+    assert response.status_code == 200 and not stream.closed
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            raise failure
+
+    with pytest.raises(Exception):
+        await response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+    assert stream.closed
