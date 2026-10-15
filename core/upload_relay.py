@@ -20,9 +20,10 @@ requests and twice the size cap in total; first use within
 ``_MAX_LIFETIME_SECONDS`` after minting, or less where the owner's credentials
 cannot be refreshed: like a ``/dl/`` URL, the link ends before they do, and it
 is not issued with less than the first-use window left. A completed upload or
-a Google 4xx closes the link (410); a status query on a completed link replays
-Google's reply. The relay answers only after Google has, so an upload that fails partway
-never looks like a success.
+a Google 4xx closes the link (410). A completed link is kept until its hard
+expiry: a status query on it replays Google's reply, counted and owner-checked
+like any request. The relay answers only after Google has, so an upload that
+fails partway never looks like a success.
 
 Off by default. Off, the route is not mounted and every tool behaves exactly as
 without this module. Needs signed download links on (their external URL and
@@ -394,11 +395,11 @@ def _size_text(n: int) -> str:
 
 def _lifetime_text(seconds: int) -> str:
     if seconds >= _MAX_LIFETIME_SECONDS:
-        return f"{_MAX_LIFETIME_SECONDS // 3600} hours"
+        return f"{_MAX_LIFETIME_SECONDS // 3600} hours from now"
     # Rounded down: the text never promises more than the link has.
     return (
-        f"{seconds // 60} minutes (the access token this server holds for you "
-        "cannot be refreshed and runs out then)"
+        f"{seconds // 60} minutes from now (the access token this server holds "
+        "for you cannot be refreshed and runs out after that)"
     )
 
 
@@ -442,10 +443,12 @@ async def offer_result(
         "with 'Content-Range: bytes */<total size>' and 'Content-Length: 0': a 308 "
         "reply's Range header shows the bytes received (none if absent), so send "
         "the rest with Content-Range; after a completed upload the same query "
-        f"returns the file's metadata again. The link takes at most {_MAX_REQUESTS} "
-        "requests. HTTP 410 means the link is closed: if its body says the upload "
-        "completed, do not upload again; otherwise call this tool again for a new "
-        "one."
+        "returns the file's metadata again, until that time limit. The link takes "
+        f"at most {_MAX_REQUESTS} requests, status queries included. HTTP 410 "
+        "means the link is closed: if its body says the upload completed, do not "
+        "upload again; otherwise call this tool again for a new one. HTTP 403 "
+        "means the link is unknown or past its time limit: if an upload to it may "
+        "have completed, look for the file in Drive by name before uploading again."
     )
 
 
@@ -460,6 +463,18 @@ def _error(status: int, message: str) -> Response:
     return JSONResponse(
         {"error": message}, status_code=status, headers=_RESPONSE_HEADERS
     )
+
+
+_FIND_IT = "find the file in Drive by name."
+_COMPLETED = "The upload completed; do not upload again."
+_OWNER_UNUSABLE = "The upload owner's credentials are not recoverable on this server"
+# One body for unknown, malformed and expired handles. A completed link answers
+# until its hard expiry, so a caller asking later lands here.
+_UNKNOWN_LINK = (
+    "Invalid or expired upload link. If an upload to it may have completed, look "
+    "for the file in Drive by name before uploading again; otherwise call the "
+    "tool again for a new upload URL."
+)
 
 
 def _check_content_range(value: str, length: int, cap: int) -> Optional[Response]:
@@ -552,7 +567,7 @@ async def serve(request: Request) -> Response:
         return _error(404, "Not found")
     handle = request.path_params.get("handle", "")
     if not isinstance(handle, str) or not _HANDLE_RE.fullmatch(handle):
-        return _error(403, "Invalid or expired upload link")
+        return _error(403, _UNKNOWN_LINK)
     if handle in _in_flight:
         return _error(409, "Another upload to this link is in progress")
     # No await between the check above and this add: one relay per handle in this
@@ -577,30 +592,9 @@ def _is_status_query(request: Request) -> bool:
 async def _serve_held(handle: str, request: Request) -> Response:
     record = await _load(handle)
     if record is None:
-        return _error(403, "Invalid or expired upload link")
+        return _error(403, _UNKNOWN_LINK)
     if record["state"] == "done":
-        reply = record.get("reply")
-        if reply and _is_status_query(request):
-            # A caller that missed the completion reply can still learn the file id.
-            return Response(
-                content=reply["body"].encode("utf-8"),
-                status_code=reply["status"],
-                headers={**_RESPONSE_HEADERS, "Content-Type": reply["type"]}
-                if reply["type"]
-                else _RESPONSE_HEADERS,
-            )
-        if reply:
-            return _error(
-                410,
-                "The upload completed; do not upload again. For the file's metadata "
-                "(including its id), send a PUT with 'Content-Range: bytes */<total "
-                "size>' and an empty body.",
-            )
-        return _error(
-            410,
-            "The upload completed; do not upload again. Google's reply was not "
-            "kept, so find the file in Drive by name.",
-        )
+        return await _answer_done(handle, record, request)
     if record["state"] == "dead" or record["reqs"] >= _MAX_REQUESTS:
         return _error(
             410,
@@ -635,10 +629,44 @@ async def _serve_held(handle: str, request: Request) -> Response:
         return _error(413, "This link has carried its maximum total upload volume")
 
     if not await _owner_usable(record["sub"]):
-        return _error(
-            401, "The upload owner's credentials are not recoverable on this server"
-        )
+        return _error(401, _OWNER_UNUSABLE)
     return await _relay(handle, record, request, length, content_range)
+
+
+async def _answer_done(handle: str, record: dict, request: Request) -> Response:
+    """A completed link: a status query gets Google's kept reply (checked and
+    counted like any request); anything else, a 410 saying not to upload again."""
+    reply = record.get("reply")
+    if not reply:
+        return _error(410, f"{_COMPLETED} Google's reply was not kept, so {_FIND_IT}")
+    if not _is_status_query(request):
+        return _error(
+            410,
+            f"{_COMPLETED} For the file's metadata (including its id), send a PUT "
+            "with 'Content-Range: bytes */<total size>' and an empty body.",
+        )
+    if record["reqs"] >= _MAX_REQUESTS:
+        return _error(
+            410,
+            f"{_COMPLETED} The link's {_MAX_REQUESTS} requests are used, so Google's "
+            f"reply can no longer be returned: {_FIND_IT}",
+        )
+    if not await _owner_usable(record["sub"]):
+        return _error(
+            401,
+            f"{_COMPLETED} {_OWNER_UNUSABLE}, so Google's reply is not returned. "
+            "Re-authenticate through this server and ask again, or "
+            f"{_FIND_IT}",
+        )
+    record["reqs"] += 1
+    await _save(handle, record)
+    return Response(
+        content=reply["body"].encode("utf-8"),
+        status_code=reply["status"],
+        headers={**_RESPONSE_HEADERS, "Content-Type": reply["type"]}
+        if reply["type"]
+        else _RESPONSE_HEADERS,
+    )
 
 
 async def _relay(
@@ -708,7 +736,12 @@ async def _relay(
             }
     elif status is not None and _closes_link(status):
         record["state"] = "dead"
-    record["exp"] = min(now + _IDLE_SECONDS, record["hard_exp"])
+    # A completed link (and its reply) is kept until the hard expiry.
+    record["exp"] = (
+        record["hard_exp"]
+        if record["state"] == "done"
+        else min(now + _IDLE_SECONDS, record["hard_exp"])
+    )
     await _save(handle, record)
     logger.info(
         "Upload relay for %s: %d bytes, Google status %s, link %s",

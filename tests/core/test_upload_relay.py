@@ -807,6 +807,78 @@ async def test_completed_link_without_a_kept_reply_says_so(client, google):
     assert len(google.requests) == 1
 
 
+async def _complete(client, google):
+    google.reply = lambda request, body: httpx.Response(
+        201, json={"id": "FILE9"}, headers={"Content-Type": "application/json"}
+    )
+    handle = await _handle()
+    assert (await client.put(f"/ul/{handle}", content=b"abc")).status_code == 201
+    return handle
+
+
+async def _status_query(client, handle):
+    return await client.put(
+        f"/ul/{handle}", content=b"", headers={"Content-Range": "bytes */3"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_replay_checks_the_owner_like_any_other_request(
+    client, google, monkeypatch
+):
+    handle = await _complete(client, google)
+    creds = sd._recover_credentials.return_value
+    monkeypatch.setattr(sd, "_recover_credentials", Mock(return_value=None))
+    refused = await _status_query(client, handle)
+    assert refused.status_code == 401
+    assert "FILE9" not in refused.text
+    # Still tells a caller that lost the 201 not to upload a second copy.
+    assert "completed; do not upload again" in refused.json()["error"]
+    sd._recover_credentials.return_value = creds
+    assert (await _status_query(client, handle)).status_code == 201
+    assert len(google.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_replays_count_toward_the_request_limit(client, google):
+    handle = await _complete(client, google)
+    assert (await _status_query(client, handle)).status_code == 201
+    record = await _record(handle)
+    assert record["reqs"] == 2
+    record["reqs"] = ur._MAX_REQUESTS
+    await ur._store.put(handle, record, collection=ur._COLLECTION)
+    used_up = await _status_query(client, handle)
+    assert used_up.status_code == 410
+    message = used_up.json()["error"]
+    assert "completed; do not upload again" in message
+    assert "find the file in Drive by name" in message
+    assert "FILE9" not in used_up.text
+
+
+@pytest.mark.asyncio
+async def test_completed_link_answers_until_its_hard_expiry(
+    client, google, monkeypatch
+):
+    handle = await _complete(client, google)
+    record = await _record(handle)
+    assert record["exp"] == record["hard_exp"]
+    real = time.time
+    # Past the 15-minute idle window: the reply is still there.
+    monkeypatch.setattr(
+        ur, "time", type("T", (), {"time": staticmethod(lambda: real() + 3600)})
+    )
+    assert (await _status_query(client, handle)).status_code == 201
+    # Past the hard expiry: the generic 403, which says to look before re-uploading.
+    monkeypatch.setattr(
+        ur,
+        "time",
+        type("T", (), {"time": staticmethod(lambda: real() + 2 * 3600 + 5)}),
+    )
+    gone = await _status_query(client, handle)
+    assert gone.status_code == 403
+    assert "look for the file in Drive by name" in gone.json()["error"]
+
+
 # --- lifetime ------------------------------------------------------------------------
 
 
@@ -964,7 +1036,9 @@ async def test_offer_returns_a_link_on_this_server(relay_env):
     assert "--fail-with-body" in text and "Content-Type: application/pdf" in text
     assert "at most 50 requests" in text
     assert "if its body says the upload completed, do not upload again" in text
-    assert "the same query returns the file's metadata again" in text
+    assert "the same query returns the file's metadata again, until that" in text
+    assert "status queries included" in text
+    assert "look for the file in Drive by name before uploading again" in text
     handle = text.split("/ul/")[1].split()[0].strip("'")
     assert (await ur._load(handle))["mt"] == "application/pdf"
 

@@ -64,10 +64,14 @@ curl --fail-with-body -w '\nHTTP %{http_code}\n' \
   an empty file.
 - `410` means the link is closed. If its body says the upload completed, do
   not upload again: the status query returns Google's completion reply (kept
-  with the link), file id included, or, where that reply could not be kept,
-  the body says to find the file by name. Otherwise (refused by Google, or
-  used up) call the tool again.
-- A link takes at most 50 requests, status queries included. A file sent in
+  with the link until its time limit), file id included, or, where that reply
+  could not be kept, the body says to find the file by name. Otherwise
+  (refused by Google, or used up) call the tool again.
+- `403` means the handle is unknown or past its time limit. If an upload to
+  it may have completed, look for the file in Drive by name before uploading
+  again (the body says so).
+- A link takes at most 50 requests, status queries included (replays of a
+  completed upload's reply count too). A file sent in
   `Content-Range` chunks therefore needs chunks of at least 1/50 of its size
   on average (2 MiB for a 100 MiB file); non-final chunks must be multiples of
   256 KiB.
@@ -77,9 +81,9 @@ curl --fail-with-body -w '\nHTTP %{http_code}\n' \
 | Limit | Value |
 | --- | --- |
 | Time to first use | 15 minutes |
-| Expiry after use | 15 minutes after the last request, never more than 2 hours after minting (a body still arriving then is cut off) |
+| Expiry after use | 15 minutes after the last request, never more than 2 hours after minting (a body still arriving then is cut off); a completed link is kept until this hard limit |
 | Owner without a refresh token | the link ends 30 s before the owner's access token stops being usable here, if that is sooner than 2 hours (the tool result gives the shorter limit); with under 15 minutes of it left, no link is issued |
-| Requests | 50, status queries included |
+| Requests | 50, status queries and replays included |
 | Bytes in total | twice the size cap |
 | Concurrency | one request at a time per server instance (`409` for a second); see [More than one instance](#more-than-one-instance) |
 
@@ -90,11 +94,11 @@ curl --fail-with-body -w '\nHTTP %{http_code}\n' \
 | `200`/`201` | Google completed the upload; body is its JSON. The link closes. |
 | `308` | Google has part of the file; `Range` says how much. |
 | `400` | Malformed `Content-Length` or `Content-Range`, an empty request without `Content-Range`, or the body did not arrive as declared: cut short, more than declared, no data for 60 s, or still arriving at the 2-hour limit. |
-| `401` | The owner's credentials are no longer recoverable on this server. |
-| `403` | Unknown, malformed or expired handle (one generic body for all). |
+| `401` | The owner's credentials are no longer recoverable on this server. For a status query on a completed link the body also says the upload completed. |
+| `403` | Unknown, malformed or expired handle (one generic body for all, which says to look for the file by name before uploading again). |
 | `405` | Method other than PUT or POST (POST is sent on as PUT). |
 | `409` | Another request on this link is in progress on this server instance. |
-| `410` | Link closed: upload completed (the body says so and how to read the file id), Google answered 4xx, or 50 requests used. |
+| `410` | Link closed: upload completed (the body says so and how to read the file id, or to find the file by name once its 50 requests are used), Google answered 4xx, or 50 requests used. |
 | `411` | No `Content-Length`, or a chunked body. |
 | `413` | Over the size cap (by `Content-Length` or `Content-Range`), or over the link's total. |
 | `502` | Google answered 5xx or an unexpected status, or the connection to Google failed. |
@@ -127,9 +131,11 @@ request.
   and no credential is added (the session URL authorizes itself). Back to the
   caller go only `Content-Type` on success and a well-formed `Range` on `308`;
   never `Location` or Google's upload-ID header.
-- **Revocation parity with `/dl/`.** Each request checks that the owner's
-  credentials are still recoverable and usable here. This catches deleted or
-  unrefreshable credentials, not a revocation made at Google.
+- **Revocation parity with `/dl/`.** Every request that goes to Google, and
+  every replay of Google's reply, checks that the owner's credentials are
+  still recoverable and usable here. This catches deleted or unrefreshable
+  credentials, not a revocation made at Google. The `410` for a closed link
+  is not checked; it returns nothing of Google's.
 - **No false success.** The body is streamed to Google as it arrives and the
   answer goes back only after Google's. If either side drops mid-body, the
   caller gets an error, never a `200`.
