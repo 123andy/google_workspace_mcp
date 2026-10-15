@@ -404,6 +404,13 @@ async def offer_result(
     reason = _unavailable_reason()
     if reason:
         return _error_text(reason)
+    # The route makes the same check per request; a link it would refuse is no link.
+    if not await _owner_usable(user_email):
+        return _error_text(
+            "this server could not recover usable credentials for you (none "
+            "stored here, or an access token about to expire with no refresh "
+            "token), and the upload link needs them"
+        )
     if not is_valid_session_url(session_url):
         logger.warning("Upload session URL failed validation; not offered.")
         return _error_text("Google returned an unexpected upload session URL")

@@ -176,6 +176,39 @@ async def test_on_but_unusable_is_an_error_not_googles_url(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool, kwargs",
+    [
+        (create_drive_file, {"file_name": "r.pdf", "mime_type": "application/pdf"}),
+        (update_drive_file, {"file_id": "file123", "mime_type": "text/plain"}),
+        (import_to_google_doc, {"file_name": "R", "source_format": "docx"}),
+        (import_to_google_sheets, {"file_name": "R", "source_format": "csv"}),
+        (import_to_google_slides, {"file_name": "R", "source_format": "pptx"}),
+    ],
+    ids=["create", "update", "doc", "sheets", "slides"],
+)
+async def test_owner_the_route_cannot_recover_gets_an_error(
+    relay_on, folder, monkeypatch, tool, kwargs
+):
+    """E.g. a service-account deployment: the tool works with the key file, but
+    nothing is stored for the user, so every PUT to a link would be a 401."""
+    monkeypatch.setattr(sd, "_recover_credentials", Mock(return_value=None))
+    with patch(
+        "gdrive.drive_tools.resolve_drive_item",
+        AsyncMock(return_value=("file123", {"name": "N", "mimeType": "text/plain"})),
+    ):
+        text = await _unwrap(tool)(
+            service=_service(),
+            user_google_email=USER,
+            return_upload_url=True,
+            **kwargs,
+        )
+    assert text.startswith("Error: no upload URL could be issued")
+    assert "credentials" in text
+    assert "googleapis.com" not in text and "/ul/" not in text
+
+
+@pytest.mark.asyncio
 async def test_unexpected_session_url_from_google_is_an_error(relay_on, folder):
     text = await _unwrap(create_drive_file)(
         service=_service(location="https://evil.example/upload?upload_id=X"),
