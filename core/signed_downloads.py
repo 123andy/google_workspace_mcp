@@ -539,9 +539,11 @@ async def _fetch_drive(claims: dict, credentials: Credentials) -> DownloadResult
                 pending, finished = await asyncio.to_thread(next_chunk)
             except Exception as exc:
                 logger.error("Drive stream interrupted mid-download: %s", exc)
-                # Headers are out. Raising makes the server abort the chunked body
-                # without its terminating chunk, so the client sees an incomplete
-                # transfer; returning would end it cleanly as a complete file.
+                # Headers are out. Raising reaches the server, which drops the
+                # connection before the terminating chunk, so the client sees an
+                # incomplete transfer; returning would end it as a complete file.
+                # Holds only while no BaseHTTPMiddleware wraps this route (it ends
+                # the body cleanly instead): test_mcp_session_middleware_truncation.
                 raise SignedDownloadError(f"Drive stream interrupted: {exc}") from exc
 
     return DownloadResult(
