@@ -145,12 +145,26 @@ async def test_import_upload_url_is_unchanged(upload_setting, folder):
 
 @pytest.mark.asyncio
 async def test_ul_path_does_not_exist(upload_setting):
-    transport = httpx.ASGITransport(app=server.http_app())
-    async with httpx.AsyncClient(
-        transport=transport, base_url="http://testserver"
-    ) as http:
-        ul = await http.put("/ul/" + "A" * 22, content=b"x")
-        other = await http.put("/nothing-here/" + "A" * 22, content=b"x")
+    import core.server as core_server
+
+    # Newer trees mount /ul/ from configure_server_for_http; run that step too.
+    mount = getattr(core_server, "_ensure_upload_relay_route", None)
+    before = list(server._additional_http_routes)
+    try:
+        if mount is not None:
+            core_server._upload_relay_route_registered = False
+            mount()
+        assert server._additional_http_routes == before
+        transport = httpx.ASGITransport(app=server.http_app())
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as http:
+            ul = await http.put("/ul/" + "A" * 22, content=b"x")
+            other = await http.put("/nothing-here/" + "A" * 22, content=b"x")
+    finally:
+        server._additional_http_routes[:] = before
+        if mount is not None:
+            core_server._upload_relay_route_registered = False
     assert ul.status_code == 404
     assert (ul.status_code, ul.content) == (other.status_code, other.content)
 
