@@ -479,10 +479,13 @@ def _remove(name, *a, **k):
     return real_remove(name, *a, **k)
 
 provider.remove_tool = _remove
-# Next hook after the surface check; hard-exit so no server binds (main()
-# swallows ordinary exceptions).
-main.set_transport_mode = lambda *_a, **_k: os._exit(0)
-sys.argv = ["main.py", "--only-tools", "send_gmail_message"]
+# First hook after the surface check on a streamable-http run (set_transport_mode
+# runs before the tool imports); hard-exit so no server binds (main() swallows
+# ordinary exceptions).
+main.configure_server_for_http = lambda *_a, **_k: os._exit(0)
+sys.argv = [
+    "main.py", "--transport", "streamable-http", "--only-tools", "send_gmail_message"
+]
 main.main()
 """
         env = {

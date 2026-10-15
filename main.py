@@ -838,6 +838,9 @@ def main():
     if not args.permissions:
         set_permissions_mode(None)
 
+    # Before the imports: upload tool descriptions depend on the transport.
+    set_transport_mode(args.transport)
+
     loaded = []
     failed = []
     for tool in tools_to_import:

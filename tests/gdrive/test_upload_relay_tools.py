@@ -220,6 +220,14 @@ def test_hint_text_on_names_this_server(relay_on):
     assert "googleapis" not in hint
 
 
+@pytest.fixture
+def http_transport():
+    saved = get_transport_mode()
+    set_transport_mode("streamable-http")
+    yield
+    set_transport_mode(saved)
+
+
 @pytest.mark.parametrize(
     "name",
     [
@@ -230,7 +238,9 @@ def test_hint_text_on_names_this_server(relay_on):
         "import_to_google_slides",
     ],
 )
-def test_flag_on_rewrites_each_upload_tools_description(monkeypatch, name):
+def test_flag_on_rewrites_each_upload_tools_description(
+    monkeypatch, http_transport, name
+):
     """Pins the text describe() relies on, so a wording change upstream fails here
     instead of silently leaving 'a Google ... URL' in the description."""
     import gdrive.drive_tools as drive_tools
@@ -255,7 +265,87 @@ def test_flag_on_rewrites_each_upload_tools_description(monkeypatch, name):
     assert copy.__doc__.count("return_upload_url (bool)") == 1
 
 
-def test_update_description_reads_as_a_sentence(monkeypatch):
+def test_flag_on_over_stdio_leaves_the_description_alone(monkeypatch):
+    """stdio returns Google's URL, so the description must keep saying so."""
+    monkeypatch.setenv(ur.FLAG_ENV, "true")
+    saved = get_transport_mode()
+    set_transport_mode("stdio")
+    try:
+
+        def tool():
+            """return_upload_url (bool): Return a Google resumable-upload session URL."""
+
+        original = tool.__doc__
+        assert ur.describe(tool) is tool and tool.__doc__ == original
+    finally:
+        set_transport_mode(saved)
+
+
+@pytest.mark.parametrize(
+    "transport, on_this_server", [("streamable-http", True), ("stdio", False)]
+)
+def test_entrypoint_describes_the_link_only_where_it_is_issued(
+    transport, on_this_server
+):
+    """Through main.main(): the transport is set before the tools are imported."""
+    import os
+    import socket
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = str(s.getsockname()[1])
+    code = (
+        "import asyncio, sys\n"
+        "import main\n"
+        "from fastmcp import Client\n"
+        "from core.server import server\n"
+        "async def schema():\n"
+        "    async with Client(server) as client:\n"
+        "        tools = {t.name: t for t in await client.list_tools()}\n"
+        "    return str(tools['create_drive_file'].inputSchema)\n"
+        "def run(*a, **k):\n"
+        "    print('SCHEMA:' + asyncio.run(schema()))\n"
+        "server.run = run\n"
+        f"sys.argv = ['main.py', '--transport', '{transport}', '--tools', 'drive']\n"
+        "main.main()\n"
+    )
+    skip = {
+        "MCP_ENABLE_OAUTH21",
+        "EXTERNAL_OAUTH21_PROVIDER",
+        "WORKSPACE_MCP_STATELESS_MODE",
+        "MCP_SINGLE_USER_MODE",
+    }
+    env = {k: v for k, v in os.environ.items() if k not in skip}
+    env.update(
+        {
+            ur.FLAG_ENV: "true",
+            sd.FLAG_ENV: "true",
+            "WORKSPACE_EXTERNAL_URL": EXTERNAL,
+            "WORKSPACE_MCP_DISABLE_LOCAL_FILES": "true",
+            "GOOGLE_OAUTH_CLIENT_ID": "test-client-id",
+            "GOOGLE_OAUTH_CLIENT_SECRET": "test-client-secret",
+            "WORKSPACE_MCP_PORT": port,
+            "PORT": port,
+        }
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    lines = [ln for ln in result.stdout.splitlines() if ln.startswith("SCHEMA:")]
+    assert lines, result.stderr[-2000:]
+    assert ("upload URL on this server" in lines[0]) is on_this_server
+    assert (ur._DOC_FROM in lines[0]) is not on_this_server
+
+
+def test_update_description_reads_as_a_sentence(monkeypatch, http_transport):
     import gdrive.drive_tools as drive_tools
 
     fn = drive_tools.update_drive_file
