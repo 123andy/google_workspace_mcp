@@ -431,11 +431,14 @@ async def offer_result(
         "file is created or updated only then. Start within "
         f"{_FIRST_USE_SECONDS // 60} minutes; the link then stays valid while in "
         f"use, for at most {_MAX_LIFETIME_SECONDS // 3600} hours, and closes once "
-        "the upload completes. If a PUT is cut off, send a PUT with "
-        "'Content-Range: bytes */<total size>' and 'Content-Length: 0': a 308 "
-        "reply's Range header shows the bytes received (none if absent); then send "
-        "the rest with Content-Range. HTTP 410 means the link is closed: call this "
-        "tool again for a new one."
+        "the upload completes. If a PUT is cut off or its reply is lost, send a PUT "
+        "with 'Content-Range: bytes */<total size>' and 'Content-Length: 0': a 308 "
+        "reply's Range header shows the bytes received (none if absent), so send "
+        "the rest with Content-Range; after a completed upload the same query "
+        f"returns the file's metadata again. The link takes at most {_MAX_REQUESTS} "
+        "requests. HTTP 410 means the link is closed: if its body says the upload "
+        "completed, do not upload again; otherwise call this tool again for a new "
+        "one."
     )
 
 
@@ -461,7 +464,9 @@ def _check_content_range(value: str, length: int, cap: int) -> Optional[Response
         return _error(413, f"File exceeds this server's upload limit of {cap} bytes")
     if start is None:
         # Status query: "bytes */total" carries no body.
-        if total == "*" or length != 0:
+        if total == "*":
+            return _error(400, "A status query names the size: 'bytes */<total size>'")
+        if length != 0:
             return _error(400, "A Content-Range status query has no body")
         return None
     first, last = int(start), int(end)
@@ -565,7 +570,18 @@ async def _serve_held(handle: str, request: Request) -> Response:
                 if reply["type"]
                 else _RESPONSE_HEADERS,
             )
-        return _error(410, "This upload link has been used; the upload completed.")
+        if reply:
+            return _error(
+                410,
+                "The upload completed; do not upload again. For the file's metadata "
+                "(including its id), send a PUT with 'Content-Range: bytes */<total "
+                "size>' and an empty body.",
+            )
+        return _error(
+            410,
+            "The upload completed; do not upload again. Google's reply was not "
+            "kept, so find the file in Drive by name.",
+        )
     if record["state"] == "dead" or record["reqs"] >= _MAX_REQUESTS:
         return _error(
             410,
