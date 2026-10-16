@@ -174,16 +174,22 @@ bodies allowed through. For a Pomerium + nginx-ingress deployment:
    This is the same shape as the `/dl/` carve-out.
 2. **nginx ingress:** a path-scoped Ingress for `/ul/` on that host (annotations
    do not inherit from another Ingress for the same host) with
-   `proxy-body-size` above the cap plus headroom (e.g. `128m` for 100 MiB),
-   and long `proxy-read-timeout`/`proxy-send-timeout`. Leave request buffering
-   on (the default): nginx then takes the whole body from a slow client before
-   passing it on at LAN speed, at the cost of spooling it to the controller's
-   disk.
+   `proxy-body-size` above the cap plus headroom (e.g. `128m` for 100 MiB) and
+   `proxy-next-upstream: "off"` (nginx would otherwise re-send a failed PUT,
+   whole, to another replica). Leave request buffering on (the default): nginx
+   then takes the whole body from a slow client before passing it on, at the
+   cost of spooling it to the controller's disk. Timeout annotations do not
+   help: nginx's are per read or write, and the gateway's limits below fire
+   first.
 3. **Timeouts:** Pomerium's global `timeout_read` (default 30 s) bounds how
-   long a request body may take to arrive. Without nginx buffering in front,
-   a slow upload can be cut at that point; this has not been measured on a
-   live gateway. Callers can also stay under it by sending the file in
-   `Content-Range` chunks (non-final chunks multiples of 256 KiB).
+   long a request body may take to reach the backend. Measured locally: a slow
+   single-request upload direct to Pomerium was cut at 30 s, and a per-route
+   `timeout` did not change that; with nginx buffering in front the same upload
+   completed. The 30 s still covers the onward leg, because the relay streams
+   to Google as it reads: one request must get from nginx to Google within
+   about 30 s (100 MiB needs roughly 3.5 MiB/s). Callers can stay under it by
+   sending the file in `Content-Range` chunks (non-final chunks multiples of
+   256 KiB). Not yet measured on a live gateway.
 4. **Edge logs:** proxy access logs record the path, and the handle is in the
    path. Decide retention and access accordingly, or mask `/ul/` paths there.
 
