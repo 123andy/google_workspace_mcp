@@ -76,6 +76,7 @@ class WorkspaceGoogleProvider(GoogleProvider):
 _auth_provider: Optional[GoogleProvider] = None
 _oauth_client_storage = None
 _legacy_callback_registered = False
+_upload_relay_route_registered = False
 
 _READINESS_TIMEOUT_ENV = "WORKSPACE_MCP_READINESS_TIMEOUT_SECONDS"
 _DEFAULT_READINESS_TIMEOUT_SECONDS = 1.0
@@ -527,6 +528,20 @@ def _ensure_legacy_callback_route() -> None:
     _legacy_callback_registered = True
 
 
+def _ensure_upload_relay_route() -> None:
+    """Mount ``/ul/{handle}`` (core.upload_relay) only while signed upload links
+    are on; off, the path does not exist."""
+    global _upload_relay_route_registered
+    from core import upload_relay
+
+    if _upload_relay_route_registered or not upload_relay.active():
+        return
+    server.custom_route(upload_relay.ROUTE_PATH, methods=["PUT", "POST"])(
+        upload_relay.serve
+    )
+    _upload_relay_route_registered = True
+
+
 def configure_server_for_http():
     """
     Configures the authentication provider for HTTP transport.
@@ -538,6 +553,8 @@ def configure_server_for_http():
 
     if transport_mode != "streamable-http":
         return
+
+    _ensure_upload_relay_route()
 
     # Use centralized OAuth configuration
     from auth.oauth_config import get_oauth_config
@@ -850,7 +867,7 @@ async def serve_attachment(request: Request):
 
 @server.custom_route("/attachments/signed/{token}", methods=["GET"])
 async def serve_signed_attachment(request: Request):
-    """Stream a Gmail/Drive resource named by a signed capability URL; nothing is stored."""
+    """Stream a Gmail, Drive or Chat resource named by a signed capability URL; nothing is stored."""
     from core.signed_downloads import serve
 
     return await serve(request.path_params["token"])

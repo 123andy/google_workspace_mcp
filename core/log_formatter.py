@@ -22,8 +22,64 @@ class SuppressStatelessTransportTerminationFilter(logging.Filter):
         )
 
 
+# Paths whose trailing segment is itself the credential: a short-link handle or a
+# signed token. Anyone who can read the access log could replay them.
+_CAPABILITY_PATH_PREFIXES = ("/dl/", "/ul/", "/attachments/signed/")
+# ``/auth/`` also hosts literal operator routes (``/auth/callback``), so only a
+# single credential-shaped segment there is redacted: ``secrets.token_urlsafe``
+# output, 16 or more URL-safe characters.
+_AUTH_HANDLE = re.compile(r"/auth/[A-Za-z0-9_-]{16,}(?=[/?#&]|$)")
+_CAPABILITY_PATH = re.compile(
+    "|".join(re.escape(prefix) for prefix in _CAPABILITY_PATH_PREFIXES)
+)
+_CAPABILITY_IN_QUERY = re.compile(f"({_CAPABILITY_PATH.pattern})[^/?#&\\s]+")
+
+
+def redact_capability_path(path: str) -> str:
+    """Redact every capability in a logged request target.
+
+    A credential in the path (``/dl/<handle>``, ``/auth/<handle>``) becomes
+    ``<redacted>`` and the query string is dropped with it, so a second
+    credential riding in the query cannot survive. Otherwise any capability in
+    the query is redacted in place and the rest is kept. The prefix may follow a
+    mount point (uvicorn logs ``root_path`` + path)."""
+    original, sep, query = path.partition("?")
+    path_part = _AUTH_HANDLE.sub("/auth/<redacted>", original)
+    match = _CAPABILITY_PATH.search(path_part)
+    if match:
+        return f"{path_part[: match.end()]}<redacted>"
+    if path_part != original or not sep:
+        return path_part
+    query = _AUTH_HANDLE.sub("/auth/<redacted>", query)
+    query = _CAPABILITY_IN_QUERY.sub(r"\1<redacted>", query)
+    return f"{path_part}?{query}"
+
+
+class RedactCapabilityPathsFilter(logging.Filter):
+    """Redact capability-bearing paths in uvicorn access-log records.
+
+    uvicorn logs ``'%s - "%s %s HTTP/%s" %d'`` with the request path as the
+    third argument; status, size and timing are untouched.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
+            redacted = redact_capability_path(args[2])
+            if redacted != args[2]:
+                record.args = (*args[:2], redacted, *args[3:])
+        return True
+
+
 def install_noisy_log_filters() -> None:
-    """Install targeted filters for known noisy third-party log lines."""
+    """Install targeted filters for known noisy third-party log lines, and the
+    redaction filter on the uvicorn access logger."""
+    access_logger = logging.getLogger("uvicorn.access")
+    if not any(
+        isinstance(existing, RedactCapabilityPathsFilter)
+        for existing in access_logger.filters
+    ):
+        access_logger.addFilter(RedactCapabilityPathsFilter())
     target_logger = logging.getLogger("mcp.server.streamable_http")
     if not any(
         isinstance(existing, SuppressStatelessTransportTerminationFilter)

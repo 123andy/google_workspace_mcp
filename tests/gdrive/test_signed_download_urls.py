@@ -105,6 +105,30 @@ async def test_stateless_fallback_is_loud_when_url_cannot_be_minted(
 
 @pytest.mark.asyncio
 @patch("gdrive.drive_tools._download_file_to_temp", new_callable=AsyncMock)
+async def test_fails_loud_when_url_cannot_be_minted(download, enabled, monkeypatch):
+    """Not stateless: no download, no storage write, an error naming the fix."""
+    import gdrive.drive_tools as drive_tools
+
+    monkeypatch.setattr(drive_tools, "is_stateless_mode", lambda: False)
+    storage = Mock()
+    monkeypatch.setattr(drive_tools, "get_attachment_storage", lambda: storage)
+
+    with patch.object(sd, "offer_url", return_value=None):
+        result = await _unwrap(get_drive_file_download_url)(
+            service=_service("video/mp4", "clip.mp4"),
+            user_google_email=USER,
+            file_id="v-1",
+        )
+
+    assert result == sd.SIGNING_FAILED_ERROR
+    assert "re-authenticate through this server" in result.lower()
+    assert "start_google_auth" not in result
+    download.assert_not_called()
+    storage.save_attachment_from_path.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("gdrive.drive_tools._download_file_to_temp", new_callable=AsyncMock)
 async def test_stateless_wording_unchanged_when_feature_off(
     download, monkeypatch, tmp_path
 ):
@@ -123,3 +147,32 @@ async def test_stateless_wording_unchanged_when_feature_off(
     result = tool_result.content[0].text
     assert result.startswith("File downloaded successfully!")
     assert "signed" not in result.lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "env,size,expect",
+    [
+        ("0", 300, "inline returns are disabled"),
+        ("100", 300, "exceeds the inline limit"),
+    ],
+)
+@patch("gdrive.drive_tools._download_file_to_temp", new_callable=AsyncMock)
+async def test_stateless_not_returned_messages_say_why_there_is_no_link(
+    download, enabled, monkeypatch, env, size, expect
+):
+    import gdrive.drive_tools as drive_tools
+
+    monkeypatch.setattr(drive_tools, "is_stateless_mode", lambda: True)
+    monkeypatch.setenv("WORKSPACE_MCP_STATELESS_INLINE_MAX_BYTES", env)
+    service = _service("video/mp4", "clip.mp4")
+    service.files().get().execute.return_value["size"] = str(size)
+
+    with patch.object(sd, "offer_url", return_value=None):
+        result = await _unwrap(get_drive_file_download_url)(
+            service=service, user_google_email=USER, file_id="v-1"
+        )
+
+    assert expect in result
+    assert sd.UNAVAILABLE_NOTE in result
+    download.assert_not_called()

@@ -1,6 +1,6 @@
 """Signed, short-lived download URLs that stream Google content on demand.
 
-Neither Gmail nor Drive offers a public download URL: bytes only come back from
+Gmail, Drive and Chat offer no public download URL: bytes only come back from
 an authenticated API call. Without this module a remote server must either write
 the file to local disk and serve it from ``/attachments/{id}`` (impossible in
 stateless mode, and not tied to a user) or hand base64 back through the model.
@@ -34,6 +34,7 @@ from datetime import datetime, timedelta, timezone
 from typing import AsyncIterator, Awaitable, Callable, Optional
 from urllib.parse import quote, urlparse
 
+import httpx
 from cryptography.fernet import Fernet
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from google.auth.transport.requests import Request
@@ -42,7 +43,11 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
 from core.config import get_transport_mode
-from core.file_limits import FileTooLargeError, ensure_within_file_size_limit
+from core.file_limits import (
+    FileTooLargeError,
+    ensure_within_file_size_limit,
+    get_max_file_bytes,
+)
 
 try:
     from google.auth._helpers import REFRESH_THRESHOLD
@@ -206,12 +211,31 @@ def usable_seconds(
     return (expiry - REFRESH_THRESHOLD - ref).total_seconds()
 
 
-def clamp_ttl(credentials: Credentials, *, now: Optional[datetime] = None) -> int:
-    """URL lifetime that ends before the credentials stop being usable; <= 0 means
-    do not mint. Deliberately not floored: a minimum would let a URL outlive the
-    credentials that serve it."""
+def clamp_ttl(
+    credentials: Credentials,
+    *,
+    now: Optional[datetime] = None,
+    max_seconds: int = URL_TTL_SECONDS,
+) -> int:
+    """Link lifetime (at most ``max_seconds``) that ends before the credentials
+    stop being usable; <= 0 means do not mint. Deliberately not floored: a
+    minimum would let a link outlive the credentials that serve it."""
     left = usable_seconds(credentials, now=now) - _EXPIRY_MARGIN_SECONDS
-    return int(min(URL_TTL_SECONDS, left))
+    return int(min(max_seconds, left))
+
+
+def header_safe_media_type(value: object) -> bool:
+    """A MIME type fit for a response header: 1-255 printable ASCII characters
+    and no spaces at the ends. h11 (uvicorn's HTTP/1.1) refuses a header value
+    that starts or ends with a space, so the client would see the connection
+    drop with no response."""
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 255
+        and value.isascii()
+        and value.isprintable()
+        and value == value.strip()
+    )
 
 
 def format_ttl(seconds: float) -> str:
@@ -393,6 +417,13 @@ UNAVAILABLE_NOTE = (
     "expire with no refresh token). Re-authenticate if this persists."
 )
 
+SIGNING_FAILED_ERROR = (
+    "Error: no signed download link could be issued, so nothing was downloaded. "
+    "This server could not recover usable credentials for you (none stored here, "
+    "or an access token about to expire with no refresh token). Re-authenticate "
+    "through this server, then call this tool again."
+)
+
 
 # --- Fetchers: claims + owner credentials -> bytes -------------------------------
 
@@ -405,6 +436,11 @@ class DownloadResult:
     media_type: str
     content: Optional[bytes] = None
     stream: Optional[AsyncIterator[bytes]] = None
+    # Exact byte count of ``stream`` when Google declared it; sent as
+    # Content-Length so a client can tell a cut transfer from a complete one.
+    length: Optional[int] = None
+    # Releases what ``stream`` holds open, for when it is never iterated.
+    close: Optional[Callable[[], Awaitable[None]]] = None
 
 
 class SignedDownloadError(Exception):
@@ -524,9 +560,11 @@ async def _fetch_drive(claims: dict, credentials: Credentials) -> DownloadResult
                 pending, finished = await asyncio.to_thread(next_chunk)
             except Exception as exc:
                 logger.error("Drive stream interrupted mid-download: %s", exc)
-                # Headers are out. Raising makes the server abort the chunked body
-                # without its terminating chunk, so the client sees an incomplete
-                # transfer; returning would end it cleanly as a complete file.
+                # Headers are out. Raising reaches the server, which drops the
+                # connection before the terminating chunk, so the client sees an
+                # incomplete transfer; returning would end it as a complete file.
+                # Holds only while no BaseHTTPMiddleware wraps this route (it ends
+                # the body cleanly instead): test_mcp_session_middleware_truncation.
                 raise SignedDownloadError(f"Drive stream interrupted: {exc}") from exc
 
     return DownloadResult(
@@ -536,10 +574,139 @@ async def _fetch_drive(claims: dict, credentials: Credentials) -> DownloadResult
     )
 
 
+_CHAT_MEDIA_BASE = "https://chat.googleapis.com/v1/media/"
+_CHAT_STREAM_CHUNK_BYTES = 64 * 1024
+
+
+def chat_media_url(resource_name: str) -> str:
+    """The Chat media URL for ``attachmentDataRef.resourceName``.
+
+    The host is fixed; the name is only ever a path suffix. Names that could
+    change the path or query (``..``, ``?``, ``#``, ``%``, backslash, control
+    characters) are refused rather than escaped. Raises ``ValueError``.
+    """
+    if (
+        not isinstance(resource_name, str)
+        or not resource_name
+        or ".." in resource_name
+        or any(ch in resource_name for ch in "?#%\\")
+        or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in resource_name)
+    ):
+        raise ValueError("invalid Chat attachment resource name")
+    url = f"{_CHAT_MEDIA_BASE}{quote(resource_name, safe='/')}?alt=media"
+    if httpx.URL(url).host != "chat.googleapis.com":
+        raise ValueError("invalid Chat attachment resource name")
+    return url
+
+
+async def _fetch_chat(claims: dict, credentials: Credentials) -> DownloadResult:
+    """Stream a Chat attachment from the media endpoint in bounded chunks."""
+    try:
+        url = chat_media_url(claims.get("rn"))
+    except ValueError as exc:
+        raise SignedDownloadError(str(exc)) from exc
+    # Sender-supplied. Checked before the stream opens: a type unfit for a header
+    # would otherwise fail only once the response is being built.
+    media_type = claims.get("mt")
+    if not header_safe_media_type(media_type):
+        media_type = "application/octet-stream"
+    limit = get_max_file_bytes()
+    # Redirects are not followed: Google's media endpoint answers directly, so a
+    # redirect is unexpected and is treated as a failure rather than chased.
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(120.0, connect=30.0), follow_redirects=False
+    )
+    response = None
+    try:
+        # Identity encoding keeps Content-Length and the streamed bytes in the
+        # same unit, so the size cap below is exact.
+        response = await client.send(
+            client.build_request(
+                "GET",
+                url,
+                headers={
+                    "Authorization": f"Bearer {credentials.token}",
+                    "Accept-Encoding": "identity",
+                },
+            ),
+            stream=True,
+        )
+        # Check the status before committing a 200 to the client.
+        if response.status_code != 200:
+            raise SignedDownloadError(
+                f"Chat media download failed: HTTP {response.status_code}"
+            )
+        # aiter_bytes would decode an encoded body while Content-Length counts
+        # the encoded bytes, ending a 200 short of its declared length.
+        encoding = response.headers.get("content-encoding", "identity")
+        if any(t.strip().lower() not in ("", "identity") for t in encoding.split(",")):
+            raise SignedDownloadError(
+                "Chat media response has a Content-Encoding despite "
+                "Accept-Encoding: identity"
+            )
+        declared = response.headers.get("content-length")
+        # Without a declared length a cut upstream body is indistinguishable from
+        # a complete one, and the client would get a truncated file as a clean 200.
+        if not (declared and declared.isdigit()):
+            raise SignedDownloadError(
+                "Chat media response declared no Content-Length; refusing to "
+                "stream a body that cannot be checked for truncation"
+            )
+        declared_bytes = int(declared)
+        if limit is not None and declared_bytes > limit:
+            raise SignedDownloadError("attachment exceeds the file size limit")
+    except BaseException as exc:
+        if response is not None:
+            await response.aclose()
+        await client.aclose()
+        if isinstance(exc, (SignedDownloadError, asyncio.CancelledError)):
+            raise
+        if isinstance(exc, Exception):
+            raise SignedDownloadError(f"Chat media download failed: {exc}") from exc
+        raise
+
+    async def close() -> None:
+        await response.aclose()
+        await client.aclose()
+
+    async def body() -> AsyncIterator[bytes]:
+        sent = 0
+        try:
+            async for chunk in response.aiter_bytes(_CHAT_STREAM_CHUNK_BYTES):
+                sent += len(chunk)
+                if sent > declared_bytes or (limit is not None and sent > limit):
+                    # Raising aborts the body: the client sees an incomplete
+                    # transfer, not a file that looks complete.
+                    raise SignedDownloadError(
+                        "attachment exceeds its declared size or the file size limit"
+                    )
+                yield chunk
+            if sent != declared_bytes:
+                raise SignedDownloadError(
+                    f"Chat stream ended early: {sent} of {declared_bytes} bytes"
+                )
+        except SignedDownloadError:
+            raise
+        except Exception as exc:
+            logger.error("Chat stream interrupted mid-download: %s", exc)
+            raise SignedDownloadError(f"Chat stream interrupted: {exc}") from exc
+        finally:
+            await close()
+
+    return DownloadResult(
+        filename=claims.get("fn") or "attachment",
+        media_type=media_type,
+        stream=body(),
+        length=declared_bytes,
+        close=close,
+    )
+
+
 _FETCHERS: dict[str, Callable[[dict, Credentials], Awaitable[DownloadResult]]] = {
     "gmail": _fetch_gmail_attachment,
     "gmail_message": _fetch_gmail_message,
     "drive": _fetch_drive,
+    "chat": _fetch_chat,
 }
 
 
@@ -547,7 +714,7 @@ _FETCHERS: dict[str, Callable[[dict, Credentials], Awaitable[DownloadResult]]] =
 
 
 def _content_disposition(name: str) -> str:
-    """Names come from Gmail/Drive metadata (sender-controlled): the ASCII
+    """Names come from Gmail/Drive/Chat metadata (sender-controlled): the ASCII
     ``filename=`` keeps printable ASCII only — no quotes, backslashes, C0/DEL
     controls (h11 refuses a header value containing NUL) or non-ASCII, which the
     percent-encoded ``filename*`` carries intact."""
@@ -597,14 +764,41 @@ async def serve(token: str) -> Response:
         logger.error("Signed download fetch failed: %s", exc)
         return _error(502, "Failed to fetch the requested resource")
 
-    headers = {
-        **_RESPONSE_HEADERS,
-        "Content-Disposition": _content_disposition(result.filename),
-    }
-    if result.stream is not None:
-        return StreamingResponse(
-            result.stream, media_type=result.media_type, headers=headers
+    try:
+        headers = {
+            **_RESPONSE_HEADERS,
+            "Content-Disposition": _content_disposition(result.filename),
+        }
+        if result.stream is not None:
+            if result.length is not None:
+                headers["Content-Length"] = str(result.length)
+            return _ClosingStreamingResponse(
+                result.stream,
+                media_type=result.media_type,
+                headers=headers,
+                close=result.close,
+            )
+        return Response(
+            content=result.content, media_type=result.media_type, headers=headers
         )
-    return Response(
-        content=result.content, media_type=result.media_type, headers=headers
-    )
+    except BaseException:
+        if result.close is not None:
+            await result.close()
+        raise
+
+
+class _ClosingStreamingResponse(StreamingResponse):
+    """Runs ``close`` however the response ends, including when the body was
+    never iterated (client gone, or sending the headers failed), where the
+    stream's own cleanup never runs."""
+
+    def __init__(self, *args, close=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._close = close
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            if self._close is not None:
+                await self._close()

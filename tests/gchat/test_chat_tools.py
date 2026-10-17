@@ -86,6 +86,58 @@ async def test_get_messages_shows_attachment_metadata(mock_resolve):
     assert "download_chat_attachment" in result
 
 
+async def _messages_text(att, monkeypatch, signed):
+    import gchat.chat_tools as ct
+
+    monkeypatch.setattr(ct.signed_downloads, "enabled", lambda: signed)
+    chat_service = Mock()
+    chat_service.spaces().get().execute.return_value = {"displayName": "Test Space"}
+    chat_service.spaces().messages().list().execute.return_value = {
+        "messages": [_make_message(attachments=[att])]
+    }
+    with patch("gchat.chat_tools._resolve_sender", AsyncMock(return_value="U")):
+        return await _unwrap(ct.get_messages)(
+            chat_service=chat_service,
+            people_service=Mock(),
+            user_google_email="test@example.com",
+            space_id="spaces/S",
+        )
+
+
+@pytest.mark.asyncio
+async def test_get_messages_hint_for_drive_attachment_names_drive_tools(monkeypatch):
+    att = _make_attachment(resource_name=None)
+    att["source"] = "DRIVE_FILE"
+    att["driveDataRef"] = {"driveFileId": "1AbCdEf"}
+    result = await _messages_text(att, monkeypatch, signed=True)
+
+    assert "download_chat_attachment(" not in result
+    assert "Drive file" in result and "1AbCdEf" in result
+
+
+@pytest.mark.asyncio
+async def test_get_messages_hint_for_drive_attachment_without_id(monkeypatch):
+    att = _make_attachment(resource_name=None)
+    att["source"] = "DRIVE_FILE"
+    result = await _messages_text(att, monkeypatch, signed=True)
+
+    assert "download_chat_attachment(" not in result
+    assert "Drive file" in result
+
+
+@pytest.mark.asyncio
+async def test_get_messages_hint_unchanged_for_uploads_and_when_signing_off(
+    monkeypatch,
+):
+    upload = await _messages_text(_make_attachment(), monkeypatch, signed=True)
+    assert "download_chat_attachment(" in upload
+
+    drive = _make_attachment(resource_name=None)
+    drive["source"] = "DRIVE_FILE"
+    off = await _messages_text(drive, monkeypatch, signed=False)
+    assert "download_chat_attachment(" in off
+
+
 @pytest.mark.asyncio
 @patch("gchat.chat_tools._resolve_sender", new_callable=AsyncMock)
 async def test_get_messages_no_attachments_unchanged(mock_resolve):

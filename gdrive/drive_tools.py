@@ -28,7 +28,7 @@ from mcp.types import (
 
 from auth.service_decorator import require_google_service
 from auth.oauth_config import is_stateless_mode
-from core import download_handles, signed_downloads
+from core import download_handles, signed_downloads, upload_relay
 from core.attachment_storage import get_attachment_storage, get_attachment_url
 from core.file_limits import (
     FileTooLargeError,
@@ -40,6 +40,7 @@ from core.utils import (
     GOOGLE_API_WRITE_RETRIES,
     IMAGE_MIME_TYPES,
     hide_local_file_args,
+    UserInputError,
     hide_remote_only_args,
     local_file_access_enabled,
     encode_image_content,
@@ -93,10 +94,11 @@ from gdrive.drive_helpers import (
     resolve_drive_item,
     resolve_file_type_mime,
     resolve_folder_id,
-    resumable_upload_result,
     share_restriction_doc_note,
     share_restriction_message,
+    upload_url_hint,
     upload_url_not_offered_error,
+    upload_url_result,
     validate_existing_permission_target,
     validate_expiration_time,
     validate_share_role,
@@ -127,7 +129,12 @@ def _with_share_restriction_note(func):
 
 
 def _stateless_too_large_message(
-    file_name: str, file_id: str, size_bytes: int, mime_type: str, limit: int
+    file_name: str,
+    file_id: str,
+    size_bytes: int,
+    mime_type: str,
+    limit: int,
+    unavailable_note: str = "",
 ) -> str:
     """Explain why a stateless-mode download was not returned inline."""
     return "\n".join(
@@ -142,12 +149,13 @@ def _stateless_too_large_message(
             "(WORKSPACE_MCP_STATELESS_INLINE_MAX_BYTES, or "
             "WORKSPACE_MCP_MAX_FILE_BYTES if lower). Use "
             "get_drive_file_content for its text, or raise the limit.",
+            *([unavailable_note] if unavailable_note else []),
         ]
     )
 
 
 def _stateless_inline_disabled_message(
-    file_name: str, file_id: str, mime_type: str
+    file_name: str, file_id: str, mime_type: str, unavailable_note: str = ""
 ) -> str:
     """Explain that stateless-mode downloads are not returned inline at all."""
     return "\n".join(
@@ -159,6 +167,7 @@ def _stateless_inline_disabled_message(
             "Not returned: stateless mode has no file storage, and inline "
             "returns are disabled (WORKSPACE_MCP_STATELESS_INLINE_MAX_BYTES=0). "
             "Use get_drive_file_content for its text, or raise the limit.",
+            *([unavailable_note] if unavailable_note else []),
         ]
     )
 
@@ -495,6 +504,8 @@ async def get_drive_file_download_url(
     In HTTP mode, returns a download URL: with signed download URLs enabled on the
     server, a link that streams from Drive on demand and expires within ~15 minutes
     (fetch it promptly); otherwise a server-stored copy valid for 1 hour.
+    With signed URLs enabled but no link issuable, the tool returns an error
+    instead of falling back to an unsigned link.
     In stateless mode (no file storage), returns the file itself as an embedded
     resource, up to WORKSPACE_MCP_STATELESS_INLINE_MAX_BYTES (default 10 MiB,
     and never more than WORKSPACE_MCP_MAX_FILE_BYTES when that is set).
@@ -612,12 +623,20 @@ async def get_drive_file_download_url(
             ]
         )
     no_url = signed_downloads.enabled()
+    note = signed_downloads.UNAVAILABLE_NOTE if no_url else ""
+    if no_url and not is_stateless_mode():
+        # Signing is on but no link could be issued. Stateless mode can still
+        # return the file inline (below); otherwise the only alternative is an
+        # unsigned link that needs a browser session, so fail before downloading.
+        return signed_downloads.SIGNING_FAILED_ERROR
 
     # Stateless mode has no attachment storage to hand out a URL from, so the
     # file itself goes back as an embedded resource, up to inline_max_bytes.
     inline_max_bytes = get_stateless_inline_max_bytes() if is_stateless_mode() else None
     if inline_max_bytes == 0:
-        return _stateless_inline_disabled_message(file_name, file_id, output_mime_type)
+        return _stateless_inline_disabled_message(
+            file_name, file_id, output_mime_type, note
+        )
     # Drive's declared size is the download size only for binary files; an
     # export's size is unknown until it has been downloaded.
     declared_size = int(file_metadata.get("size") or 0)
@@ -627,7 +646,7 @@ async def get_drive_file_download_url(
         and declared_size > inline_max_bytes
     ):
         return _stateless_too_large_message(
-            file_name, file_id, declared_size, output_mime_type, inline_max_bytes
+            file_name, file_id, declared_size, output_mime_type, inline_max_bytes, note
         )
 
     # Stream the download straight to disk. Outside the capped stateless inline
@@ -640,7 +659,12 @@ async def get_drive_file_download_url(
         try:
             if size_bytes > inline_max_bytes:
                 return _stateless_too_large_message(
-                    file_name, file_id, size_bytes, output_mime_type, inline_max_bytes
+                    file_name,
+                    file_id,
+                    size_bytes,
+                    output_mime_type,
+                    inline_max_bytes,
+                    note,
                 )
             with tmp_path.open("rb") as fh:
                 payload = fh.read()
@@ -657,7 +681,7 @@ async def get_drive_file_download_url(
                 f"MIME Type: {output_mime_type}",
                 "\nStateless mode: the file is attached to this result as an "
                 f"embedded resource ({output_filename}).",
-                *([signed_downloads.UNAVAILABLE_NOTE] if no_url else []),
+                *([note] if no_url else []),
             ]
         )
         if export_mime_type:
@@ -712,8 +736,6 @@ async def get_drive_file_download_url(
             download_url = get_attachment_url(result.file_id)
             result_lines.append(f"\n📎 Download URL: {download_url}")
             result_lines.append("\nThe file will expire after 1 hour.")
-            if no_url:
-                result_lines.append(signed_downloads.UNAVAILABLE_NOTE)
 
         if export_mime_type:
             result_lines.append(
@@ -937,6 +959,7 @@ async def create_drive_folder(
 @hide_remote_only_args("return_upload_url")
 @handle_http_errors("create_drive_file", service_type="drive")
 @require_google_service("drive", "drive_file")
+@upload_relay.describe
 async def create_drive_file(
     service,
     user_google_email: str,
@@ -953,6 +976,8 @@ async def create_drive_file(
     """
     Creates a new file in Google Drive, supporting creation within shared drives.
     Accepts direct text content, inline base64 bytes, or a fileUrl to fetch content from.
+    Where local file access is disabled it can instead return an upload URL for the
+    caller to PUT file bytes to.
     This stores the supplied bytes without converting them to Google Docs, Sheets, or
     Slides. Use the matching import_to_google_* tool for Google-native conversion.
 
@@ -962,7 +987,7 @@ async def create_drive_file(
         content (Optional[str]): If provided, the content to write to the file.
         folder_id (str): The ID of the parent folder. Defaults to 'root'. For shared drives, this must be a folder ID within the shared drive.
         mime_type (Optional[str]): The MIME type of the file. Defaults to 'text/plain'; required with return_upload_url.
-        fileUrl (Optional[str]): If provided, fetches the file content from this URL. Supports file://, http://, and https:// protocols.
+        fileUrl (Optional[str]): If provided, fetches the file content from this URL. Supports http:// and https://; file:// only where local file access is enabled. Where it is disabled, files on the caller's machine go through an upload URL instead (see the upload-URL parameter, if offered).
         base64_content (Optional[str]): Standard base64-encoded file bytes.
         content_mime_type (Optional[str]): MIME type for base64_content uploads.
         base64_sha256 (Optional[str]): Expected SHA-256 of decoded base64_content. Recommended for binary payload integrity checks.
@@ -1019,11 +1044,12 @@ async def create_drive_file(
             },
         )
         logger.info("[create_drive_file] Returned resumable upload URL.")
-        return resumable_upload_result(
+        return await upload_url_result(
             f"Resumable upload session created for new file '{file_name}' "
             f"(folder '{folder_id}', for {user_google_email}).",
             upload_url,
             mime_type,
+            user_google_email,
         )
 
     mime_type = mime_type or "text/plain"
@@ -1121,6 +1147,14 @@ async def create_drive_file(
                     "[create_drive_file] file:// URL requested while server runs in streamable-http mode. Ensure the file path is accessible to the server (e.g., Docker volume) or use an HTTP(S) URL."
                 )
 
+            if not local_file_access_enabled():
+                raise UserInputError(
+                    "Local file access is disabled on this server: file paths "
+                    "resolve on the server's filesystem, not the caller's. "
+                    "Provide the file by http(s) URL or as inline content "
+                    f"instead. {upload_url_hint()}"
+                )
+
             # Convert file:// URL to a cross-platform local path
             raw_path = parsed_url.path or ""
             netloc = parsed_url.netloc
@@ -1191,7 +1225,7 @@ async def create_drive_file(
                         await asyncio.to_thread(spool.write, chunk)
 
                     _total, content_type = await _stream_url_with_validation(
-                        fileUrl, _write_spool
+                        fileUrl, _write_spool, upload_type_param="mime_type"
                     )
                     await asyncio.to_thread(spool.seek, 0)
 
@@ -1229,7 +1263,7 @@ async def create_drive_file(
                         await asyncio.to_thread(temp_file.write, chunk)
 
                     total_bytes, content_type = await _stream_url_with_validation(
-                        fileUrl, _write_chunk
+                        fileUrl, _write_chunk, upload_type_param="mime_type"
                     )
 
                     logger.info(
@@ -1312,6 +1346,7 @@ async def create_drive_file(
 @hide_remote_only_args("return_upload_url")
 @handle_http_errors("import_to_google_doc", service_type="drive")
 @require_google_service("drive", "drive_file")
+@upload_relay.describe
 async def import_to_google_doc(
     service,
     user_google_email: str,
@@ -1399,6 +1434,7 @@ async def import_to_google_doc(
 @hide_remote_only_args("return_upload_url")
 @handle_http_errors("import_to_google_slides", service_type="drive")
 @require_google_service("drive", "drive_file")
+@upload_relay.describe
 async def import_to_google_slides(
     service,
     user_google_email: str,
@@ -1479,6 +1515,7 @@ async def import_to_google_slides(
 @hide_remote_only_args("return_upload_url")
 @handle_http_errors("import_to_google_sheets", service_type="drive")
 @require_google_service("drive", "drive_file")
+@upload_relay.describe
 async def import_to_google_sheets(
     service,
     user_google_email: str,
@@ -1840,6 +1877,7 @@ async def check_drive_file_public_access(
 @hide_remote_only_args("return_upload_url")
 @handle_http_errors("update_drive_file", is_read_only=False, service_type="drive")
 @require_google_service("drive", "drive_file")
+@upload_relay.describe
 async def update_drive_file(
     service,
     user_google_email: str,
@@ -2118,11 +2156,12 @@ async def update_drive_file(
             },
         )
         logger.info(f"[update_drive_file] Returned resumable upload URL for {file_id}.")
-        return resumable_upload_result(
+        return await upload_url_result(
             "Resumable upload session created to replace the content of "
             f"'{current_file.get('name', file_id)}' (ID {file_id}, for {user_google_email}).",
             upload_url,
             upload_mime,
+            user_google_email,
         )
 
     # Native Google files take replacement content through Drive's import conversion
@@ -2172,6 +2211,7 @@ async def update_drive_file(
                     if format_map
                     else (target_mime_type or "application/octet-stream")
                 ),
+                upload_type_param="mime_type",
             )
             query_params["media_body"] = media
 
