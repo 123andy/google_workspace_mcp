@@ -211,16 +211,17 @@ def _is_artifact_content_origin_allowed(scope: Scope, origin: str) -> bool:
     """Allow ``Origin: null`` on artifact content reads when the viewer is enabled.
 
     Artifact pages run in a sandboxed frame without ``allow-same-origin``, which sends
-    ``Origin: null`` on module scripts, fonts and ``fetch``. The content route is
-    read-only and authenticated by an expiring token in its path rather than by cookies
-    or origin, so those requests are allowed there and nowhere else.
+    ``Origin: null`` on module scripts, fonts and ``fetch``, and on the browser's CSP
+    violation reports. The content route is read-only and authenticated by an expiring
+    token in its path rather than by cookies or origin, and the report endpoint only
+    logs a scrubbed summary, so those requests are allowed there and nowhere else.
     """
-    return (
-        origin == "null"
-        and scope.get("method") in ("GET", "HEAD")
-        and str(scope.get("path", "")).startswith("/c/")
-        and viewer_enabled()
-    )
+    if origin != "null" or not viewer_enabled():
+        return False
+    method, path = scope.get("method"), str(scope.get("path", ""))
+    if method in ("GET", "HEAD"):
+        return path.startswith("/c/")
+    return method == "POST" and path == "/csp-report"
 
 
 class OriginValidationMiddleware:

@@ -125,10 +125,17 @@ class TestOriginExemption:
             self.scope("HEAD"), "null"
         )
 
+    def test_allows_null_origin_report_posts(self):
+        scope = self.scope("POST", "/csp-report")
+        assert core_server._is_artifact_content_origin_allowed(scope, "null")
+
     @pytest.mark.parametrize(
         "method,path,origin",
         [
             ("POST", "/c/tok/", "null"),
+            ("POST", "/csp-report/x", "null"),
+            ("GET", "/csp-report", "https://evil.example.com"),
+            ("POST", "/csp-report", "https://evil.example.com"),
             ("GET", "/mcp", "null"),
             ("GET", "/a/x/", "null"),
             ("GET", "/dl/abc", "null"),
