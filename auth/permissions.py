@@ -147,6 +147,9 @@ SERVICE_PERMISSION_LEVELS: Dict[str, List[Tuple[str, List[str]]]] = {
             ],
         ),
     ],
+    "artifacts": [
+        ("readonly", [DRIVE_READONLY_SCOPE]),
+    ],
 }
 
 # Actions denied at specific permission levels.

@@ -218,6 +218,7 @@ TOOL_SCOPES_MAP = {
     "contacts": CONTACTS_SCOPES,
     "search": CUSTOM_SEARCH_SCOPES,
     "appscript": SCRIPT_SCOPES,
+    "artifacts": [DRIVE_READONLY_SCOPE],
 }
 
 # Tool-to-read-only-scopes mapping
@@ -245,6 +246,7 @@ TOOL_READONLY_SCOPES_MAP = {
         SCRIPT_METRICS_SCOPE,
         DRIVE_READONLY_SCOPE,
     ],
+    "artifacts": [DRIVE_READONLY_SCOPE],
 }
 
 

@@ -178,3 +178,10 @@ appscript:
     - get_script_activity
     - manage_script_trigger
   complete: []
+
+artifacts:
+  core:
+    - register_artifact
+    - get_artifact_policy
+  extended: []
+  complete: []
