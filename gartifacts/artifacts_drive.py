@@ -62,6 +62,11 @@ async def _get(service: Any, file_id: str, fields: str) -> Dict[str, Any]:
     )
 
 
+async def get_folder(service: Any, folder_id: str) -> Dict[str, Any]:
+    """Fetch the metadata the viewer needs about a registered folder."""
+    return await _get(service, folder_id, "id, name, mimeType, trashed")
+
+
 async def list_children(
     service: Any, folder_id: str, name: Optional[str] = None
 ) -> List[Dict[str, Any]]:

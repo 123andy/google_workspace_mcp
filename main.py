@@ -11,7 +11,7 @@ from typing import NoReturn
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 from core.startup_ui import StartupDisplay, collapse_home, wordmark_lines
-from gartifacts.artifacts_config import artifacts_enabled
+from gartifacts.artifacts_config import artifacts_enabled, viewer_enabled
 
 # Prevent any stray startup output on macOS (e.g. platform identifiers) from
 # corrupting the MCP JSON-RPC handshake on stdout. We capture anything written
@@ -868,6 +868,11 @@ def main():
 
     # Filter tools based on tier configuration (if tier-based loading is enabled)
     tools_removed = filter_server_tools(server)
+
+    if viewer_enabled():
+        from gartifacts.artifacts_viewer import register_viewer_routes
+
+        register_viewer_routes(server)
 
     ui.section("Services")
     ui.grid([(SERVICE_ICONS.get(t, "🔧"), t.title()) for t in loaded])
