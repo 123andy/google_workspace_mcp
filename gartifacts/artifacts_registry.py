@@ -21,6 +21,7 @@ from gartifacts.artifacts_links import new_hash, slugify
 logger = logging.getLogger(__name__)
 
 REGISTRY_PATH_ENV = "WORKSPACE_MCP_ARTIFACTS_REGISTRY_PATH"
+REGISTRY_BACKEND_ENV = "WORKSPACE_MCP_ARTIFACTS_REGISTRY_BACKEND"
 _MAX_HASH_ATTEMPTS = 5
 
 
@@ -201,12 +202,25 @@ def _default_registry_path() -> str:
     return os.path.join(base, "artifacts.sqlite")
 
 
+def _build_registry() -> ArtifactRegistry:
+    backend = os.getenv(REGISTRY_BACKEND_ENV, "sqlite").strip().lower()
+    if backend == "postgres":
+        from gartifacts.artifacts_registry_postgres import PostgresArtifactRegistry
+
+        return PostgresArtifactRegistry()
+    if backend != "sqlite":
+        raise ValueError(
+            f"Unknown {REGISTRY_BACKEND_ENV} {backend!r}; use sqlite or postgres"
+        )
+    return SqliteArtifactRegistry(_default_registry_path())
+
+
 def get_artifact_registry() -> ArtifactRegistry:
     """Return the process-wide registry, creating the SQLite default on first use."""
     global _registry
     with _registry_lock:
         if _registry is None:
-            _registry = SqliteArtifactRegistry(_default_registry_path())
+            _registry = _build_registry()
         return _registry
 
 
