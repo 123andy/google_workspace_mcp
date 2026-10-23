@@ -11,6 +11,7 @@ from typing import NoReturn
 from dotenv import load_dotenv
 from core import signed_downloads, upload_relay
 from core.startup_ui import StartupDisplay, collapse_home, wordmark_lines
+from gartifacts.artifacts_config import artifacts_enabled
 
 # Prevent any stray startup output on macOS (e.g. platform identifiers) from
 # corrupting the MCP JSON-RPC handshake on stdout. We capture anything written
@@ -227,8 +228,21 @@ SERVICE_MODULES = {
     "contacts": "gcontacts.contacts_tools",
     "search": "gsearch.search_tools",
     "appscript": "gappsscript.apps_script_tools",
+    "artifacts": "gartifacts.artifacts_tools",
 }
 VALID_SERVICES = frozenset(SERVICE_MODULES)
+
+# Services that never load by default: they must be named with --tools/--permissions or
+# switched on (see gartifacts.artifacts_config), so existing setups are unchanged.
+OPT_IN_SERVICES = frozenset({"artifacts"})
+
+
+def default_services(services, *, artifacts_on=None):
+    """The services a server loads when none are selected explicitly."""
+    if artifacts_on is None:
+        artifacts_on = artifacts_enabled()
+    return [s for s in services if s not in OPT_IN_SERVICES or artifacts_on]
+
 
 # Every icon is a double-width emoji with no variation selector, so the startup
 # service grid stays aligned across terminals.
@@ -245,6 +259,7 @@ SERVICE_ICONS = {
     "contacts": "👤",
     "search": "🔍",
     "appscript": "📜",
+    "artifacts": "📦",
 }
 
 
@@ -803,7 +818,7 @@ def main():
             if args.tools is not None:
                 tools_to_import = args.tools
             else:
-                tools_to_import = suggested_services
+                tools_to_import = default_services(suggested_services)
 
             # Set the specific tools that should be registered
             set_enabled_tool_names(set(tier_tools))
@@ -816,7 +831,7 @@ def main():
         set_enabled_tool_names(None)
     else:
         # Default: import all tools
-        tools_to_import = tool_imports.keys()
+        tools_to_import = default_services(tool_imports)
         # Don't filter individual tools when importing all
         set_enabled_tool_names(None)
 
@@ -858,7 +873,10 @@ def main():
     ui.grid([(SERVICE_ICONS.get(t, "🔧"), t.title()) for t in loaded])
     ui.blank()
 
-    summary = f"{len(loaded)} of {len(tool_imports)} services loaded"
+    selectable = [
+        s for s in tool_imports if s not in OPT_IN_SERVICES or s in tools_to_import
+    ]
+    summary = f"{len(loaded)} of {len(selectable)} services loaded"
     if args.tool_tier is not None:
         summary += f" · tier {args.tool_tier}"
     if tools_removed:
