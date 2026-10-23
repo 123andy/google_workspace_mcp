@@ -27,20 +27,17 @@ def test_sandboxed_frame_reads_content_with_null_origin(world, client):
     assert response.status_code == 200
 
 
+def test_csp_report_from_the_sandboxed_frame_is_accepted(client):
+    headers = {**CONTENT, "origin": "null", "sec-fetch-dest": "report"}
+    response = client.post("/csp-report", json={"csp-report": {}}, headers=headers)
+    assert response.status_code == 204
+
+
 def test_null_origin_is_still_refused_elsewhere(world, client):
     _, record = make_bundle(world)
-    assert (
-        client.get(
-            f"/a/{record.hash}-x/", headers={**APP, "origin": "null"}
-        ).status_code
-        == 403
-    )
-    assert (
-        client.post(
-            "/csp-report", json={}, headers={**CONTENT, "origin": "null"}
-        ).status_code
-        == 403
-    )
+    app_headers = {**APP, "origin": "null"}
+    assert client.get(f"/a/{record.hash}-x/", headers=app_headers).status_code == 403
+    assert client.post(f"/a/{record.hash}-x/", headers=app_headers).status_code == 403
 
 
 def test_content_origin_exemption_needs_the_viewer_switch(world, monkeypatch):

@@ -92,6 +92,13 @@ class TestViewerPage:
         )
         assert "/sub/page%202.html" in response.text
 
+    def test_reload_keeps_the_current_page(self, world):
+        _, record = make_bundle(world)
+        response = world.client.get(
+            f"/a/{record.hash}-q3-board-deck/sub/page2.html", headers=APP
+        )
+        assert f'href="/a/{record.hash}-q3-board-deck/sub/page2.html"' in response.text
+
     def test_title_is_escaped(self, world):
         bundle, record = make_bundle(world)
         world.drive.items[bundle]["name"] = "20261022-1815-<script>alert(1)</script>"

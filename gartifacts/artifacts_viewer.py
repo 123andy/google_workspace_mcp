@@ -362,7 +362,7 @@ async def viewer_page(request: Request) -> Response:
         record.title,
         f"{content_origin}/c/{token}/{quote(path)}",
         content_origin,
-        f"/a/{canonical}/",
+        f"/a/{canonical}/{quote(path)}",
     )
 
 
