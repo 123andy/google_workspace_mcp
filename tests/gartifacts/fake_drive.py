@@ -4,9 +4,21 @@ import itertools
 import re
 from typing import Any, Dict, List, Optional
 
+import httplib2
+from googleapiclient.errors import HttpError
+
 from gartifacts.artifacts_drive import FOLDER_MIME
 
 ROOT_ID = "ROOT"
+
+
+def not_found(file_id: str) -> HttpError:
+    """The error Drive raises for a file that is missing or not visible to the caller."""
+    return HttpError(
+        httplib2.Response({"status": 404}), b"File not found: " + file_id.encode()
+    )
+
+
 _NAME_Q = re.compile(r"^name = '((?:[^'\\]|\\.)*)' and (.*)$")
 _PARENT_Q = re.compile(r"^'((?:[^'\\]|\\.)*)' in parents and trashed = false$")
 
@@ -33,13 +45,18 @@ class _Files:
                 return {"id": ROOT_ID}
             item = self._drive.items.get(fileId)
             if item is None:
-                raise KeyError(fileId)
+                raise not_found(fileId)
             return {k: v for k, v in item.items() if k != "content"}
 
         return _Request(produce)
 
     def get_media(self, fileId: str):
-        return _Request(lambda: self._drive.items[fileId]["content"])
+        def produce() -> bytes:
+            if fileId not in self._drive.items:
+                raise not_found(fileId)
+            return self._drive.items[fileId]["content"]
+
+        return _Request(produce)
 
     def list(self, q: str, pageToken: Optional[str] = None, pageSize: int = 100, **_):
         self._drive.list_calls.append(q)

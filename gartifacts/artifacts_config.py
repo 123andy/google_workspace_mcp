@@ -16,6 +16,14 @@ ARTIFACTS_ENV = "WORKSPACE_MCP_ARTIFACTS"
 VIEWER_ENV = "WORKSPACE_MCP_ARTIFACTS_VIEWER"
 # Public base URL of the viewer, used to build links returned to users.
 VIEWER_URL_ENV = "WORKSPACE_MCP_ARTIFACTS_VIEWER_URL"
+# Public base URL of the separate host that serves artifact content.
+CONTENT_URL_ENV = "WORKSPACE_MCP_ARTIFACTS_CONTENT_URL"
+
+# The gateway tells the two hosts apart with one request header (the Host header is
+# rewritten on the way in): "app" on the viewer route, "content" on the content route.
+ROUTE_MARKER_HEADER = "x-artifacts-route"
+APP_MARKER = "app"
+CONTENT_MARKER = "content"
 
 _TRUE = {"1", "true", "yes", "on"}
 
@@ -34,12 +42,21 @@ def viewer_enabled() -> bool:
     return _flag(VIEWER_ENV)
 
 
-def viewer_base_url() -> Optional[str]:
-    """The viewer's public base URL without a trailing slash, or None if unset/invalid."""
-    raw = os.getenv(VIEWER_URL_ENV, "").strip().rstrip("/")
+def _origin_from_env(name: str) -> Optional[str]:
+    raw = os.getenv(name, "").strip().rstrip("/")
     parts = urlsplit(raw)
     if parts.scheme not in ("http", "https") or not parts.netloc:
         return None
     if parts.path or parts.query or parts.fragment:
         return None
     return raw
+
+
+def viewer_base_url() -> Optional[str]:
+    """The viewer's public base URL without a trailing slash, or None if unset/invalid."""
+    return _origin_from_env(VIEWER_URL_ENV)
+
+
+def content_base_url() -> Optional[str]:
+    """The content host's public base URL without a trailing slash, or None."""
+    return _origin_from_env(CONTENT_URL_ENV)

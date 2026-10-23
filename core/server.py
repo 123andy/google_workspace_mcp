@@ -34,6 +34,8 @@ from auth.oauth_responses import (
     create_server_error_response,
 )
 from auth.scopes import PROTOCOL_AUTH_SCOPES, SCOPES, get_current_scopes  # noqa
+from gartifacts.artifacts_config import viewer_enabled
+from gartifacts.artifacts_consent import finish_viewer_consent
 from core.config import (
     USER_GOOGLE_EMAIL,
     get_transport_mode,
@@ -205,6 +207,22 @@ def _is_null_origin_consent_compat_allowed(scope: Scope, origin: str) -> bool:
     return _parse_bool_env(os.getenv(_ALLOW_NULL_ORIGIN_CONSENT_ENV, "").strip())
 
 
+def _is_artifact_content_origin_allowed(scope: Scope, origin: str) -> bool:
+    """Allow ``Origin: null`` on artifact content reads when the viewer is enabled.
+
+    Artifact pages run in a sandboxed frame without ``allow-same-origin``, which sends
+    ``Origin: null`` on module scripts, fonts and ``fetch``. The content route is
+    read-only and authenticated by an expiring token in its path rather than by cookies
+    or origin, so those requests are allowed there and nowhere else.
+    """
+    return (
+        origin == "null"
+        and scope.get("method") in ("GET", "HEAD")
+        and str(scope.get("path", "")).startswith("/c/")
+        and viewer_enabled()
+    )
+
+
 class OriginValidationMiddleware:
     """Reject browser-originated HTTP requests from untrusted origins."""
 
@@ -222,6 +240,9 @@ class OriginValidationMiddleware:
                 if not _is_origin_allowed(origin) and not _is_same_origin_as_host(
                     origin, host_header
                 ):
+                    if _is_artifact_content_origin_allowed(scope, origin):
+                        await self.app(scope, receive, send)
+                        return
                     if _is_null_origin_consent_compat_allowed(scope, origin):
                         logger.info(
                             "Allowing OAuth consent POST with Origin: null because "
@@ -952,6 +973,13 @@ async def legacy_oauth2_callback(request: Request) -> HTMLResponse:
         logger.info(
             f"OAuth callback: Successfully authenticated user: {verified_user_id}."
         )
+
+        if viewer_enabled():
+            viewer_response = finish_viewer_consent(
+                request.query_params.get("state"), credentials
+            )
+            if viewer_response is not None:
+                return viewer_response
 
         return create_success_response(verified_user_id)
     except Exception as e:
