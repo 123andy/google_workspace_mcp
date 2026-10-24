@@ -71,9 +71,7 @@ _ICON_PDF = (
 _NOTICE = (
     "<p><strong>Never enter passwords or secrets here.</strong></p>"
     "<p>This content was created by people (or by AI) and has not been reviewed.</p>"
-    "<p>Be especially careful about what you type here. Never sign in to any site "
-    "inside this frame, and never enter a password, key or personal "
-    "information: a login box in this area could be a fake.</p>"
+    "<p>Don't sign in to any site here. A login box in this area could be a fake.</p>"
     "<p>Only the bar at the top is part of the viewer.</p>"
 )
 
