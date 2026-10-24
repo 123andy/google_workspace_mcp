@@ -1,4 +1,6 @@
 import logging
+import os
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -6,6 +8,7 @@ import pytest
 from gartifacts import artifacts_viewer as viewer
 from gartifacts.artifacts_config import (
     APP_MARKER,
+    BRANDING_FILE_ENV,
     CONTENT_URL_ENV,
     ROUTE_MARKER_HEADER,
     VIEWER_URL_ENV,
@@ -427,29 +430,116 @@ class TestShellFeatures:
         response = world.client.get(f"/c/{token_for(record)}/", headers=FRAME)
         assert b"<script>" not in response.content
 
-    def test_icon_route_and_header_logo(self, world, monkeypatch, tmp_path):
+    def _link(self, world):
         _, record = make_bundle(world)
-        link = f"/a/{record.hash}-q3-board-deck/"
+        return f"/a/{record.hash}-q3-board-deck/"
+
+    def _branding(self, monkeypatch, tmp_path, text):
+        path = tmp_path / "branding.yaml"
+        path.write_text(text)
+        monkeypatch.setenv(BRANDING_FILE_ENV, str(path))
+        return path
+
+    def test_defaults_without_a_branding_file(self, world):
+        text = world.client.get(self._link(world), headers=APP).text
+        assert "<span class=brand>Artifacts</span>" in text and "#1f3a5f" in text
+        assert "class=logo" not in text and "rel=icon" not in text
         assert world.client.get("/a/_icon", headers=APP).status_code == 404
-        assert "class=logo" not in world.client.get(link, headers=APP).text
-        path = tmp_path / "icon.png"
-        path.write_bytes(b"\x89PNG fake")
-        monkeypatch.setenv("WORKSPACE_MCP_ARTIFACTS_ICON_PATH", str(path))
-        icon = world.client.get("/a/_icon", headers=APP)
-        assert icon.status_code == 200 and icon.content == b"\x89PNG fake"
-        assert icon.headers["content-type"] == "image/png"
-        assert "sandbox" in icon.headers["content-security-policy"]
+
+    def test_branding_file_sets_name_colour_wording_and_icon(
+        self, world, monkeypatch, tmp_path
+    ):
+        (tmp_path / "logo.png").write_bytes(b"\x89PNG fake")
+        self._branding(
+            monkeypatch,
+            tmp_path,
+            "name: Acme Artifacts\ncolor: '#1F346F'\nicon: logo.png\n"
+            "notice:\n  - 'Ask <a href=\"https://x.example\" target=_blank>help</a>.'\n"
+            "about:\n  - Shared inside Acme only.\n  - 'Slack #support-ai'\n",
+        )
+        link = self._link(world)
         text = world.client.get(link, headers=APP).text
+        assert "Acme Artifacts" in text and "#1F346F" in text
+        assert '<a href="https://x.example" target=_blank>help</a>' in text
+        assert "Shared inside Acme only." in text and "Slack #support-ai" in text
+        assert "has not been reviewed" not in text
+        assert "Never enter passwords or secrets here." in text
         assert "class=logo" in text and "rel=icon" in text
+        icon = world.client.get("/a/_icon", headers=APP)
+        assert (
+            icon.content == b"\x89PNG fake"
+            and icon.headers["content-type"] == "image/png"
+        )
+        assert "sandbox" in icon.headers["content-security-policy"]
         assert world.client.get("/a/_icon", headers=CONTENT).status_code == 404
 
-    def test_brand_settings(self, world, monkeypatch):
-        _, record = make_bundle(world)
-        link = f"/a/{record.hash}-q3-board-deck/"
-        monkeypatch.setenv("WORKSPACE_MCP_ARTIFACTS_BRAND_NAME", "Acme <b>Artifacts")
-        monkeypatch.setenv("WORKSPACE_MCP_ARTIFACTS_BRAND_COLOR", "#1F346F")
-        text = world.client.get(link, headers=APP).text
-        assert "Acme &lt;b&gt;Artifacts" in text and "#1F346F" in text
-        monkeypatch.setenv("WORKSPACE_MCP_ARTIFACTS_BRAND_COLOR", "red;}</style>")
-        text = world.client.get(link, headers=APP).text
-        assert "red;}" not in text and "#1f3a5f" in text
+    def test_config_html_cannot_run_script(self, world, monkeypatch, tmp_path):
+        self._branding(
+            monkeypatch, tmp_path, "notice:\n  - '<img src=x onerror=alert(1)>'\n"
+        )
+        response = world.client.get(self._link(world), headers=APP)
+        csp = response.headers["content-security-policy"]
+        assert "script-src 'nonce-" in csp and "unsafe-inline'" not in csp.split(";")[1]
+
+    def test_notice_days_zero_turns_the_modal_off(self, world, monkeypatch, tmp_path):
+        self._branding(monkeypatch, tmp_path, "notice_days: 0\n")
+        text = world.client.get(self._link(world), headers=APP).text
+        assert "id=ack" not in text and "I understand" not in text
+
+    def test_notice_days_sets_the_cookie_lifetime(self, world, monkeypatch, tmp_path):
+        self._branding(monkeypatch, tmp_path, "notice_days: 7\n")
+        text = world.client.get(self._link(world), headers=APP).text
+        assert "Max-Age=604800" in text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "name: [not, a, string]\ncolor: red;}</style>\nnotice_days: -3\n"
+            "notice: 42\nabout: [1, 2]\n",
+            "just a string",
+            ": : bad yaml : [",
+        ],
+    )
+    def test_bad_branding_falls_back_to_defaults(
+        self, world, monkeypatch, tmp_path, text
+    ):
+        self._branding(monkeypatch, tmp_path, text)
+        page = world.client.get(self._link(world), headers=APP)
+        assert page.status_code == 200
+        assert "<span class=brand>Artifacts</span>" in page.text
+        assert "#1f3a5f" in page.text and "red;}" not in page.text
+
+    def test_missing_branding_file_falls_back(self, world, monkeypatch, tmp_path):
+        monkeypatch.setenv(BRANDING_FILE_ENV, str(tmp_path / "absent.yaml"))
+        assert world.client.get(self._link(world), headers=APP).status_code == 200
+
+    def test_branding_is_reread_when_the_file_changes(
+        self, world, monkeypatch, tmp_path
+    ):
+        path = self._branding(monkeypatch, tmp_path, "name: One\n")
+        link = self._link(world)
+        assert (
+            "<span class=brand>One</span>" in world.client.get(link, headers=APP).text
+        )
+        path.write_text("name: Two\n")
+        os.utime(path, (time.time() + 5, time.time() + 5))
+        assert (
+            "<span class=brand>Two</span>" in world.client.get(link, headers=APP).text
+        )
+
+    def test_header_has_about_share_reload_and_pdf(self, world):
+        text = world.client.get(self._link(world), headers=APP).text
+        assert "id=about-open class=brandbtn" in text and "id=about role=dialog" in text
+        assert "id=about-link" in text
+        assert 'aria-label="Copy link"' in text and "id=share" in text
+        assert "Link copied. People also need access to the Drive folder." in text
+
+    def test_denied_page_offers_drive_access_request(self, world):
+        bundle, record = make_bundle(world)
+        del world.drive.items[bundle]
+        denied = world.client.get(f"/a/{record.hash}-q3-board-deck/", headers=APP)
+        assert denied.status_code == 404
+        assert f"https://drive.google.com/drive/folders/{bundle}" in denied.text
+        assert "Request access in Google Drive" in denied.text
+        unknown = world.client.get("/a/zzzzzzzz-x/", headers=APP)
+        assert unknown.status_code == 404 and "drive.google.com" not in unknown.text

@@ -38,7 +38,7 @@ from gartifacts.artifacts_config import (
     CONTENT_MARKER,
     ROUTE_MARKER_HEADER,
     content_base_url,
-    icon,
+    branding,
     viewer_base_url,
 )
 from gartifacts.artifacts_consent import begin_consent
@@ -66,6 +66,8 @@ from gartifacts.artifacts_tokens import (
     mint_content_token,
     verify_content_token,
 )
+
+DRIVE_FOLDER_URL = "https://drive.google.com/drive/folders/"
 
 logger = logging.getLogger(__name__)
 access_logger = logging.getLogger("gartifacts.access")
@@ -140,13 +142,24 @@ def log_event(event: str, **fields: Any) -> None:
 
 
 def _page(
-    status: int, title: str, message: str, headers: Optional[Dict[str, str]] = None
+    status: int,
+    title: str,
+    message: str,
+    headers: Optional[Dict[str, str]] = None,
+    action: Optional[Tuple[str, str]] = None,
 ) -> HTMLResponse:
+    """A plain message page; ``action`` is an optional (label, https url) link."""
+    link = (
+        f'<p><a href="{html.escape(action[1], quote=True)}" target=_blank '
+        f"rel=noopener>{html.escape(action[0])}</a></p>"
+        if action
+        else ""
+    )
     body = (
         "<!doctype html><html lang=en><meta charset=utf-8>"
         f"<title>{html.escape(title)}</title>"
         '<body style="font:16px system-ui;margin:3rem auto;max-width:34rem">'
-        f"<h1>{html.escape(title)}</h1><p>{html.escape(message)}</p></body></html>"
+        f"<h1>{html.escape(title)}</h1><p>{html.escape(message)}</p>{link}</body></html>"
     )
     merged = {
         **_SECURITY_HEADERS,
@@ -157,11 +170,17 @@ def _page(
     return HTMLResponse(body, status_code=status, headers=merged)
 
 
-def _unavailable() -> HTMLResponse:
+def _unavailable(folder_id: Optional[str] = None) -> HTMLResponse:
+    """The same page for missing and denied; a registered link adds Drive's request page."""
     return _page(
         404,
         "Not available",
         "This artifact does not exist, or you do not have access to it.",
+        action=(
+            ("Request access in Google Drive", f"{DRIVE_FOLDER_URL}{folder_id}")
+            if folder_id
+            else None
+        ),
     )
 
 
@@ -300,7 +319,7 @@ async def viewer_page(request: Request) -> Response:
             outcome="denied_or_missing",
             request_id=request_id,
         )
-        return _unavailable()
+        return _unavailable(record.folder_id)
     except Exception:
         logger.exception("Drive check failed")
         return _page(
@@ -501,7 +520,7 @@ async def viewer_icon(request: Request) -> Response:
     """``GET /a/_icon``: the configured favicon and header logo, if any."""
     if _marker(request) != APP_MARKER:
         return _unavailable()
-    found = icon()
+    found = branding().icon
     if found is None:
         return Response(status_code=404)
     data, content_type = found

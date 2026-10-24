@@ -5,10 +5,16 @@ Everything artifact-related is off unless explicitly enabled, so a server that s
 of these variables behaves exactly as it did before the feature existed.
 """
 
+import logging
 import os
 import re
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlsplit
+
+import yaml
+
+logger = logging.getLogger(__name__)
 
 # Adds the artifacts tools to the default service set (they can also be selected
 # explicitly with --tools artifacts or --permissions artifacts:readonly).
@@ -20,20 +26,9 @@ VIEWER_URL_ENV = "WORKSPACE_MCP_ARTIFACTS_VIEWER_URL"
 # Public base URL of the separate host that serves artifact content.
 CONTENT_URL_ENV = "WORKSPACE_MCP_ARTIFACTS_CONTENT_URL"
 
-# Branding of the viewer's header bar. All optional; the defaults are neutral.
-BRAND_NAME_ENV = "WORKSPACE_MCP_ARTIFACTS_BRAND_NAME"
-BRAND_COLOR_ENV = "WORKSPACE_MCP_ARTIFACTS_BRAND_COLOR"
-# Path of an image file (PNG, SVG or ICO) used as the favicon and the header logo.
-ICON_PATH_ENV = "WORKSPACE_MCP_ARTIFACTS_ICON_PATH"
-
-DEFAULT_BRAND_NAME = "Artifacts"
-DEFAULT_BRAND_COLOR = "#1f3a5f"
-_ICON_MAX_BYTES = 256 * 1024
-_ICON_TYPES = {
-    ".png": "image/png",
-    ".svg": "image/svg+xml",
-    ".ico": "image/x-icon",
-}
+# Optional YAML or JSON file that sets the viewer's branding and wording (see
+# ``Branding`` for the keys). Unset means the neutral defaults.
+BRANDING_FILE_ENV = "WORKSPACE_MCP_ARTIFACTS_BRANDING_FILE"
 
 # The gateway tells the two hosts apart with one request header (the Host header is
 # rewritten on the way in): "app" on the viewer route, "content" on the content route.
@@ -78,38 +73,114 @@ def content_base_url() -> Optional[str]:
     return _origin_from_env(CONTENT_URL_ENV)
 
 
-def brand_name() -> str:
-    """Name shown in the header bar."""
-    return os.getenv(BRAND_NAME_ENV, "").strip()[:60] or DEFAULT_BRAND_NAME
+DEFAULT_NAME = "Artifacts"
+DEFAULT_COLOR = "#1f3a5f"
+DEFAULT_NOTICE_DAYS = 30
+DEFAULT_NOTICE = (
+    "This content was created by people (or by AI) and has not been reviewed.",
+    "Don't sign in to any site here. A login box in this area could be a fake.",
+    "Only the bar at the top is part of the viewer.",
+)
+DEFAULT_ABOUT = (
+    "Artifacts are made by colleagues with Claude and are meant for sharing inside "
+    "the company.",
+    "Only people with access to the Drive folder can open one.",
+    "To share outside the company, use the PDF button and check the file first.",
+    "Anyone you share an artifact's folder with can see everything in it.",
+)
+_ICON_MAX_BYTES = 256 * 1024
+_ICON_TYPES = {".png": "image/png", ".svg": "image/svg+xml", ".ico": "image/x-icon"}
+_MAX_ITEMS = 12
+_MAX_TEXT = 2000
 
 
-def brand_color() -> str:
-    """Header background as ``#rrggbb``; anything else falls back to the default."""
-    value = os.getenv(BRAND_COLOR_ENV, "").strip()
-    return value if re.fullmatch(r"#[0-9a-fA-F]{6}", value) else DEFAULT_BRAND_COLOR
+@dataclass(frozen=True)
+class Branding:
+    """What the viewer shows around an artifact.
+
+    ``notice`` and ``about`` are lists of HTML fragments. The branding file is trusted
+    configuration, so they are inserted as written; the page's script policy still
+    refuses inline script. ``notice_days`` is how long an acknowledged notice stays
+    dismissed (0 turns the first-visit modal off).
+    """
+
+    name: str = DEFAULT_NAME
+    color: str = DEFAULT_COLOR
+    icon: Optional[Tuple[bytes, str]] = None
+    notice_days: int = DEFAULT_NOTICE_DAYS
+    notice: Tuple[str, ...] = DEFAULT_NOTICE
+    about: Tuple[str, ...] = DEFAULT_ABOUT
 
 
-_icon_cache: dict = {}
+def _text_list(value: Any, fallback: Tuple[str, ...]) -> Tuple[str, ...]:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list) or len(value) > _MAX_ITEMS:
+        return fallback
+    items = [v for v in value if isinstance(v, str) and 0 < len(v) <= _MAX_TEXT]
+    return tuple(items) if items and len(items) == len(value) else fallback
 
 
-def icon() -> Optional[Tuple[bytes, str]]:
-    """The configured icon as (bytes, content type), or None when unset or unusable."""
-    path = os.getenv(ICON_PATH_ENV, "").strip()
-    if not path:
+def _load_icon(raw: Any, base_dir: str) -> Optional[Tuple[bytes, str]]:
+    if not isinstance(raw, str) or not raw.strip():
         return None
+    path = raw if os.path.isabs(raw) else os.path.join(base_dir, raw)
     content_type = _ICON_TYPES.get(os.path.splitext(path)[1].lower())
     if content_type is None:
+        logger.error("Artifact branding: unsupported icon type %s", path)
         return None
     try:
-        mtime = os.stat(path).st_mtime
-        cached = _icon_cache.get(path)
-        if cached and cached[0] == mtime:
-            return cached[1]
         with open(path, "rb") as handle:
             data = handle.read(_ICON_MAX_BYTES + 1)
-    except OSError:
+    except OSError as exc:
+        logger.error("Artifact branding: cannot read icon %s: %s", path, exc)
         return None
     if not data or len(data) > _ICON_MAX_BYTES:
+        logger.error("Artifact branding: icon %s is empty or too large", path)
         return None
-    _icon_cache[path] = (mtime, (data, content_type))
     return data, content_type
+
+
+def _parse_branding(path: str) -> Branding:
+    with open(path, "r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+    if not isinstance(data, dict):
+        raise ValueError("the branding file must hold a mapping")
+    name = data.get("name")
+    color = data.get("color")
+    days = data.get("notice_days")
+    return Branding(
+        name=name.strip()[:60]
+        if isinstance(name, str) and name.strip()
+        else DEFAULT_NAME,
+        color=color.strip()
+        if isinstance(color, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", color.strip())
+        else DEFAULT_COLOR,
+        icon=_load_icon(data.get("icon"), os.path.dirname(os.path.abspath(path))),
+        notice_days=days
+        if isinstance(days, int) and not isinstance(days, bool) and 0 <= days <= 365
+        else DEFAULT_NOTICE_DAYS,
+        notice=_text_list(data.get("notice"), DEFAULT_NOTICE),
+        about=_text_list(data.get("about"), DEFAULT_ABOUT),
+    )
+
+
+_branding_cache: Dict[str, Tuple[float, Branding]] = {}
+
+
+def branding() -> Branding:
+    """The branding in effect: the configured file (re-read when it changes) or defaults."""
+    path = os.getenv(BRANDING_FILE_ENV, "").strip()
+    if not path:
+        return Branding()
+    try:
+        mtime = os.stat(path).st_mtime
+        cached = _branding_cache.get(path)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        result = _parse_branding(path)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        logger.error("Artifact branding file %s is unusable: %s", path, exc)
+        return Branding()
+    _branding_cache[path] = (mtime, result)
+    return result

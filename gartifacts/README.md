@@ -18,9 +18,7 @@ A *bundle* is a Drive folder with an `index.html` at its top level and other pag
 | `WORKSPACE_MCP_ARTIFACTS_VIEWER=true` | Mounts the viewer, content and report routes and allows `Origin: null` on content reads only. |
 | `WORKSPACE_MCP_ARTIFACTS_VIEWER_URL` | Public base URL of the viewer (links returned to users; allowed to frame the content). |
 | `WORKSPACE_MCP_ARTIFACTS_CONTENT_URL` | Public base URL of the content host. |
-| `WORKSPACE_MCP_ARTIFACTS_BRAND_NAME` | Name in the viewer's header bar (default `Artifacts`). |
-| `WORKSPACE_MCP_ARTIFACTS_BRAND_COLOR` | Header bar colour as `#rrggbb`; text is white (default dark blue). |
-| `WORKSPACE_MCP_ARTIFACTS_ICON_PATH` | PNG, SVG or ICO file (up to 256 KB) used as the favicon and the header logo; none by default. |
+| `WORKSPACE_MCP_ARTIFACTS_BRANDING_FILE` | Optional YAML or JSON file for the viewer's look and wording (below). |
 | `WORKSPACE_MCP_ARTIFACTS_TOKEN_KEY` | Secret (at least 16 characters) used to encrypt content tokens. |
 | `WORKSPACE_MCP_ARTIFACTS_TOKEN_TTL_SECONDS` | Token lifetime, 60 to 86400 (default 3600). |
 | `WORKSPACE_MCP_ARTIFACTS_REGISTRY_PATH` | SQLite file for the registry (default: `artifacts.sqlite` in the credentials directory). |
@@ -38,3 +36,22 @@ Two public hostnames point at the same server. The gateway adds one request head
 - The policy limits where scripts, styles, fonts and images may load from and blocks other network access. It cannot stop script from navigating its own frame, so the shell shows a permanent "user-generated content, never enter a password" banner, and artifacts must not hold secrets.
 - Content tokens are encrypted and expire; a leaked token reads one bundle as one user until it expires.
 - Drive remains the only permission system: the viewer reads as the signed-in user, so sharing a bundle folder in Drive is what grants access.
+
+## Branding file
+
+`WORKSPACE_MCP_ARTIFACTS_BRANDING_FILE` points to a YAML or JSON file; every key is optional, and it is re-read
+when it changes. A missing or unusable file is logged and the defaults are used.
+
+```yaml
+name: Acme Artifacts        # header and page title
+color: "#1F346F"            # header colour (#rrggbb); text is white
+icon: logo.png              # PNG, SVG or ICO up to 256 KB, relative to this file; favicon and header logo
+notice_days: 30             # days an acknowledged first-visit notice stays dismissed; 0 turns the modal off
+notice:                     # bullets under the fixed "Never enter passwords or secrets here." line
+  - This content was created by people and has not been reviewed.
+about:                      # bullets in the About dialog (click the logo and name)
+  - Shared inside Acme only.
+```
+
+`notice` and `about` are HTML fragments inserted as written, so the file must be trusted configuration; the
+page's script policy still refuses inline script. The headline line and the safety behaviour are not configurable.
