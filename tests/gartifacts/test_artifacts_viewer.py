@@ -394,6 +394,10 @@ class TestShellFeatures:
             f"/a/{record.hash}-q3-board-deck/page2.html", headers=APP
         ).text
         assert f'<a class=title href="/a/{record.hash}-q3-board-deck/"' in text
+        assert (
+            f'<a class=title2 href="/a/{record.hash}-q3-board-deck/">q3 board deck</a>'
+            in text
+        )
 
     def test_script_runs_only_with_the_nonce(self, world):
         _, record = make_bundle(world)

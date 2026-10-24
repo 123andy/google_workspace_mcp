@@ -137,9 +137,12 @@ iframe{flex:1;border:0;width:100%%}
 .lbl{display:none}
 .hdr .btn{padding:5px 8px}
 #pop{left:10px;right:10px;max-width:none}}
-@media(max-width:480px){.title{display:none}.hdr button.brandbtn{flex-shrink:1}}
+a.title2{display:none}
+@media(max-width:480px){.title{display:none}.hdr button.brandbtn{flex-shrink:1}
+a.title2{display:block;padding:0 10px 6px;font-size:12px;color:#fff;background:%(color)s;
+white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-decoration:none;opacity:.9}}
 @page{margin:6mm}
-@media print{.hdr,#pop,#ack,#about,#toast{display:none}html,body{height:auto}body{display:block}
+@media print{.hdr,.title2,#pop,#ack,#about,#toast{display:none}html,body{height:auto}body{display:block}
 iframe{height:var(--h,100vh)}}
 """
 
@@ -247,6 +250,7 @@ def shell_page(
         f'aria-label="Reload" title="Reload">{_ICON_RELOAD}<span class=lbl>Reload</span></a>'
         '<button id=pdf class=btn type=button aria-label="Save as PDF" title="Save as PDF">'
         f"{_ICON_PDF}<span class=lbl>PDF</span></button></header>"
+        f'<a class=title2 href="{html.escape(base_path, quote=True)}/">{safe_title}</a>'
         f'<div id=pop role=dialog aria-label="About this content" hidden>{notice}'
         f"<p><button id=about-link class=linkbtn type=button>{about_label}</button></p></div>"
         "<div id=toast role=status aria-live=polite hidden></div></div>"
