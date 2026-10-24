@@ -120,6 +120,7 @@ iframe{flex:1;border:0;width:100%%}
 .hdr .btn{padding:5px 8px}
 #pop{left:10px;right:10px;max-width:none}}
 @media(max-width:480px){.title{display:none}}
+@page{margin:6mm}
 @media print{.hdr,#pop,#ack{display:none}html,body{height:auto}body{display:block}
 iframe{height:var(--h,100vh)}}
 """
