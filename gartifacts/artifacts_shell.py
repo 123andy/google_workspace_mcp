@@ -99,9 +99,12 @@ color:#222;background:#fff;border:1px solid #888;border-radius:6px;
 box-shadow:0 4px 14px rgba(0,0,0,.25)}
 #pop[hidden],#ack[hidden]{display:none}
 #ack{position:fixed;inset:0;z-index:10;display:flex;align-items:center;
-justify-content:center;padding:16px;background:rgba(0,0,0,.55)}
-#ack .card{max-width:440px;max-height:100%%;overflow:auto;padding:18px 20px;color:#222;
+justify-content:center;padding:16px;background:rgba(0,0,0,.78)}
+#ack .card{max-width:440px;max-height:100%%;overflow:auto;padding:0;color:#222;
 background:#fff;border-radius:8px;box-shadow:0 8px 30px rgba(0,0,0,.4)}
+#ack .mh{display:flex;align-items:center;gap:10px;padding:10px 20px;color:#fff;
+background:%(color)s;font-weight:600}
+#ack .mb{padding:16px 20px 18px}
 #ack h2{margin:0 0 10px;font-size:18px}#ack p{margin:0 0 8px}
 #ack-ok{margin-top:8px;padding:8px 16px;font:inherit;font-weight:600;color:#fff;
 background:%(color)s;border:0;border-radius:4px;cursor:pointer}
@@ -184,9 +187,10 @@ def shell_page(
         + _NOTICE
         + "</div></div>"
         "<div id=ack role=dialog aria-modal=true aria-labelledby=ack-t hidden>"
-        "<div class=card><h2 id=ack-t>Before you continue</h2>"
+        f"<div class=card><div class=mh>{logo}<span>{name}</span></div><div class=mb>"
+        "<h2 id=ack-t>Before you continue</h2>"
         + _NOTICE
-        + "<button id=ack-ok type=button>I understand</button></div></div>"
+        + "<button id=ack-ok type=button>I understand</button></div></div></div>"
         f'<iframe id=f sandbox="allow-scripts" title="{safe_title}" '
         "referrerpolicy=no-referrer "
         f'src="{html.escape(content_url, quote=True)}"></iframe>'
