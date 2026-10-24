@@ -378,6 +378,13 @@ def test_log_events_are_json_and_carry_no_token(world, caplog):
 
 
 class TestShellFeatures:
+    def test_first_visit_notice_is_a_modal_with_a_30_day_cookie(self, world):
+        _, record = make_bundle(world)
+        text = world.client.get(f"/a/{record.hash}-q3-board-deck/", headers=APP).text
+        assert "id=ack" in text and "I understand" in text
+        assert '"artifacts_notice"' in text and "Max-Age=2592000" in text
+        assert "SameSite=Lax" in text and "Domain=" not in text
+
     def test_script_runs_only_with_the_nonce(self, world):
         _, record = make_bundle(world)
         response = world.client.get(f"/a/{record.hash}-q3-board-deck/", headers=APP)

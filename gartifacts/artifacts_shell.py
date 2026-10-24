@@ -68,6 +68,18 @@ _ICON_PDF = (
     '<path d="M14 3v5h5"/><path d="M9 14h6M9 17h4"/></svg>'
 )
 
+_NOTICE = (
+    "<p><strong>Never enter passwords or secrets here.</strong></p>"
+    "<p>This content was created by people (or by AI) and has not been reviewed.</p>"
+    "<p>Be especially careful about what you type here. Never sign in to any site "
+    "inside this frame, and never enter a password, key or personal "
+    "information: a login box in this area could be a fake.</p>"
+    "<p>Only the bar at the top is part of the viewer.</p>"
+)
+
+_NOTICE_COOKIE = "artifacts_notice"
+_NOTICE_DAYS = 30
+
 _CSS = """
 html,body{height:100%%;margin:0}
 body{display:flex;flex-direction:column;font:14px system-ui,sans-serif}
@@ -88,7 +100,14 @@ font-weight:700;letter-spacing:.04em}
 #pop{position:absolute;top:100%%;right:14px;max-width:420px;padding:12px 14px;z-index:2;
 color:#222;background:#fff;border:1px solid #888;border-radius:6px;
 box-shadow:0 4px 14px rgba(0,0,0,.25)}
-#pop[hidden]{display:none}
+#pop[hidden],#ack[hidden]{display:none}
+#ack{position:fixed;inset:0;z-index:10;display:flex;align-items:center;
+justify-content:center;padding:16px;background:rgba(0,0,0,.55)}
+#ack .card{max-width:440px;max-height:100%%;overflow:auto;padding:18px 20px;color:#222;
+background:#fff;border-radius:8px;box-shadow:0 8px 30px rgba(0,0,0,.4)}
+#ack h2{margin:0 0 10px;font-size:18px}#ack p{margin:0 0 8px}
+#ack-ok{margin-top:8px;padding:8px 16px;font:inherit;font-weight:600;color:#fff;
+background:%(color)s;border:0;border-radius:4px;cursor:pointer}
 #pop p{margin:0 0 8px}#pop p:last-child{margin:0}
 iframe{flex:1;border:0;width:100%%}
 @media(max-width:640px){
@@ -97,7 +116,7 @@ iframe{flex:1;border:0;width:100%%}
 .hdr .btn{padding:5px 8px}
 #pop{left:10px;right:10px;max-width:none}}
 @media(max-width:480px){.title{display:none}}
-@media print{.hdr,#pop{display:none}html,body{height:auto}body{display:block}
+@media print{.hdr,#pop,#ack{display:none}html,body{height:auto}body{display:block}
 iframe{height:var(--h,100vh)}}
 """
 
@@ -116,6 +135,14 @@ addEventListener('message',function(e){
  if(typeof h==='number'&&isFinite(h)&&h>=0)
   f.style.setProperty('--h',Math.ceil(Math.min(h,200000))+'px');
 });
+var ack=document.getElementById('ack'),C=%(cookie)s+'=1';
+if(document.cookie.split('; ').indexOf(C)<0){
+ var top_=document.getElementById('top');top_.inert=true;f.inert=true;ack.hidden=false;
+ document.getElementById('ack-ok').focus();
+ document.getElementById('ack-ok').addEventListener('click',function(){
+  document.cookie=C+'; Max-Age=%(age)d; Path=/; SameSite=Lax'
+   +(location.protocol==='https:'?'; Secure':'');
+  ack.hidden=true;top_.inert=false;f.inert=false})}
 document.getElementById('pdf').addEventListener('click',function(){window.print()});
 function toggle(show){pop.hidden=!show;info.setAttribute('aria-expanded',String(show))}
 info.addEventListener('click',function(e){e.stopPropagation();toggle(pop.hidden)});
@@ -155,16 +182,16 @@ def shell_page(
         f'<button id=pdf class=btn type=button aria-label="Save as PDF" title="Save as PDF">'
         f"{_ICON_PDF}<span class=lbl>PDF</span></button></header>"
         '<div id=pop role=dialog aria-label="About this content" hidden>'
-        "<p><strong>Never enter passwords or secrets here.</strong></p>"
-        "<p>This content was created by people (or by AI) and has not been reviewed.</p>"
-        "<p>Be especially careful about what you type here. Never sign in to any site "
-        "inside this frame, and never enter a password, key or personal "
-        "information: a login box in this area could be a fake.</p>"
-        "<p>Only the bar above is part of the viewer.</p></div></div>"
+        + _NOTICE
+        + "</div></div>"
+        "<div id=ack role=dialog aria-modal=true aria-labelledby=ack-t hidden>"
+        "<div class=card><h2 id=ack-t>Before you continue</h2>"
+        + _NOTICE
+        + "<button id=ack-ok type=button>I understand</button></div></div>"
         f'<iframe id=f sandbox="allow-scripts" title="{safe_title}" '
         "referrerpolicy=no-referrer "
         f'src="{html.escape(content_url, quote=True)}"></iframe>'
-        f'<script nonce="{nonce}">{_SCRIPT % {"base": json.dumps(base_path)}}</script>'
+        f'<script nonce="{nonce}">{_SCRIPT % {"base": json.dumps(base_path), "cookie": json.dumps(_NOTICE_COOKIE), "age": _NOTICE_DAYS * 86400}}</script>'
         "</body></html>"
     )
     csp = (
