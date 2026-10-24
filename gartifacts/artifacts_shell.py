@@ -70,9 +70,9 @@ _ICON_PDF = (
 
 _NOTICE = (
     "<p><strong>Never enter passwords or secrets here.</strong></p>"
-    "<p>This content was created by people (or by AI) and has not been reviewed.</p>"
-    "<p>Don't sign in to any site here. A login box in this area could be a fake.</p>"
-    "<p>Only the bar at the top is part of the viewer.</p>"
+    "<ul><li>This content was created by people (or by AI) and has not been reviewed.</li>"
+    "<li>Don't sign in to any site here. A login box in this area could be a fake.</li>"
+    "<li>Only the bar at the top is part of the viewer.</li></ul>"
 )
 
 _NOTICE_COOKIE = "artifacts_notice"
@@ -105,7 +105,9 @@ background:#fff;border-radius:8px;box-shadow:0 8px 30px rgba(0,0,0,.4)}
 #ack h2{margin:0 0 10px;font-size:18px}#ack p{margin:0 0 8px}
 #ack-ok{margin-top:8px;padding:8px 16px;font:inherit;font-weight:600;color:#fff;
 background:%(color)s;border:0;border-radius:4px;cursor:pointer}
-#pop p{margin:0 0 8px}#pop p:last-child{margin:0}
+#pop p{margin:0 0 8px}#pop p:last-child,#pop ul:last-child{margin:0}
+#pop ul,#ack ul{margin:0 0 8px;padding-left:20px}
+#pop li,#ack li{margin-bottom:4px}
 iframe{flex:1;border:0;width:100%%}
 @media(max-width:640px){
 .hdr{gap:8px;padding:6px 10px}
