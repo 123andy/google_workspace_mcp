@@ -32,7 +32,7 @@ def test_default_csp_shape():
     assert directives["form-action"] == "'none'"
     assert directives["frame-ancestors"] == "'none'"
     assert directives["worker-src"] == "blob:"
-    assert directives["sandbox"] == "allow-scripts"
+    assert directives["sandbox"] == "allow-scripts allow-modals"
     assert "'unsafe-eval'" in directives["script-src"]
     assert "cdn.jsdelivr.net" in directives["script-src"]
     assert "report-uri" not in directives

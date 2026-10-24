@@ -76,7 +76,7 @@ class TestViewerPage:
         assert "has not been reviewed" in text
         assert 'aria-label="Reload"' in text and 'aria-label="Save as PDF"' in text
         assert "<header class=hdr>" in text and "id=reload" in text and "id=pdf" in text
-        assert 'sandbox="allow-scripts"' in text
+        assert 'sandbox="allow-scripts allow-modals"' in text
         assert "allow-same-origin" not in text
         assert f"{CONTENT_ORIGIN}/c/" in text
         assert response.headers["x-content-type-options"] == "nosniff"
@@ -175,7 +175,7 @@ class TestContent:
         assert response.content.startswith(b"<h1>hi</h1><script>")
         assert response.headers["content-type"] == "text/html; charset=utf-8"
         csp = response.headers["content-security-policy"]
-        assert "sandbox allow-scripts" in csp
+        assert "sandbox allow-scripts allow-modals" in csp
         assert f"frame-ancestors {VIEWER_ORIGIN}" in csp
         assert "connect-src 'self' data: blob:" in csp
         assert "report-uri /csp-report" in csp

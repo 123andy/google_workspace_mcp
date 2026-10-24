@@ -118,7 +118,8 @@ DEFAULT_LIMITS: Mapping[str, int] = {
 
 SANDBOX_LIMITS: Tuple[str, ...] = (
     "No cookies, localStorage or sessionStorage: the page runs in an opaque origin.",
-    "No downloads, modal dialogs or popups, and no navigation of the surrounding page.",
+    "No downloads or popups, and no navigation of the surrounding page. Dialogs "
+    "(alert, confirm, print) are allowed.",
     "No fetch, XMLHttpRequest, WebSocket or beacon to other origins; "
     "fetching the bundle's own files is allowed.",
     "No Web Workers from bundle files (only blob: workers).",
@@ -251,7 +252,7 @@ def build_csp(
         f"form-action {_NONE}",
         f"base-uri {_NONE}",
         f"frame-ancestors {frame_ancestors or _NONE}",
-        "sandbox allow-scripts",
+        "sandbox allow-scripts allow-modals",
     ]
     if report_path:
         parts.append(f"report-uri {report_path}")

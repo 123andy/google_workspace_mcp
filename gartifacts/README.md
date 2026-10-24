@@ -34,7 +34,7 @@ Two public hostnames point at the same server. The gateway adds one request head
 
 ## Security notes
 
-- Artifact pages run in `<iframe sandbox="allow-scripts">` with no `allow-same-origin`, on a host that holds no session, under a Content-Security-Policy that also sends `sandbox allow-scripts`, so a page opened directly is sandboxed too. A content URL opened as a top-level page is redirected to the viewer.
+- Artifact pages run in `<iframe sandbox="allow-scripts allow-modals">` with no `allow-same-origin`, on a host that holds no session, under a Content-Security-Policy that also sends `sandbox allow-scripts`, so a page opened directly is sandboxed too. A content URL opened as a top-level page is redirected to the viewer.
 - The policy limits where scripts, styles, fonts and images may load from and blocks other network access. It cannot stop script from navigating its own frame, so the shell shows a permanent "user-generated content, never enter a password" banner, and artifacts must not hold secrets.
 - Content tokens are encrypted and expire; a leaked token reads one bundle as one user until it expires.
 - Drive remains the only permission system: the viewer reads as the signed-in user, so sharing a bundle folder in Drive is what grants access.

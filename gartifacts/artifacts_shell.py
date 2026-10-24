@@ -32,6 +32,14 @@ _TRACKER = (
     "if(window.ResizeObserver){new ResizeObserver(s).observe(document.documentElement)}"
     "['pushState','replaceState'].forEach(function(n){var o=history[n];"
     "history[n]=function(){var r=o.apply(this,arguments);s();return r}});"
+    "addEventListener('message',function(e){"
+    "if(e.source!==parent||!e.data||e.data.a!=='artifacts-print')return;"
+    "parent.postMessage({a:'artifacts-printing'},T);window.print()});"
+    "addEventListener('beforeprint',function(){var m=document.createElement('style');"
+    "m.id='__artifacts_print';m.textContent='@page{margin:6mm}';"
+    "document.head.appendChild(m)});"
+    "addEventListener('afterprint',function(){var m=document.getElementById('__artifacts_print');"
+    "if(m)m.remove()});"
     "s()}catch(e){}})();"
 )
 
@@ -148,7 +156,12 @@ if(document.cookie.split('; ').indexOf(C)<0){
   document.cookie=C+'; Max-Age=%(age)d; Path=/; SameSite=Lax'
    +(location.protocol==='https:'?'; Secure':'');
   ack.hidden=true;top_.inert=false;f.inert=false})}
-document.getElementById('pdf').addEventListener('click',function(){window.print()});
+var printing=false;
+addEventListener('message',function(e){if(e.source===f.contentWindow&&e.data&&e.data.a==='artifacts-printing')printing=true});
+document.getElementById('pdf').addEventListener('click',function(){
+ printing=false;
+ try{f.contentWindow.postMessage({a:'artifacts-print'},'*')}catch(x){}
+ setTimeout(function(){if(!printing)window.print()},400)});
 function toggle(show){pop.hidden=!show;info.setAttribute('aria-expanded',String(show))}
 info.addEventListener('click',function(e){e.stopPropagation();toggle(pop.hidden)});
 document.addEventListener('click',function(e){if(!pop.contains(e.target))toggle(false)});
@@ -195,7 +208,7 @@ def shell_page(
         "<h2 id=ack-t>Before you continue</h2>"
         + _NOTICE
         + "<button id=ack-ok type=button>I understand</button></div></div></div>"
-        f'<iframe id=f sandbox="allow-scripts" title="{safe_title}" '
+        f'<iframe id=f sandbox="allow-scripts allow-modals" title="{safe_title}" '
         "referrerpolicy=no-referrer "
         f'src="{html.escape(content_url, quote=True)}"></iframe>'
         f'<script nonce="{nonce}">{_SCRIPT % {"base": json.dumps(base_path), "cookie": json.dumps(_NOTICE_COOKIE), "age": _NOTICE_DAYS * 86400}}</script>'
