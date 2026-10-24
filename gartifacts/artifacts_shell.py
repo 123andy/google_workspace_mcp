@@ -93,7 +93,7 @@ html,body{height:100%%;margin:0}
 body{display:flex;flex-direction:column;font:14px system-ui,sans-serif}
 .hdr{display:flex;align-items:center;gap:10px;padding:6px 14px;color:#fff;background:%(color)s}
 .logo{height:28px;width:34px;object-fit:contain;filter:brightness(0) invert(1)}
-.hdr button.brandbtn{display:inline-flex;align-items:center;gap:10px;min-width:0;padding:0;
+.hdr button.brandbtn{flex-shrink:0;display:inline-flex;align-items:center;gap:10px;min-width:0;padding:0;
 border:0;background:none}
 .brand{font-weight:600;white-space:nowrap;min-width:0;overflow:hidden;text-overflow:ellipsis}
 .title{opacity:.85;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;
@@ -137,7 +137,7 @@ iframe{flex:1;border:0;width:100%%}
 .lbl{display:none}
 .hdr .btn{padding:5px 8px}
 #pop{left:10px;right:10px;max-width:none}}
-@media(max-width:480px){.title{display:none}}
+@media(max-width:480px){.title{display:none}.hdr button.brandbtn{flex-shrink:1}}
 @page{margin:6mm}
 @media print{.hdr,#pop,#ack,#about,#toast{display:none}html,body{height:auto}body{display:block}
 iframe{height:var(--h,100vh)}}
