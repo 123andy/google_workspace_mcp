@@ -84,7 +84,9 @@ body{display:flex;flex-direction:column;font:14px system-ui,sans-serif}
 .hdr{display:flex;align-items:center;gap:10px;padding:6px 14px;color:#fff;background:%(color)s}
 .logo{height:28px;width:34px;object-fit:contain;filter:brightness(0) invert(1)}
 .brand{font-weight:600;white-space:nowrap;min-width:0;overflow:hidden;text-overflow:ellipsis}
-.title{opacity:.85;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.title{opacity:.85;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;
+color:inherit;text-decoration:none}
+a.title:hover{opacity:1;text-decoration:underline}
 .warn{margin-left:auto;display:flex;align-items:center;gap:6px;white-space:nowrap}
 .hdr button,.hdr a.btn{font:inherit;color:#fff;background:transparent;
 border:1px solid rgba(255,255,255,.7);border-radius:4px;padding:3px 10px;
@@ -175,7 +177,8 @@ def shell_page(
         '<meta name=viewport content="width=device-width, initial-scale=1">'
         f"<style>{_CSS % {'color': brand_color()}}</style></head><body>"
         f"<div id=top><header class=hdr>{logo}<span class=brand>{name}</span>"
-        f'<span class=title title="{safe_title}">{safe_title}</span>'
+        f'<a class=title href="{html.escape(base_path, quote=True)}/" '
+        f'title="Go to the first page of {safe_title}">{safe_title}</a>'
         "<span class=warn><button id=info class=info type=button "
         'aria-label="Caution: about this content" aria-expanded=false '
         f"aria-controls=pop>{_ICON_WARN}CAUTION</button></span>"

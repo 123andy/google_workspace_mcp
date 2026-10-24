@@ -385,6 +385,13 @@ class TestShellFeatures:
         assert '"artifacts_notice"' in text and "Max-Age=2592000" in text
         assert "SameSite=Lax" in text and "Domain=" not in text
 
+    def test_title_links_to_the_first_page(self, world):
+        _, record = make_bundle(world)
+        text = world.client.get(
+            f"/a/{record.hash}-q3-board-deck/page2.html", headers=APP
+        ).text
+        assert f'<a class=title href="/a/{record.hash}-q3-board-deck/"' in text
+
     def test_script_runs_only_with_the_nonce(self, world):
         _, record = make_bundle(world)
         response = world.client.get(f"/a/{record.hash}-q3-board-deck/", headers=APP)
