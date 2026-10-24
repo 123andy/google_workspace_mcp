@@ -51,6 +51,9 @@ notice:                     # bullets under the fixed "Never enter passwords or 
   - This content was created by people and has not been reviewed.
 about:                      # bullets in the About dialog (click the logo and name)
   - Shared inside Acme only.
+request_message: "Viewer access to artifact: {url} - please copy the artifact url into the message window if you approve this request"   # {url} is the viewer link
+request_steps:              # numbered steps on the page shown to someone without access
+  - Choose Viewer on Google's request page.
 ```
 
 `notice` and `about` are HTML fragments inserted as written, so the file must be trusted configuration; the

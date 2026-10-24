@@ -88,6 +88,19 @@ DEFAULT_ABOUT = (
     "To share outside the company, use the PDF button and check the file first.",
     "Anyone you share an artifact's folder with can see everything in it.",
 )
+DEFAULT_REQUEST_MESSAGE = (
+    "Viewer access to artifact: {url} - please copy the artifact url into the "
+    "message window if you approve this request"
+)
+DEFAULT_REQUEST_STEPS = (
+    "Click <strong>Request access in Google Drive</strong> below (it opens in a new tab).",
+    "On Google's page, choose <strong>Viewer</strong>. Google preselects Editor, "
+    "which would let the person who approves you hand over edit rights.",
+    "Paste the message below into Google's message box, then send the request.",
+    "When the owner approves, come back to this page and press "
+    "<strong>Check again</strong>. Google's approval email links to the Drive folder; "
+    "this page is the viewer.",
+)
 _ICON_MAX_BYTES = 256 * 1024
 _ICON_TYPES = {".png": "image/png", ".svg": "image/svg+xml", ".ico": "image/x-icon"}
 _MAX_ITEMS = 12
@@ -110,6 +123,8 @@ class Branding:
     notice_days: int = DEFAULT_NOTICE_DAYS
     notice: Tuple[str, ...] = DEFAULT_NOTICE
     about: Tuple[str, ...] = DEFAULT_ABOUT
+    request_message: str = DEFAULT_REQUEST_MESSAGE
+    request_steps: Tuple[str, ...] = DEFAULT_REQUEST_STEPS
 
 
 def _text_list(value: Any, fallback: Tuple[str, ...]) -> Tuple[str, ...]:
@@ -119,6 +134,13 @@ def _text_list(value: Any, fallback: Tuple[str, ...]) -> Tuple[str, ...]:
         return fallback
     items = [v for v in value if isinstance(v, str) and 0 < len(v) <= _MAX_TEXT]
     return tuple(items) if items and len(items) == len(value) else fallback
+
+
+def _message(value: Any) -> str:
+    """The text people paste into Google's request box (``{url}`` is the viewer link)."""
+    if isinstance(value, str) and "{url}" in value and len(value) <= 220:
+        return value.strip()
+    return DEFAULT_REQUEST_MESSAGE
 
 
 def _load_icon(raw: Any, base_dir: str) -> Optional[Tuple[bytes, str]]:
@@ -162,6 +184,8 @@ def _parse_branding(path: str) -> Branding:
         else DEFAULT_NOTICE_DAYS,
         notice=_text_list(data.get("notice"), DEFAULT_NOTICE),
         about=_text_list(data.get("about"), DEFAULT_ABOUT),
+        request_message=_message(data.get("request_message")),
+        request_steps=_text_list(data.get("request_steps"), DEFAULT_REQUEST_STEPS),
     )
 
 

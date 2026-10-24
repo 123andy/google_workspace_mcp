@@ -60,7 +60,12 @@ from gartifacts.artifacts_policy import (
     load_policy,
 )
 from gartifacts.artifacts_registry import get_artifact_registry
-from gartifacts.artifacts_shell import ICON_ROUTE, inject_tracker, shell_page
+from gartifacts.artifacts_shell import (
+    ICON_ROUTE,
+    denied_page,
+    inject_tracker,
+    shell_page,
+)
 from gartifacts.artifacts_tokens import (
     TokenConfigError,
     mint_content_token,
@@ -170,17 +175,19 @@ def _page(
     return HTMLResponse(body, status_code=status, headers=merged)
 
 
-def _unavailable(folder_id: Optional[str] = None) -> HTMLResponse:
-    """The same page for missing and denied; a registered link adds Drive's request page."""
-    return _page(
-        404,
-        "Not available",
-        "This artifact does not exist, or you do not have access to it.",
-        action=(
-            ("Request access in Google Drive", f"{DRIVE_FOLDER_URL}{folder_id}")
-            if folder_id
-            else None
-        ),
+def _unavailable(record: Any = None, segment: str = "") -> HTMLResponse:
+    """The same page for missing and denied; a registered link adds the request steps.
+
+    The link in the pasted message is the one the person typed (``segment``), never the
+    registered slug, which comes from the title.
+    """
+    if record is None:
+        return denied_page(None, "", _SECURITY_HEADERS)
+    base = viewer_base_url() or ""
+    return denied_page(
+        f"{DRIVE_FOLDER_URL}{record.folder_id}",
+        f"{base}/a/{quote(segment, safe='')}/",
+        _SECURITY_HEADERS,
     )
 
 
@@ -319,7 +326,7 @@ async def viewer_page(request: Request) -> Response:
             outcome="denied_or_missing",
             request_id=request_id,
         )
-        return _unavailable(record.folder_id)
+        return _unavailable(record, segment)
     except Exception:
         logger.exception("Drive check failed")
         return _page(

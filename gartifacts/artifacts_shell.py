@@ -283,3 +283,89 @@ def _script(base_path: str, notice_days: int) -> str:
         "copied": json.dumps(_COPIED),
         "notcopied": json.dumps(_NOT_COPIED),
     }
+
+
+_DENIED_CSS = """
+body{margin:0;font:16px system-ui,sans-serif;color:#222}
+.top{display:flex;align-items:center;gap:10px;padding:8px 16px;color:#fff;background:%(color)s;
+font-weight:600}
+.logo{height:28px;width:34px;object-fit:contain;filter:brightness(0) invert(1)}
+main{max-width:36rem;margin:2rem auto;padding:0 16px}
+h1{font-size:1.6rem;margin:0 0 .5rem}
+ol{padding-left:1.3rem}li{margin-bottom:.5rem}
+.msg{width:100%%;box-sizing:border-box;font:14px ui-monospace,monospace;padding:8px;
+border:1px solid #888;border-radius:4px;resize:none}
+button,a.btn{display:inline-block;margin:6px 8px 6px 0;padding:8px 14px;font:inherit;
+font-weight:600;color:#fff;background:%(color)s;border:0;border-radius:4px;cursor:pointer;
+text-decoration:none}
+button.plain{color:%(color)s;background:#fff;border:1px solid %(color)s}
+#ok{margin-left:4px;color:#060}
+"""
+
+_DENIED_SCRIPT = """
+(function(){
+var t=document.getElementById('msg');
+document.getElementById('copy').addEventListener('click',function(){
+ function done(){document.getElementById('ok').textContent='Copied'}
+ if(navigator.clipboard&&navigator.clipboard.writeText){
+  navigator.clipboard.writeText(t.value).then(done,function(){t.select()})}
+ else{t.select();try{document.execCommand('copy');done()}catch(x){}}});
+document.getElementById('again').addEventListener('click',function(){location.reload()});
+})();
+"""
+
+
+def denied_page(
+    drive_url: Optional[str], viewer_url: str, headers: dict
+) -> HTMLResponse:
+    """The page for a link the user cannot open.
+
+    It is the same for a missing and a denied link; a registered link also gets Drive's
+    request-access link, the steps, and the message to paste into Google's request box.
+    It shows nothing about the artifact itself.
+    """
+    look = branding()
+    name = html.escape(look.name)
+    nonce = secrets.token_urlsafe(16)
+    logo = f'<img class=logo src="{ICON_ROUTE}" alt="">' if look.icon else ""
+    favicon = f'<link rel=icon href="{ICON_ROUTE}">' if look.icon else ""
+    steps = ""
+    if drive_url:
+        message = html.escape(look.request_message.replace("{url}", viewer_url))
+        items = "".join(f"<li>{step}</li>" for step in look.request_steps)
+        steps = (
+            f"<ol>{items}</ol>"
+            f'<textarea id=msg class=msg rows=5 readonly aria-label="Message to paste">'
+            f"{message}</textarea>"
+            "<p><button id=copy type=button class=plain>Copy message</button>"
+            "<span id=ok role=status></span></p>"
+            f'<p><a class=btn href="{html.escape(drive_url, quote=True)}" target=_blank '
+            "rel=noopener>Request access in Google Drive</a>"
+            "<button id=again type=button class=plain>Check again</button></p>"
+        )
+    body = (
+        "<!doctype html><html lang=en><head><meta charset=utf-8>"
+        f"<title>Not available - {name}</title>{favicon}"
+        '<meta name=viewport content="width=device-width, initial-scale=1">'
+        f"<style>{_DENIED_CSS % {'color': look.color}}</style></head><body>"
+        f"<div class=top>{logo}<span>{name}</span></div><main>"
+        "<h1>Not available</h1>"
+        "<p>This artifact does not exist, or you do not have access to it.</p>"
+        + (
+            "<p>Artifacts are stored in the owner's Google Drive and open only for "
+            "people the owner has shared them with.</p>"
+            if drive_url
+            else ""
+        )
+        + steps
+        + "</main>"
+        + (f'<script nonce="{nonce}">{_DENIED_SCRIPT}</script>' if drive_url else "")
+        + "</body></html>"
+    )
+    csp = (
+        f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; "
+        "img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+    )
+    return HTMLResponse(
+        body, status_code=404, headers={**headers, "Content-Security-Policy": csp}
+    )

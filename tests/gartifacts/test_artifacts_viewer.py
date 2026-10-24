@@ -550,3 +550,71 @@ class TestShellFeatures:
         assert "Request access in Google Drive" in denied.text
         unknown = world.client.get("/a/zzzzzzzz-x/", headers=APP)
         assert unknown.status_code == 404 and "drive.google.com" not in unknown.text
+
+
+class TestDeniedPage:
+    def _denied(self, world, segment=None):
+        bundle, record = make_bundle(world)
+        del world.drive.items[bundle]
+        seg = segment or f"{record.hash}-whatever-i-typed"
+        return bundle, record, world.client.get(f"/a/{seg}/", headers=APP), seg
+
+    def test_steps_message_and_buttons(self, world):
+        bundle, record, response, seg = self._denied(world)
+        text = response.text
+        assert response.status_code == 404
+        assert "choose <strong>Viewer</strong>" in text
+        assert f"{VIEWER_ORIGIN}/a/{seg}/" in text
+        assert "please copy the artifact url into the message window" in text
+        assert "id=copy" in text and "id=again" in text
+        assert f"https://drive.google.com/drive/folders/{bundle}" in text
+        nonce = (
+            response.headers["content-security-policy"]
+            .split("'nonce-")[1]
+            .split("'")[0]
+        )
+        assert f'<script nonce="{nonce}">' in text
+
+    def test_message_uses_what_was_typed_not_the_registered_slug(self, world):
+        _, record, response, _ = self._denied(world)
+        assert record.slug not in response.text.replace(record.hash, "")
+
+    def test_hostile_link_cannot_inject_markup(self, world):
+        _, record = make_bundle(world)
+        bad = f"{record.hash}-%22%3E%3Cscript%3Ealert(1)%3C%2Fscript%3E"
+        del world.drive.items[_]
+        response = world.client.get(f"/a/{bad}/", headers=APP)
+        assert (
+            "<script>alert" not in response.text
+            and "<script>alert" not in response.text.lower()
+        )
+
+    def test_unknown_link_gets_no_steps_and_no_drive_link(self, world):
+        make_bundle(world)
+        response = world.client.get("/a/zzzzzzzz-x/", headers=APP)
+        assert response.status_code == 404
+        assert (
+            "id=copy" not in response.text and "drive.google.com" not in response.text
+        )
+        assert "<script" not in response.text
+
+    def test_wording_comes_from_the_branding_file(self, world, monkeypatch, tmp_path):
+        path = tmp_path / "b.yaml"
+        path.write_text(
+            "request_message: 'Please share {url} as viewer'\n"
+            "request_steps:\n  - Ask in Slack first.\n"
+        )
+        monkeypatch.setenv(BRANDING_FILE_ENV, str(path))
+        _, _, response, seg = self._denied(world)
+        assert f"Please share {VIEWER_ORIGIN}/a/{seg}/ as viewer" in response.text
+        assert "<li>Ask in Slack first.</li>" in response.text
+
+    def test_message_without_a_placeholder_falls_back(
+        self, world, monkeypatch, tmp_path
+    ):
+        path = tmp_path / "b.yaml"
+        path.write_text("request_message: 'no placeholder here'\n")
+        monkeypatch.setenv(BRANDING_FILE_ENV, str(path))
+        _, _, response, _ = self._denied(world)
+        assert "no placeholder here" not in response.text
+        assert "Viewer access to artifact:" in response.text
