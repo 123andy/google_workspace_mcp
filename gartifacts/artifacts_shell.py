@@ -82,8 +82,7 @@ _CSS = """
 html,body{height:100%%;margin:0}
 body{display:flex;flex-direction:column;font:14px system-ui,sans-serif}
 .hdr{display:flex;align-items:center;gap:10px;padding:6px 14px;color:#fff;background:%(color)s}
-.logo{height:26px;width:32px;box-sizing:border-box;padding:3px;border-radius:6px;
-background:#fff;object-fit:contain}
+.logo{height:28px;width:34px;object-fit:contain;filter:brightness(0) invert(1)}
 .brand{font-weight:600;white-space:nowrap;min-width:0;overflow:hidden;text-overflow:ellipsis}
 .title{opacity:.85;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
 .warn{margin-left:auto;display:flex;align-items:center;gap:6px;white-space:nowrap}
