@@ -18,6 +18,9 @@ A *bundle* is a Drive folder with an `index.html` at its top level and other pag
 | `WORKSPACE_MCP_ARTIFACTS_VIEWER=true` | Mounts the viewer, content and report routes and allows `Origin: null` on content reads only. |
 | `WORKSPACE_MCP_ARTIFACTS_VIEWER_URL` | Public base URL of the viewer (links returned to users; allowed to frame the content). |
 | `WORKSPACE_MCP_ARTIFACTS_CONTENT_URL` | Public base URL of the content host. |
+| `WORKSPACE_MCP_ARTIFACTS_BRAND_NAME` | Name in the viewer's header bar (default `Artifacts`). |
+| `WORKSPACE_MCP_ARTIFACTS_BRAND_COLOR` | Header bar colour as `#rrggbb`; text is white (default dark blue). |
+| `WORKSPACE_MCP_ARTIFACTS_ICON_PATH` | PNG, SVG or ICO file (up to 256 KB) used as the favicon and the header logo; none by default. |
 | `WORKSPACE_MCP_ARTIFACTS_TOKEN_KEY` | Secret (at least 16 characters) used to encrypt content tokens. |
 | `WORKSPACE_MCP_ARTIFACTS_TOKEN_TTL_SECONDS` | Token lifetime, 60 to 86400 (default 3600). |
 | `WORKSPACE_MCP_ARTIFACTS_REGISTRY_PATH` | SQLite file for the registry (default: `artifacts.sqlite` in the credentials directory). |

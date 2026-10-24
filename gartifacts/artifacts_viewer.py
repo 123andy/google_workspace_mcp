@@ -38,6 +38,7 @@ from gartifacts.artifacts_config import (
     CONTENT_MARKER,
     ROUTE_MARKER_HEADER,
     content_base_url,
+    icon,
     viewer_base_url,
 )
 from gartifacts.artifacts_consent import begin_consent
@@ -59,6 +60,7 @@ from gartifacts.artifacts_policy import (
     load_policy,
 )
 from gartifacts.artifacts_registry import get_artifact_registry
+from gartifacts.artifacts_shell import ICON_ROUTE, inject_tracker, shell_page
 from gartifacts.artifacts_tokens import (
     TokenConfigError,
     mint_content_token,
@@ -231,38 +233,6 @@ async def _check_folder(
     return meta
 
 
-def _shell_page(
-    title: str, content_url: str, content_origin: str, reload_url: str
-) -> HTMLResponse:
-    safe_title = html.escape(title)
-    body = (
-        "<!doctype html><html lang=en><head><meta charset=utf-8>"
-        f"<title>{safe_title} - Artifact</title>"
-        '<meta name=viewport content="width=device-width, initial-scale=1">'
-        "<style>html,body{height:100%;margin:0}body{display:flex;flex-direction:column;"
-        "font:14px system-ui,sans-serif}.banner{background:#fff4ce;border-bottom:1px solid "
-        "#d9b84a;padding:8px 14px}.bar{display:flex;justify-content:space-between;"
-        "align-items:center;padding:6px 14px;border-bottom:1px solid #ddd}"
-        "a.reload{padding:3px 10px;border:1px solid #888;border-radius:4px;color:inherit;"
-        "text-decoration:none}iframe{flex:1;border:0;width:100%}</style></head><body>"
-        "<div class=banner role=note><strong>User-generated content.</strong> "
-        "Never enter a password or sign in here.</div>"
-        f"<div class=bar><span>{safe_title}</span>"
-        f'<a class=reload href="{html.escape(reload_url, quote=True)}">Reload</a></div>'
-        f'<iframe sandbox="allow-scripts" title="{safe_title}" '
-        "referrerpolicy=no-referrer "
-        f'src="{html.escape(content_url, quote=True)}"></iframe></body></html>'
-    )
-    csp = (
-        "default-src 'none'; style-src 'unsafe-inline'; "
-        f"frame-src {content_origin}; frame-ancestors 'none'; base-uri 'none'; "
-        "form-action 'none'"
-    )
-    return HTMLResponse(
-        body, headers={**_SECURITY_HEADERS, "Content-Security-Policy": csp}
-    )
-
-
 async def viewer_page(request: Request) -> Response:
     """``GET /a/<hash>-<slug>/<path>``: authorise the viewer and return the shell."""
     request_id = uuid.uuid4().hex[:12]
@@ -358,11 +328,13 @@ async def viewer_page(request: Request) -> Response:
     log_event(
         "view", user=email, hash=record.hash, outcome="allowed", request_id=request_id
     )
-    return _shell_page(
+    return shell_page(
         record.title,
         f"{content_origin}/c/{token}/{quote(path)}",
         content_origin,
         f"/a/{canonical}/{quote(path)}",
+        f"/a/{canonical}",
+        _SECURITY_HEADERS,
     )
 
 
@@ -468,6 +440,8 @@ async def content_file(request: Request) -> Response:
     if download:
         out["Content-Disposition"] = "attachment"
     body = data if isinstance(data, (bytes, bytearray)) else str(data).encode("utf-8")
+    if content_type.startswith("text/html"):
+        body = inject_tracker(bytes(body), viewer_base_url())
     log_event(
         "content",
         user=claims.email,
@@ -523,6 +497,25 @@ async def csp_report(request: Request) -> Response:
     return Response(status_code=204)
 
 
+async def viewer_icon(request: Request) -> Response:
+    """``GET /a/_icon``: the configured favicon and header logo, if any."""
+    if _marker(request) != APP_MARKER:
+        return _unavailable()
+    found = icon()
+    if found is None:
+        return Response(status_code=404)
+    data, content_type = found
+    return Response(
+        data,
+        media_type=content_type,
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "public, max-age=3600",
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+        },
+    )
+
+
 async def viewer_no_slash(request: Request) -> Response:
     """``/a/<segment>`` without a slash: relative links need the trailing one."""
     return RedirectResponse(f"/a/{request.path_params['segment']}/", status_code=308)
@@ -531,6 +524,7 @@ async def viewer_no_slash(request: Request) -> Response:
 def viewer_routes() -> list:
     """Starlette routes for the viewer, content and report endpoints."""
     return [
+        Route(ICON_ROUTE, viewer_icon, methods=["GET"]),
         Route("/a/{segment}/{path:path}", viewer_page, methods=["GET"]),
         Route("/a/{segment}", viewer_no_slash, methods=["GET"]),
         Route("/c/{token}/{path:path}", content_file, methods=["GET"]),

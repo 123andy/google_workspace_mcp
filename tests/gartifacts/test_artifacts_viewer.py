@@ -72,8 +72,9 @@ class TestViewerPage:
         response = world.client.get(f"/a/{record.hash}-q3-board-deck/", headers=APP)
         assert response.status_code == 200
         text = response.text
-        assert "User-generated content." in text
-        assert "Never enter a password" in text
+        assert "Never enter passwords or secrets" in text
+        assert "has not been reviewed" in text
+        assert "<header class=hdr>" in text and "id=reload" in text and "id=pdf" in text
         assert 'sandbox="allow-scripts"' in text
         assert "allow-same-origin" not in text
         assert f"{CONTENT_ORIGIN}/c/" in text
@@ -170,7 +171,7 @@ class TestContent:
         _, record = make_bundle(world)
         response = world.client.get(f"/c/{token_for(record)}/", headers=FRAME)
         assert response.status_code == 200
-        assert response.content == b"<h1>hi</h1>"
+        assert response.content.startswith(b"<h1>hi</h1><script>")
         assert response.headers["content-type"] == "text/html; charset=utf-8"
         csp = response.headers["content-security-policy"]
         assert "sandbox allow-scripts" in csp
@@ -214,7 +215,7 @@ class TestContent:
         response = world.client.get(
             f"/c/{token_for(record)}/page2.html", headers=headers
         )
-        assert response.status_code == 200 and response.content == b"two"
+        assert response.status_code == 200 and response.content.startswith(b"two")
 
     def test_unframed_without_viewer_url_is_refused(self, world, monkeypatch):
         _, record = make_bundle(world)
@@ -373,3 +374,67 @@ def test_log_events_are_json_and_carry_no_token(world, caplog):
         '"outcome": "allowed"' in caplog.text and '"outcome": "served"' in caplog.text
     )
     assert token_for(record)[:20] not in caplog.text
+
+
+class TestShellFeatures:
+    def test_script_runs_only_with_the_nonce(self, world):
+        _, record = make_bundle(world)
+        response = world.client.get(f"/a/{record.hash}-q3-board-deck/", headers=APP)
+        csp = response.headers["content-security-policy"]
+        nonce = csp.split("script-src 'nonce-")[1].split("'")[0]
+        assert f'<script nonce="{nonce}">' in response.text
+        assert "unsafe-eval" not in csp and "script-src 'unsafe-inline'" not in csp
+
+    def test_shell_is_given_the_canonical_link_for_the_address_bar(self, world):
+        _, record = make_bundle(world)
+        response = world.client.get(f"/a/{record.hash}-old-slug/", headers=APP)
+        assert response.status_code == 302
+        shell = world.client.get(response.headers["location"], headers=APP)
+        assert f'base="/a/{record.hash}-q3-board-deck"' in shell.text
+
+    def test_tracker_is_added_to_html_only(self, world):
+        _, record = make_bundle(
+            world,
+            {"a.css": b"body{}", "b.js": b"1", "c.html": b"<body>x</body>"},
+        )
+        token = token_for(record)
+        css = world.client.get(f"/c/{token}/a.css", headers=FRAME)
+        js = world.client.get(f"/c/{token}/b.js", headers=FRAME)
+        page = world.client.get(f"/c/{token}/c.html", headers=FRAME)
+        assert css.content == b"body{}" and js.content == b"1"
+        assert page.content.startswith(b"<body>x<script>")
+        assert page.content.endswith(b"</script></body>")
+        assert VIEWER_ORIGIN.encode() in page.content
+
+    def test_tracker_skipped_without_a_viewer_url(self, world, monkeypatch):
+        _, record = make_bundle(world)
+        monkeypatch.delenv(VIEWER_URL_ENV)
+        response = world.client.get(f"/c/{token_for(record)}/", headers=FRAME)
+        assert b"<script>" not in response.content
+
+    def test_icon_route_and_header_logo(self, world, monkeypatch, tmp_path):
+        _, record = make_bundle(world)
+        link = f"/a/{record.hash}-q3-board-deck/"
+        assert world.client.get("/a/_icon", headers=APP).status_code == 404
+        assert "class=logo" not in world.client.get(link, headers=APP).text
+        path = tmp_path / "icon.png"
+        path.write_bytes(b"\x89PNG fake")
+        monkeypatch.setenv("WORKSPACE_MCP_ARTIFACTS_ICON_PATH", str(path))
+        icon = world.client.get("/a/_icon", headers=APP)
+        assert icon.status_code == 200 and icon.content == b"\x89PNG fake"
+        assert icon.headers["content-type"] == "image/png"
+        assert "sandbox" in icon.headers["content-security-policy"]
+        text = world.client.get(link, headers=APP).text
+        assert "class=logo" in text and "rel=icon" in text
+        assert world.client.get("/a/_icon", headers=CONTENT).status_code == 404
+
+    def test_brand_settings(self, world, monkeypatch):
+        _, record = make_bundle(world)
+        link = f"/a/{record.hash}-q3-board-deck/"
+        monkeypatch.setenv("WORKSPACE_MCP_ARTIFACTS_BRAND_NAME", "Acme <b>Artifacts")
+        monkeypatch.setenv("WORKSPACE_MCP_ARTIFACTS_BRAND_COLOR", "#1F346F")
+        text = world.client.get(link, headers=APP).text
+        assert "Acme &lt;b&gt;Artifacts" in text and "#1F346F" in text
+        monkeypatch.setenv("WORKSPACE_MCP_ARTIFACTS_BRAND_COLOR", "red;}</style>")
+        text = world.client.get(link, headers=APP).text
+        assert "red;}" not in text and "#1f3a5f" in text
