@@ -50,28 +50,53 @@ def inject_tracker(document: bytes, app_origin: Optional[str]) -> bytes:
     return document[:at] + tag + document[at:]
 
 
+_ICON_RELOAD = (
+    '<svg class=ic viewBox="0 0 24 24" width=16 height=16 fill=none stroke=currentColor '
+    "stroke-width=2 stroke-linecap=round stroke-linejoin=round aria-hidden=true>"
+    '<path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v5h-5"/></svg>'
+)
+_ICON_WARN = (
+    '<svg viewBox="0 0 24 24" width=18 height=18 aria-hidden=true>'
+    '<path d="M12 2.5 22.5 21h-21z" fill=#ffc107 stroke=#ffc107 stroke-width=2 '
+    'stroke-linejoin=round /><path d="M12 9.5v5M12 17.5v.01" stroke=#333 '
+    "stroke-width=2.2 stroke-linecap=round /></svg>"
+)
+_ICON_PDF = (
+    '<svg class=ic viewBox="0 0 24 24" width=16 height=16 fill=none stroke=currentColor '
+    "stroke-width=2 stroke-linecap=round stroke-linejoin=round aria-hidden=true>"
+    '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/>'
+    '<path d="M14 3v5h5"/><path d="M9 14h6M9 17h4"/></svg>'
+)
+
 _CSS = """
 html,body{height:100%%;margin:0}
 body{display:flex;flex-direction:column;font:14px system-ui,sans-serif}
 .hdr{display:flex;align-items:center;gap:10px;padding:6px 14px;color:#fff;background:%(color)s}
 .logo{height:26px;width:32px;box-sizing:border-box;padding:3px;border-radius:6px;
 background:#fff;object-fit:contain}
-.brand{font-weight:600;white-space:nowrap}
+.brand{font-weight:600;white-space:nowrap;min-width:0;overflow:hidden;text-overflow:ellipsis}
 .title{opacity:.85;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
-.warn{margin-left:auto;display:flex;align-items:center;gap:6px;font-weight:600;
-white-space:nowrap}
+.warn{margin-left:auto;display:flex;align-items:center;gap:6px;white-space:nowrap}
 .hdr button,.hdr a.btn{font:inherit;color:#fff;background:transparent;
 border:1px solid rgba(255,255,255,.7);border-radius:4px;padding:3px 10px;
 text-decoration:none;cursor:pointer}
+.hdr .btn{display:inline-flex;align-items:center;gap:6px}
 .hdr button:hover,.hdr a.btn:hover{background:rgba(255,255,255,.15)}
-.hdr button.info{width:22px;height:22px;padding:0;border-radius:50%%;font-weight:700;
-line-height:1}
-#pop{position:absolute;top:44px;right:14px;max-width:420px;padding:12px 14px;z-index:2;
+button.info{display:inline-flex;align-items:center;gap:6px;border:0;padding:3px 4px;
+font-weight:700;letter-spacing:.04em}
+#top{position:relative}
+#pop{position:absolute;top:100%%;right:14px;max-width:420px;padding:12px 14px;z-index:2;
 color:#222;background:#fff;border:1px solid #888;border-radius:6px;
 box-shadow:0 4px 14px rgba(0,0,0,.25)}
 #pop[hidden]{display:none}
 #pop p{margin:0 0 8px}#pop p:last-child{margin:0}
 iframe{flex:1;border:0;width:100%%}
+@media(max-width:640px){
+.hdr{gap:8px;padding:6px 10px}
+.lbl{display:none}
+.hdr .btn{padding:5px 8px}
+#pop{left:10px;right:10px;max-width:none}}
+@media(max-width:480px){.title{display:none}}
 @media print{.hdr,#pop{display:none}html,body{height:auto}body{display:block}
 iframe{height:var(--h,100vh)}}
 """
@@ -120,20 +145,22 @@ def shell_page(
         f"<title>{safe_title} - {name}</title>{favicon}"
         '<meta name=viewport content="width=device-width, initial-scale=1">'
         f"<style>{_CSS % {'color': brand_color()}}</style></head><body>"
-        f"<header class=hdr>{logo}<span class=brand>{name}</span>"
+        f"<div id=top><header class=hdr>{logo}<span class=brand>{name}</span>"
         f'<span class=title title="{safe_title}">{safe_title}</span>'
-        "<span class=warn>Never enter passwords or secrets "
-        '<button id=info class=info type=button aria-label="About this content" '
-        "aria-expanded=false aria-controls=pop>i</button></span>"
-        f'<a id=reload class=btn href="{html.escape(reload_url, quote=True)}">Reload</a>'
-        "<button id=pdf type=button>PDF</button></header>"
+        "<span class=warn><button id=info class=info type=button "
+        'aria-label="Caution: about this content" aria-expanded=false '
+        f"aria-controls=pop>{_ICON_WARN}CAUTION</button></span>"
+        f'<a id=reload class=btn href="{html.escape(reload_url, quote=True)}" '
+        f'aria-label="Reload" title="Reload">{_ICON_RELOAD}<span class=lbl>Reload</span></a>'
+        f'<button id=pdf class=btn type=button aria-label="Save as PDF" title="Save as PDF">'
+        f"{_ICON_PDF}<span class=lbl>PDF</span></button></header>"
         '<div id=pop role=dialog aria-label="About this content" hidden>'
-        "<p><strong>This content was created by people (or by AI) and has not been "
-        "reviewed.</strong></p>"
+        "<p><strong>Never enter passwords or secrets here.</strong></p>"
+        "<p>This content was created by people (or by AI) and has not been reviewed.</p>"
         "<p>Be especially careful about what you type here. Never sign in to any site "
         "inside this frame, and never enter a password, key or personal "
         "information: a login box in this area could be a fake.</p>"
-        "<p>Only the bar above is part of the viewer.</p></div>"
+        "<p>Only the bar above is part of the viewer.</p></div></div>"
         f'<iframe id=f sandbox="allow-scripts" title="{safe_title}" '
         "referrerpolicy=no-referrer "
         f'src="{html.escape(content_url, quote=True)}"></iframe>'

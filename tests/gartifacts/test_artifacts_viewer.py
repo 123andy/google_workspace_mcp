@@ -72,8 +72,9 @@ class TestViewerPage:
         response = world.client.get(f"/a/{record.hash}-q3-board-deck/", headers=APP)
         assert response.status_code == 200
         text = response.text
-        assert "Never enter passwords or secrets" in text
+        assert "CAUTION" in text and "Never enter passwords or secrets here." in text
         assert "has not been reviewed" in text
+        assert 'aria-label="Reload"' in text and 'aria-label="Save as PDF"' in text
         assert "<header class=hdr>" in text and "id=reload" in text and "id=pdf" in text
         assert 'sandbox="allow-scripts"' in text
         assert "allow-same-origin" not in text
