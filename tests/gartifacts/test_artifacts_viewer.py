@@ -464,6 +464,7 @@ class TestShellFeatures:
         link = self._link(world)
         text = world.client.get(link, headers=APP).text
         assert "Acme Artifacts" in text and "#1F346F" in text
+        assert 'class="brandbtn has-logo"' in text
         assert '<a href="https://x.example" target=_blank>help</a>' in text
         assert "Shared inside Acme only." in text and "Slack #support-ai" in text
         assert "has not been reviewed" not in text
@@ -533,7 +534,9 @@ class TestShellFeatures:
 
     def test_header_has_about_share_reload_and_pdf(self, world):
         text = world.client.get(self._link(world), headers=APP).text
-        assert "id=about-open class=brandbtn" in text and "id=about role=dialog" in text
+        assert (
+            'id=about-open class="brandbtn"' in text and "id=about role=dialog" in text
+        )
         assert "id=about-link" in text
         assert 'aria-label="Copy link"' in text and "id=share" in text
         assert "Link copied. People also need access to the Drive folder." in text

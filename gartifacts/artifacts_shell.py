@@ -139,6 +139,7 @@ iframe{flex:1;border:0;width:100%%}
 #pop{left:10px;right:10px;max-width:none}}
 a.title2{display:none}
 @media(max-width:480px){.title{display:none}.hdr button.brandbtn{flex-shrink:1}
+.brandbtn.has-logo .brand{display:none}
 a.title2{display:block;padding:0 10px 6px;font-size:12px;color:#fff;background:%(color)s;
 white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-decoration:none;opacity:.9}}
 @page{margin:6mm}
@@ -237,7 +238,8 @@ def shell_page(
         '<meta name=viewport content="width=device-width, initial-scale=1">'
         f"<style>{_CSS % {'color': look.color}}</style></head><body>"
         "<div id=top><header class=hdr>"
-        f'<button id=about-open class=brandbtn type=button aria-label="{about_label}" '
+        f'<button id=about-open class="brandbtn{" has-logo" if look.icon else ""}" type=button '
+        f'aria-label="{about_label}" '
         f'title="{about_label}">{logo}<span class=brand>{name}</span></button>'
         f'<a class=title href="{html.escape(base_path, quote=True)}/" '
         f'title="Go to the first page of {safe_title}">{safe_title}</a>'
