@@ -35,6 +35,7 @@ def env(monkeypatch):
     monkeypatch.delenv("WORKSPACE_MCP_ARTIFACTS_CSP_PROFILE", raising=False)
     viewer._folder_ok.clear()
     viewer._report_times.clear()
+    viewer._report_by_key.clear()
 
 
 @pytest.fixture

@@ -339,15 +339,28 @@ class TestCspReport:
             == 204
         )
 
-    def test_rate_limited(self, world, caplog):
+    def test_unattributed_reports_share_one_small_bucket(self, world, caplog):
         with caplog.at_level(logging.INFO, logger="gartifacts.access"):
-            for _ in range(viewer._REPORT_PER_MINUTE + 20):
+            for _ in range(viewer._REPORT_PER_KEY_MINUTE + 20):
                 world.client.post(
                     "/csp-report",
                     json={"csp-report": {"blocked-uri": "x"}},
                     headers=CONTENT,
                 )
-        assert caplog.text.count("csp_violation") == viewer._REPORT_PER_MINUTE
+        assert caplog.text.count("csp_violation") == viewer._REPORT_PER_KEY_MINUTE
+
+    def test_global_limit_applies_across_artifacts(self, world, monkeypatch, caplog):
+        monkeypatch.setattr(viewer, "_REPORT_PER_MINUTE", 3)
+        records = [make_bundle(world)[1] for _ in range(5)]
+        with caplog.at_level(logging.INFO, logger="gartifacts.access"):
+            for record in records:
+                uri = f"https://content.example.com/c/{token_for(record)}/x"
+                world.client.post(
+                    "/csp-report",
+                    json={"csp-report": {"document-uri": uri}},
+                    headers=CONTENT,
+                )
+        assert caplog.text.count("csp_violation") == 3
 
 
 class TestPrincipal:
@@ -618,3 +631,56 @@ class TestDeniedPage:
         _, _, response, _ = self._denied(world)
         assert "no placeholder here" not in response.text
         assert "Viewer access to artifact:" in response.text
+
+
+class TestRouteMarkerForgery:
+    """A content marker is believed only when no identity assertion came with it."""
+
+    ASSERTED = {**CONTENT, "x-pomerium-jwt-assertion": "anything"}
+
+    def test_content_marker_with_assertion_is_refused(self, world):
+        _, record = make_bundle(world)
+        url = f"/c/{token_for(record)}/index.html"
+        assert world.client.get(url, headers=self.ASSERTED).status_code == 404
+        assert (
+            world.client.post("/csp-report", json={}, headers=self.ASSERTED).status_code
+            == 404
+        )
+
+    def test_genuine_content_request_still_works(self, world):
+        _, record = make_bundle(world)
+        response = world.client.get(f"/c/{token_for(record)}/index.html", headers=FRAME)
+        assert response.status_code == 200
+
+
+class TestCspReportIdentity:
+    def report(self, record, count=1, **kwargs):
+        body = {
+            "csp-report": {
+                "document-uri": f"https://content.example.com/c/{token_for(record)}/x",
+                "violated-directive": "connect-src",
+                "blocked-uri": "https://evil.example.com",
+            }
+        }
+        return [
+            self_client.post("/csp-report", json=body, headers=CONTENT)
+            for self_client in [self.client] * count
+        ]
+
+    def test_event_names_the_artifact_and_user(self, world, caplog):
+        _, record = make_bundle(world)
+        self.client = world.client
+        with caplog.at_level(logging.INFO, logger="gartifacts.access"):
+            self.report(record)
+        assert record.hash in caplog.text and OWNER in caplog.text
+
+    def test_one_artifact_cannot_use_up_the_whole_limit(self, world, caplog):
+        _, noisy = make_bundle(world)
+        _, quiet = make_bundle(world)
+        self.client = world.client
+        with caplog.at_level(logging.INFO, logger="gartifacts.access"):
+            self.report(noisy, count=viewer._REPORT_PER_KEY_MINUTE + 10)
+            self.report(quiet)
+        events = [r.message for r in caplog.records if "csp_violation" in r.message]
+        assert sum(noisy.hash in e for e in events) == viewer._REPORT_PER_KEY_MINUTE
+        assert sum(quiet.hash in e for e in events) == 1

@@ -131,6 +131,7 @@ _SECURITY_HEADERS = {
 _FOLDER_OK_TTL = 30.0
 _REPORT_MAX_BYTES = 8192
 _REPORT_PER_MINUTE = 120
+_REPORT_PER_KEY_MINUTE = 30
 
 
 class NeedsConsent(Exception):
@@ -193,6 +194,19 @@ def _unavailable(record: Any = None, segment: str = "") -> HTMLResponse:
 
 def _marker(request: Request) -> str:
     return request.headers.get(ROUTE_MARKER_HEADER, "").strip().lower()
+
+
+def _is_content_request(request: Request) -> bool:
+    """True for a request that arrived on the public content route.
+
+    That route carries no identity assertion. A request that has one came through an
+    authenticated route, so a content marker on it was supplied by the client.
+    """
+    if _marker(request) != CONTENT_MARKER:
+        return False
+    config = get_oauth_config()
+    names = {"x-pomerium-jwt-assertion", config.gateway_identity_header}
+    return not any(name and request.headers.get(name) for name in names)
 
 
 async def _principal(request: Request) -> Optional[str]:
@@ -392,7 +406,7 @@ def _content_type(name: str) -> Tuple[str, bool]:
 
 async def content_file(request: Request) -> Response:
     """``GET /c/<token>/<path>``: serve one file from a registered bundle."""
-    if _marker(request) != CONTENT_MARKER:
+    if not _is_content_request(request):
         return _unavailable()
     policy = load_policy()
     headers = _content_headers(policy)
@@ -485,6 +499,7 @@ async def content_no_slash(request: Request) -> Response:
 
 _report_times: list = []
 _report_lock = threading.Lock()
+_report_by_key: Dict[str, list] = {}
 
 
 _TOKEN_IN_PATH = re.compile(r"/c/[^/\s?#]+")
@@ -497,29 +512,55 @@ def _scrub(value: Any) -> Any:
     return value
 
 
-async def csp_report(request: Request) -> Response:
-    """``POST /csp-report``: log a policy violation, scrubbed, with a global rate limit."""
-    if _marker(request) != CONTENT_MARKER:
-        return Response(status_code=404)
-    now = time.monotonic()
+def _report_key(report: Any) -> Tuple[str, str]:
+    """(hash, user) from the content token in a report's document-uri, else blanks."""
+    uri = report.get("document-uri") if isinstance(report, dict) else None
+    found = _TOKEN_IN_PATH.search(uri) if isinstance(uri, str) else None
+    claims = verify_content_token(found.group(0)[3:]) if found else None
+    return (claims.artifact_hash, claims.email) if claims else ("", "")
+
+
+def _report_allowed(key: str, now: float) -> bool:
+    """Per-hash and global limits for reports; the global one also bounds unknown senders."""
     with _report_lock:
         _report_times[:] = [t for t in _report_times if now - t < 60]
         if len(_report_times) >= _REPORT_PER_MINUTE:
-            return Response(status_code=204)
+            return False
+        recent = [t for t in _report_by_key.get(key, ()) if now - t < 60]
+        if len(recent) >= _REPORT_PER_KEY_MINUTE:
+            _report_by_key[key] = recent
+            return False
+        recent.append(now)
+        _report_by_key[key] = recent
         _report_times.append(now)
+        for stale in [
+            k for k, v in _report_by_key.items() if not v or now - v[-1] >= 60
+        ]:
+            del _report_by_key[stale]
+    return True
+
+
+async def csp_report(request: Request) -> Response:
+    """``POST /csp-report``: log a policy violation, scrubbed, with rate limits."""
+    if not _is_content_request(request):
+        return Response(status_code=404)
     body = await request.body()
-    if len(body) <= _REPORT_MAX_BYTES:
-        try:
-            data = json.loads(body)
-            report = data.get("csp-report", data) if isinstance(data, dict) else {}
-            fields = {
-                key: _scrub(report.get(key))
-                for key in ("document-uri", "violated-directive", "blocked-uri")
-                if isinstance(report, dict)
-            }
-            log_event("csp_violation", **fields)
-        except ValueError:
-            pass
+    if len(body) > _REPORT_MAX_BYTES:
+        return Response(status_code=204)
+    try:
+        data = json.loads(body)
+    except ValueError:
+        data = None
+    report = data.get("csp-report", data) if isinstance(data, dict) else {}
+    artifact_hash, user = _report_key(report)
+    if not _report_allowed(artifact_hash or "-", time.monotonic()):
+        return Response(status_code=204)
+    if isinstance(report, dict) and report:
+        fields = {
+            key: _scrub(report.get(key))
+            for key in ("document-uri", "violated-directive", "blocked-uri")
+        }
+        log_event("csp_violation", hash=artifact_hash, user=user, **fields)
     return Response(status_code=204)
 
 

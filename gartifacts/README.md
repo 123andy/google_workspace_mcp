@@ -15,7 +15,8 @@ A *bundle* is a Drive folder with an `index.html` at its top level and other pag
 | Variable | Effect |
 | --- | --- |
 | `WORKSPACE_MCP_ARTIFACTS=true` | Adds the `artifacts` service to the default service set. It can also be chosen with `--tools artifacts` or `--permissions artifacts:readonly`, which request only the Drive read-only scope. |
-| `WORKSPACE_MCP_ARTIFACTS_VIEWER=true` | Mounts the viewer, content and report routes and allows `Origin: null` on content reads only. |
+| `WORKSPACE_MCP_ARTIFACTS_VIEWER=true` | Mounts the viewer, content and report routes and allows `Origin: null` on content reads only. Refuses to start if the instance requests any scope beyond Drive read and sign-in. |
+| `WORKSPACE_MCP_ARTIFACTS_ALLOW_WRITE_WITH_SERVING=true` | Lets the viewer start on an instance with other scopes. Not recommended: the viewer opens user-authored script. |
 | `WORKSPACE_MCP_ARTIFACTS_VIEWER_URL` | Public base URL of the viewer (links returned to users; allowed to frame the content). |
 | `WORKSPACE_MCP_ARTIFACTS_CONTENT_URL` | Public base URL of the content host. |
 | `WORKSPACE_MCP_ARTIFACTS_BRANDING_FILE` | Optional YAML or JSON file for the viewer's look and wording (below). |
@@ -28,7 +29,7 @@ A *bundle* is a Drive folder with an `index.html` at its top level and other pag
 
 The viewer expects a gateway that signs users in and passes a signed identity assertion (see *Trusted-gateway identity*): set `TRUST_GATEWAY_IDENTITY=true` and its JWKS and audience settings. Users grant Drive read access once through the server's normal OAuth callback.
 
-Two public hostnames point at the same server. The gateway adds one request header to each, `x-artifacts-route: app` on the viewer host and `x-artifacts-route: content` on the content host, because the `Host` header is usually rewritten on the way in. Requests for `/a/…` are accepted only with `app` and `/c/…` and `/csp-report` only with `content`. Route the content host publicly (a sandboxed frame cannot send cookies), strip the `Cookie` request header there, and expose nothing else on it.
+Two public hostnames point at the same server. The gateway adds one request header to each, `x-artifacts-route: app` on the viewer host and `x-artifacts-route: content` on the content host, because the `Host` header is usually rewritten on the way in. Requests for `/a/…` are accepted only with `app` and `/c/…` and `/csp-report` only with `content` and no identity assertion header, since a request that carries one came through an authenticated route and the marker was client-supplied. Route the content host publicly (a sandboxed frame cannot send cookies), strip the `Cookie` request header there, and expose nothing else on it.
 
 ## Security notes
 

@@ -870,7 +870,13 @@ def main():
     tools_removed = filter_server_tools(server)
 
     if viewer_enabled():
+        from auth.scopes import get_current_scopes
+        from gartifacts.artifacts_guard import serving_scope_problem
         from gartifacts.artifacts_viewer import register_viewer_routes
+
+        problem = serving_scope_problem(get_current_scopes())
+        if problem:
+            fatal(ui, "Artifact viewer refused to start", problem)
 
         register_viewer_routes(server)
 
