@@ -21,6 +21,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from core.utils import UserInputError
+from gdrive.drive_helpers import get_allowed_share_domains, validate_share_target
 
 logger = logging.getLogger(__name__)
 
@@ -1179,6 +1180,30 @@ def _build_acl_scope(scope_type: str, scope_value: Optional[str]) -> Dict[str, s
     return {"type": scope_type, "value": value}
 
 
+def _validate_calendar_share_scope(scope: Dict[str, Any]) -> None:
+    """Apply the share-domain allowlist (WORKSPACE_MCP_ALLOWED_SHARE_DOMAINS)
+    to a calendar sharing scope. A no-op when the allowlist is unset.
+
+    Public ('default') access is refused; user, group and domain targets
+    must fall inside the allowed domains, using the same matching as Drive.
+    """
+    domains = get_allowed_share_domains()
+    if domains is None:
+        return
+    scope_type = (scope.get("type") or "").lower()
+    value = scope.get("value")
+    share_type = "anyone" if scope_type == "default" else scope_type
+    try:
+        validate_share_target(share_type, value)
+    except ValueError:
+        target = "anyone (public)" if share_type == "anyone" else f"'{value}'"
+        raise UserInputError(
+            f"Cannot share this calendar with {target}. Calendar sharing on this "
+            f"server is restricted to these domains: {', '.join(domains)}. Share "
+            "outside them from Google Calendar directly."
+        ) from None
+
+
 def _format_acl_rule(rule: Dict[str, Any]) -> str:
     """Format one ACL rule as a single readable line."""
     scope = rule.get("scope", {})
@@ -1238,6 +1263,7 @@ async def _manage_calendar_acl(
             "role": _resolve_acl_role(role, action),
             "scope": _build_acl_scope(scope_type, scope_value),
         }
+        _validate_calendar_share_scope(body["scope"])
         rule = await asyncio.to_thread(
             lambda: acl.insert(
                 calendarId=calendar_id,
@@ -1264,15 +1290,24 @@ async def _manage_calendar_acl(
             "cannot be changed or removed."
         )
     if action == "update_sharing":
+        new_role = _resolve_acl_role(role, action)
         request = acl.patch(
             calendarId=calendar_id,
             ruleId=rule_id,
-            body={"role": _resolve_acl_role(role, action)},
+            body={"role": new_role},
             sendNotifications=send_notifications,
         )
     else:
+        new_role = None
         request = acl.delete(calendarId=calendar_id, ruleId=rule_id)
     try:
+        if new_role not in (None, "none") and get_allowed_share_domains():
+            # Raising an existing outside rule (e.g. reader -> writer) would
+            # bypass the check a fresh share gets, so check the rule's target.
+            existing = await asyncio.to_thread(
+                acl.get(calendarId=calendar_id, ruleId=rule_id).execute
+            )
+            _validate_calendar_share_scope(existing.get("scope", {}))
         rule = await asyncio.to_thread(request.execute)
     except HttpError as error:
         if error.resp.status == 404:

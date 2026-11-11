@@ -325,3 +325,119 @@ async def test_read_only_mode_removes_manage_calendar(monkeypatch):
         set_read_only(False)
 
     assert provider.removed == ["manage_calendar"]
+
+
+# --- share-domain allowlist (WORKSPACE_MCP_ALLOWED_SHARE_DOMAINS) ---------------
+
+
+@pytest.fixture
+def restricted(monkeypatch):
+    monkeypatch.setenv("WORKSPACE_MCP_ALLOWED_SHARE_DOMAINS", "example.com")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope_type", "scope_value"),
+    [
+        ("default", None),
+        ("user", "bob@outside.org"),
+        ("group", "team@outside.org"),
+        ("domain", "outside.org"),
+        ("user", "bob@sub.example.com"),
+    ],
+)
+async def test_share_outside_allowlist_is_refused(restricted, scope_type, scope_value):
+    service, acl = _service()
+    with pytest.raises(
+        UserInputError, match="restricted to these domains: example.com"
+    ):
+        await _call(
+            service,
+            action="share",
+            role="reader",
+            scope_type=scope_type,
+            scope_value=scope_value,
+        )
+    acl.insert.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope_type", "scope_value"),
+    [
+        ("user", "Alice@Example.com"),
+        ("group", "team@example.com"),
+        ("domain", "example.com"),
+    ],
+)
+async def test_share_inside_allowlist_is_allowed(restricted, scope_type, scope_value):
+    service, acl = _service()
+    await _call(
+        service,
+        action="share",
+        role="owner",
+        scope_type=scope_type,
+        scope_value=scope_value,
+    )
+    acl.insert.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_share_unrestricted_when_allowlist_unset(monkeypatch):
+    monkeypatch.delenv("WORKSPACE_MCP_ALLOWED_SHARE_DOMAINS", raising=False)
+    service, acl = _service()
+    await _call(service, action="share", role="reader", scope_type="default")
+    acl.insert.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_update_refuses_to_raise_an_outside_rule(restricted):
+    service, acl = _service()
+    acl.get.return_value.execute.return_value = {
+        "id": "user:bob@outside.org",
+        "role": "reader",
+        "scope": {"type": "user", "value": "bob@outside.org"},
+    }
+    with pytest.raises(UserInputError, match="restricted to these domains"):
+        await _call(
+            service,
+            action="update_sharing",
+            rule_id="user:bob@outside.org",
+            role="writer",
+        )
+    acl.patch.return_value.execute.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_refuses_public_rule(restricted):
+    service, acl = _service()
+    acl.get.return_value.execute.return_value = {
+        "id": "default",
+        "role": "freeBusyReader",
+        "scope": {"type": "default"},
+    }
+    with pytest.raises(UserInputError, match="anyone \\(public\\)"):
+        await _call(service, action="update_sharing", rule_id="default", role="reader")
+    acl.patch.return_value.execute.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_inside_allowlist_and_downgrade_to_none_are_allowed(restricted):
+    service, acl = _service()
+    acl.get.return_value.execute.return_value = RULE  # alice@example.com
+    await _call(service, action="update_sharing", rule_id=RULE["id"], role="writer")
+    acl.patch.return_value.execute.assert_called_once()
+
+    service, acl = _service()
+    await _call(
+        service, action="update_sharing", rule_id="user:bob@outside.org", role="none"
+    )
+    acl.get.assert_not_called()
+    acl.patch.return_value.execute.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_unshare_outside_rule_is_always_allowed(restricted):
+    service, acl = _service()
+    await _call(service, action="unshare", rule_id="user:bob@outside.org")
+    acl.delete.return_value.execute.assert_called_once()
