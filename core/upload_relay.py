@@ -669,17 +669,21 @@ async def _serve_leased(leases, handle: str, request: Request) -> Response:
     try:
         if await _keep_lease(leases, handle, owner, started, work) or work.done():
             return work.result()
-        work.cancel()
-        try:
-            await work
-        except asyncio.CancelledError:
-            pass
         return _interrupted()
     finally:
-        if not work.done():  # we were cancelled: stop the relay before releasing
+        if not work.done():  # lease lost, or we were cancelled: stop the relay
             work.cancel()
             await asyncio.wait({work}, timeout=_LEASE_OP_TIMEOUT)
-        await _release_lease(leases, handle, owner)
+        if work.done():
+            if not work.cancelled():
+                work.exception()  # retrieved: raised above or not wanted
+            await _release_lease(leases, handle, owner)
+        else:
+            # Releasing would let another replica in while this relay may still
+            # write; the lease expires on its own instead.
+            logger.warning(
+                "Upload relay: relay did not stop in time; shared lock left to expire"
+            )
 
 
 def _interrupted() -> Response:

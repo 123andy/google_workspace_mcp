@@ -1726,3 +1726,35 @@ async def test_a_cancelled_request_stops_its_relay_before_releasing(
     with pytest.raises(asyncio.CancelledError):
         await task
     assert order == ["relay stopped", "released"]
+
+
+@pytest.mark.asyncio
+async def test_a_relay_that_will_not_stop_keeps_its_lease_until_expiry(
+    relay_env, monkeypatch, caplog
+):
+    table = FakeLeaseTable()
+    leases = table.replica()
+    entered, finished = asyncio.Event(), asyncio.Event()
+    monkeypatch.setattr(ur, "_LEASE_OP_TIMEOUT", 0.05)
+
+    async def stubborn(handle, request):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.3)  # ignores the cancel past the bound
+            finished.set()
+
+    monkeypatch.setattr(ur, "_serve_held", stubborn)
+    task = asyncio.create_task(ur._serve_leased(leases, "h" * 22, None))
+    await asyncio.wait_for(entered.wait(), 5)
+    with caplog.at_level(logging.WARNING, logger="core.upload_relay"):
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert not finished.is_set()
+    assert [c[0] for c in table.calls] == ["acquire"]  # no release
+    assert _lease_owner(table, "h" * 22)
+    assert "left to expire" in caplog.text
+    await asyncio.wait_for(finished.wait(), 5)
+
