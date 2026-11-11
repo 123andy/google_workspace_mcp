@@ -1457,6 +1457,7 @@ async def test_a_lost_lease_stops_the_relay(client, google, leases, fast_lease):
         return httpx.Response(200)
 
     google.reply = slow
+    before = await _record(handle)
     started = time.monotonic()
     response = await client.put(f"/ul/{handle}", content=b"x")
     assert time.monotonic() - started < 2
@@ -1464,6 +1465,42 @@ async def test_a_lost_lease_stops_the_relay(client, google, leases, fast_lease):
     assert "interrupted" in response.json()["error"]
     assert _lease_owner(leases, handle) == "replica-b"
     assert handle not in ur._in_flight
+    # The stopped relay wrote nothing (the record is the new holder's now) and
+    # did nothing more: no further lock statement before its release.
+    assert await _record(handle) == before
+    assert [c[0] for c in leases.calls] == ["acquire", "renew", "release"]
+
+
+@pytest.mark.asyncio
+async def test_renewals_failing_after_one_success_stop_the_relay_in_time(
+    client, google, leases, fast_lease, monkeypatch
+):
+    """The deadline moves with each successful renewal, and only then."""
+    results = []
+    real_renew = ur._leases.renew_lease
+
+    async def renew(*args):
+        if not results:
+            results.append(await real_renew(*args))
+            return results[-1]
+        results.append(OSError)
+        raise OSError("db down")
+
+    monkeypatch.setattr(ur._leases, "renew_lease", renew)
+    handle = await _handle()
+
+    async def slow(request, body):
+        await asyncio.sleep(5)
+        return httpx.Response(200)
+
+    google.reply = slow
+    started = time.monotonic()
+    response = await client.put(f"/ul/{handle}", content=b"x")
+    elapsed = time.monotonic() - started
+    assert response.status_code == 503
+    assert results[0] is True and len(results) >= 2
+    # One renewal bought one more lease, minus the margin; never more.
+    assert elapsed < ur._LEASE_RENEW_SECONDS + ur._LEASE_SECONDS
 
 
 @pytest.mark.asyncio
