@@ -1673,6 +1673,25 @@ def test_startup_warns_when_the_lock_is_process_only(
     assert ("single replica" in caplog.text) is warns
 
 
+@pytest.mark.parametrize("secret, errors", [(None, True), ("s3cret", False)])
+def test_startup_says_when_the_shared_store_key_cannot_be_derived(
+    monkeypatch, caplog, secret, errors
+):
+    monkeypatch.setenv(ur.FLAG_ENV, "true")
+    monkeypatch.setenv(sd.FLAG_ENV, "true")
+    monkeypatch.setenv("WORKSPACE_EXTERNAL_URL", EXTERNAL)
+    monkeypatch.delenv(ur.MAX_BYTES_ENV, raising=False)
+    monkeypatch.delenv("FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY", raising=False)
+    if secret:
+        monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", secret)
+    else:
+        monkeypatch.delenv("GOOGLE_OAUTH_CLIENT_SECRET", raising=False)
+    with patch("core.storage.get_configured_kv_store", lambda: _configured("postgres")):
+        with caplog.at_level(logging.ERROR, logger="core.upload_relay"):
+            ur.validate_startup("streamable-http")
+    assert ("upload links will be unavailable" in caplog.text) is errors
+
+
 @pytest.mark.asyncio
 async def test_a_failed_renewal_is_retried_sooner_than_the_interval(
     client, google, leases, fast_lease, monkeypatch

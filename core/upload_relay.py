@@ -166,6 +166,21 @@ def validate_startup(transport: str) -> None:
             FLAG_ENV,
             configured.backend,
         )
+    if configured is not None and configured.needs_encryption:
+        from core.storage import derive_shared_fernet_key
+
+        try:
+            derive_shared_fernet_key("workspace-upload-handles")
+        except ValueError:
+            logger.error(
+                "%s is on, but the shared %s store's encryption key can't be "
+                "derived (set GOOGLE_OAUTH_CLIENT_SECRET or "
+                "FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY in the environment; a "
+                "client-secrets file is not read for this): upload links will be "
+                "unavailable.",
+                FLAG_ENV,
+                configured.backend,
+            )
     logger.info(
         "%s is on: upload links use %s/ul/*, which must be publicly reachable and "
         "accept request bodies up to %d bytes.",
