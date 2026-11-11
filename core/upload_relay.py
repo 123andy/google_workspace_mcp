@@ -689,6 +689,8 @@ async def _serve_leased(leases, handle: str, request: Request) -> Response:
             logger.warning(
                 "Upload relay: relay did not stop in time; shared lock left to expire"
             )
+            # Collect its eventual outcome so asyncio doesn't log it as unretrieved.
+            work.add_done_callback(lambda t: t.cancelled() or t.exception())
 
 
 def _interrupted() -> Response:
