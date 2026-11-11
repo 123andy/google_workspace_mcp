@@ -7,9 +7,10 @@ callback reaches the same machine that started the flow, and survives a restart
 only if that disk does.
 
 When a shared backend is configured through ``WORKSPACE_MCP_OAUTH_PROXY_*``
-(Valkey, Postgres or disk; see :mod:`core.storage`), pending states are kept
-there instead, so any replica can complete any consent and a restart during
-consent does not lose it. Records are Fernet-encrypted under their own key
+(see :mod:`core.storage`), pending states are kept there instead. With Valkey
+or Postgres, any replica can complete any consent and a restart during consent
+does not lose it. The disk backend is shared only between processes on one
+host (or on one shared volume). Records are Fernet-encrypted under their own key
 context, because they carry the PKCE verifier.
 
 The in-process ``memory`` backend is deliberately not used here: it is no more

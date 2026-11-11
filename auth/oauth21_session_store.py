@@ -622,6 +622,11 @@ class OAuth21SessionStore:
         restart during consent. If the shared write fails, the state goes to the
         local file instead, which still works when the callback reaches this
         instance.
+
+        The file is also used when the state is already expired
+        (``expires_in_seconds`` of 0), exactly as ``store_oauth_state`` does, and in
+        single-user mode (``MCP_SINGLE_USER_MODE=1``), whose missing-state fallback
+        (``consume_latest_oauth_state``) searches only the file.
         """
         state_info = self._new_oauth_state_entry(
             state,
@@ -633,7 +638,8 @@ class OAuth21SessionStore:
             enforce_user_email_match,
             principal_source,
         )
-        kv = self._get_oauth_state_kv()
+        use_shared = expires_in_seconds > 0 and os.getenv("MCP_SINGLE_USER_MODE") != "1"
+        kv = self._get_oauth_state_kv() if use_shared else None
         if kv is not None:
             from auth.oauth_state_kv import OAUTH_STATE_COLLECTION
 
@@ -651,10 +657,11 @@ class OAuth21SessionStore:
                 )
                 return
             except Exception as exc:
+                # Type only: a backend error message could carry connection details.
                 logger.warning(
                     "Could not store OAuth state in the shared store (%s); using the "
                     "local state file, so the callback must reach this instance.",
-                    exc,
+                    type(exc).__name__,
                 )
         self._store_oauth_state_in_file(state, state_info)
 
@@ -689,7 +696,7 @@ class OAuth21SessionStore:
                 logger.warning(
                     "Could not read OAuth state from the shared store (%s); "
                     "checking the local state file.",
-                    exc,
+                    type(exc).__name__,
                 )
             if record is not None:
                 try:
@@ -697,8 +704,8 @@ class OAuth21SessionStore:
                 except Exception as exc:
                     # Single use cannot be confirmed, so fail closed.
                     logger.error(
-                        "SECURITY: could not consume OAuth state in the shared store: %s",
-                        exc,
+                        "SECURITY: could not consume OAuth state in the shared store (%s)",
+                        type(exc).__name__,
                     )
                     raise ValueError(
                         "Invalid or expired OAuth state parameter"
