@@ -234,6 +234,53 @@ async def test_shared_write_failure_falls_back_to_state_file(tmp_path):
     assert state_info["code_verifier"] == "v"
 
 
+class _CommitThenFailKV:
+    """A put that commits and then reports failure (connection lost after the
+    commit); optionally a delete that fails too."""
+
+    def __init__(self, delete_fails=False):
+        self.kv = MemoryStore()
+        self.delete_fails = delete_fails
+
+    async def put(self, key, value, *, collection=None, ttl=None):
+        await self.kv.put(key, value, collection=collection, ttl=ttl)
+        raise ConnectionError("connection lost after commit")
+
+    async def get(self, key, *, collection=None):
+        return await self.kv.get(key, collection=collection)
+
+    async def delete(self, key, *, collection=None):
+        if self.delete_fails:
+            raise OSError("postgresql://u:hunter2@db/x")
+        return await self.kv.delete(key, collection=collection)
+
+
+@pytest.mark.asyncio
+async def test_a_write_that_committed_before_failing_leaves_no_shared_copy(tmp_path):
+    kv = _CommitThenFailKV()
+    store = OAuth21SessionStore(
+        oauth_state_file=str(tmp_path / "s.json"), oauth_state_kv=kv
+    )
+    await store.astore_oauth_state("committed", session_id="s", code_verifier="v")
+
+    assert await kv.kv.get("committed", collection=OAUTH_STATE_COLLECTION) is None
+    state_info = await store.avalidate_and_consume_oauth_state("committed", "s")
+    assert state_info["code_verifier"] == "v"  # from the file, once
+    with pytest.raises(ValueError):
+        await store.avalidate_and_consume_oauth_state("committed", "s")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_cleanup_still_falls_back_to_the_file(tmp_path, caplog):
+    kv = _CommitThenFailKV(delete_fails=True)
+    state_file = tmp_path / "s.json"
+    store = OAuth21SessionStore(oauth_state_file=str(state_file), oauth_state_kv=kv)
+    with caplog.at_level(logging.WARNING, logger="auth.oauth21_session_store"):
+        await store.astore_oauth_state("blip", session_id="s", code_verifier="v")
+    assert state_file.exists() and "blip" in state_file.read_text()
+    assert "OSError" in caplog.text and "hunter2" not in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_state_written_to_file_by_older_instance_is_still_accepted(tmp_path):
     """During a rollout, a callback may carry a state an old pod wrote to its file."""

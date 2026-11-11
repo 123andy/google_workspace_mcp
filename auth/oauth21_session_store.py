@@ -6,6 +6,7 @@ that can be accessed by Google service decorators. It also includes
 session context management and credential conversion functionality.
 """
 
+import asyncio
 import contextvars
 import json
 import logging
@@ -26,6 +27,9 @@ from google.oauth2.credentials import Credentials
 from auth.oauth_config import is_external_oauth21_provider
 
 logger = logging.getLogger(__name__)
+
+# Bound on removing a shared OAuth state after a failed write.
+_SHARED_STATE_CLEANUP_TIMEOUT_SECONDS = 5.0
 
 
 def _lock_file_exclusive(file_handle: IO[str]) -> None:
@@ -663,7 +667,31 @@ class OAuth21SessionStore:
                     "local state file, so the callback must reach this instance.",
                     type(exc).__name__,
                 )
+                await self._discard_shared_oauth_state(kv, state)
         self._store_oauth_state_in_file(state, state_info)
+
+    @staticmethod
+    async def _discard_shared_oauth_state(kv: Any, state: str) -> None:
+        """Best effort: remove a shared copy that a failed ``put`` may still have
+        committed (e.g. the connection dropped after the commit), so the state
+        does not live in both the shared store and the file.
+
+        If this also fails, the copy may remain and the state could be consumed
+        once from each. That is still safe: the callback exchanges Google's
+        authorization code, which Google accepts only once, so a second consume
+        cannot obtain tokens."""
+        from auth.oauth_state_kv import OAUTH_STATE_COLLECTION
+
+        try:
+            await asyncio.wait_for(
+                kv.delete(state, collection=OAUTH_STATE_COLLECTION),
+                _SHARED_STATE_CLEANUP_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not remove a possibly stored shared OAuth state (%s)",
+                type(exc).__name__,
+            )
 
     async def avalidate_and_consume_oauth_state(
         self,
