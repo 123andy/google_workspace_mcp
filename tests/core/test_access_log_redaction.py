@@ -44,6 +44,11 @@ SECRET = "SECRETHANDLE0123456789ab"
             "/oauth2callback?error=access_denied&state=<redacted>",
         ),
         ("/oauth2callback?xcode=1&codes=2", "/oauth2callback?xcode=1&codes=2"),
+        # names are matched after percent-decoding, as the server parses them
+        (
+            "/oauth2callback?%63ode=c1&st%61te=s1&x=%63ode",
+            "/oauth2callback?%63ode=<redacted>&st%61te=<redacted>&x=%63ode",
+        ),
         ("/auth", "/auth"),
         (f"/auth/{SECRET}?x=1", "/auth/<redacted>"),
         # uvicorn logs root_path + path

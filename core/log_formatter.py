@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import sys
+from urllib.parse import unquote_plus
 
 
 class SuppressStatelessTransportTerminationFilter(logging.Filter):
@@ -35,8 +36,18 @@ _CAPABILITY_PATH = re.compile(
 _CAPABILITY_IN_QUERY = re.compile(f"({_CAPABILITY_PATH.pattern})[^/?#&\\s]+")
 # OAuth redirect parameters (``/oauth2callback``, ``/auth/callback``): the
 # authorization ``code`` is single-use but still a credential until redeemed,
-# and ``state`` binds it to the pending flow. Redacted wherever they appear.
-_OAUTH_QUERY_PARAM = re.compile(r"(^|&)(code|state)=[^&#\s]*")
+# and ``state`` binds it to the pending flow. Redacted wherever they appear,
+# matched on the percent-decoded name since the server decodes names too.
+_OAUTH_QUERY_NAMES = frozenset({"code", "state"})
+
+
+def _redact_oauth_params(query: str) -> str:
+    parts = query.split("&")
+    for i, part in enumerate(parts):
+        name, eq, _value = part.partition("=")
+        if eq and unquote_plus(name) in _OAUTH_QUERY_NAMES:
+            parts[i] = f"{name}=<redacted>"
+    return "&".join(parts)
 
 
 def redact_capability_path(path: str) -> str:
@@ -56,7 +67,7 @@ def redact_capability_path(path: str) -> str:
         return path_part
     query = _AUTH_HANDLE.sub("/auth/<redacted>", query)
     query = _CAPABILITY_IN_QUERY.sub(r"\1<redacted>", query)
-    query = _OAUTH_QUERY_PARAM.sub(r"\1\2=<redacted>", query)
+    query = _redact_oauth_params(query)
     return f"{path_part}?{query}"
 
 
