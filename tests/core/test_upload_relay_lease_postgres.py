@@ -85,6 +85,9 @@ async def test_one_holder_release_and_takeover(replicas):
     assert not await b.release_lease(_C, "h", "B")
     assert await _owner(a, "h") == "A2"
     assert await a.renew_lease(_C, "h", "A2", 90)
+    # Expired and not taken over: its old owner cannot renew it either.
+    await _expire(a, "h")
+    assert not await a.renew_lease(_C, "h", "A2", 90)
 
 
 @pytest.mark.asyncio

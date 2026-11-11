@@ -1240,7 +1240,7 @@ class FakeLeases:
     async def renew_lease(self, collection, key, owner, ttl_seconds):
         self.table.calls.append(("renew", key, owner))
         row = self.table.rows.get((collection, key))
-        if row is None or row[0] != owner:
+        if row is None or row[0] != owner or row[1] <= self.table.now:
             return False
         self.table.rows[(collection, key)] = (owner, self.table.now + ttl_seconds)
         return True
@@ -1282,6 +1282,24 @@ async def test_lease_table_rules(relay_env):
     assert not await b.renew_lease(c, "h", "B", 90)
     assert not await b.release_lease(c, "h", "B")
     assert _lease_owner(table, "h") == "A2"
+    table.now += 91  # A2's lease expires and nobody takes it
+    assert not await a.renew_lease(c, "h", "A2", 90)
+
+
+@pytest.mark.asyncio
+async def test_a_relay_paused_past_its_lease_does_not_save(client, google, leases):
+    """Expired but not yet taken over: the old holder's fence still fails."""
+    handle = await _handle()
+    before = await _record(handle)
+
+    def reply(request, body):
+        leases.now += ur._LEASE_SECONDS + 1
+        return httpx.Response(200, json={"id": "F"})
+
+    google.reply = reply
+    response = await client.put(f"/ul/{handle}", content=b"x")
+    assert response.status_code == 503
+    assert await _record(handle) == before
 
 
 @pytest.mark.asyncio

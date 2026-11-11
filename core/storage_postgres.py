@@ -162,12 +162,14 @@ class SweepingPostgreSQLStore(PostgreSQLStore):
         self, collection: str, key: str, owner: str, ttl_seconds: float
     ) -> bool:
         """Extend ``owner``'s lease to ``ttl_seconds`` from now. False when the
-        row is gone or another owner has taken it."""
+        row is gone, another owner has taken it, or it has expired: a holder
+        paused past its expiry has lost the lease even if nobody took it."""
         await self.setup()
         row = await self._initialized_pool.fetchval(
             f"UPDATE {self._table_name} "  # noqa: S608 - table name validated in __init__
             "SET ttl = $4, expires_at = now() + make_interval(secs => $4) "
             "WHERE collection = $1 AND key = $2 AND value->>'owner' = $3 "
+            "AND expires_at > now() "
             "RETURNING 1",
             collection,
             key,
