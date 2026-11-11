@@ -155,14 +155,18 @@ the shared KV table (collection `signed_upload_leases`) taken with one
 `INSERT ... ON CONFLICT DO UPDATE ... WHERE expired` statement, so only one
 replica can relay a link at a time. The lease:
 
-- lasts 90 s and is renewed every 30 s (every 5 s after a failure) while the relay runs (a relay can last
-  up to the link's 2 hours), using the database clock; a connection is
-  borrowed only for each statement, never held for the upload;
+- lasts 90 s and is renewed every 30 s (every 5 s after a failure) while
+  the relay runs (a relay can last up to the link's 2 hours), using the
+  database clock; a connection is borrowed only for each statement, never
+  held for the upload;
 - frees the link within 90 s if a replica dies mid-relay;
 - is released only by the relay that took it (an owner token), so a relay
   whose lease lapsed cannot release another replica's;
 - fences every write of the link's record: the relay first renews its lease
   (owner-checked) and does not write if that fails, answering `503` as below.
+  This can happen after Google has already accepted the last chunk, so a
+  `503` at the end of an upload does not mean it failed: a status query
+  (`Content-Range: bytes */<total size>`) gets Google's answer.
   What remains assumed is that the one step between that renewal and the
   write never takes as long as a lease (90 s);
 - fails closed: if the database errors, the request gets `503` and nothing is
