@@ -155,7 +155,7 @@ the shared KV table (collection `signed_upload_leases`) taken with one
 `INSERT ... ON CONFLICT DO UPDATE ... WHERE expired` statement, so only one
 replica can relay a link at a time. The lease:
 
-- lasts 90 s and is renewed every 30 s while the relay runs (a relay can last
+- lasts 90 s and is renewed every 30 s (every 5 s after a failure) while the relay runs (a relay can last
   up to the link's 2 hours), using the database clock; a connection is
   borrowed only for each statement, never held for the upload;
 - frees the link within 90 s if a replica dies mid-relay;

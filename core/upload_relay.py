@@ -81,6 +81,8 @@ _in_flight: set[str] = set()
 _LEASE_COLLECTION = "signed_upload_leases"
 _LEASE_SECONDS = 90.0
 _LEASE_RENEW_SECONDS = 30.0
+# After a failed renewal, retry this often until the deadline.
+_LEASE_RETRY_SECONDS = 5.0
 # Stop relaying this long before the lease could have expired unrenewed.
 _LEASE_MARGIN_SECONDS = 15.0
 # Bound on one lease statement, pool wait included.
@@ -674,8 +676,9 @@ async def _serve_leased(leases, handle: str, request: Request) -> Response:
             pass
         return _interrupted()
     finally:
-        if not work.done():
+        if not work.done():  # we were cancelled: stop the relay before releasing
             work.cancel()
+            await asyncio.wait({work}, timeout=_LEASE_OP_TIMEOUT)
         await _release_lease(leases, handle, owner)
 
 
@@ -727,9 +730,10 @@ async def _keep_lease(
 ) -> bool:
     """Renew the lease until ``work`` finishes (True). False as soon as the
     lease is lost or might lapse before the next renewal could land."""
+    interval = _LEASE_RENEW_SECONDS
     while True:
         deadline = valid_from + _LEASE_SECONDS - _LEASE_MARGIN_SECONDS
-        wait = min(_LEASE_RENEW_SECONDS, deadline - time.monotonic())
+        wait = min(interval, deadline - time.monotonic())
         if wait > 0:
             await asyncio.wait({work}, timeout=wait)
         if work.done():
@@ -747,11 +751,13 @@ async def _keep_lease(
             logger.warning(
                 "Upload relay: shared lock renewal failed (%s)", type(exc).__name__
             )
+            interval = _LEASE_RETRY_SECONDS
             continue
         if not renewed:
             logger.warning("Upload relay: shared lock was lost")
             return False
         valid_from = attempt
+        interval = _LEASE_RENEW_SECONDS
 
 
 def _is_status_query(request: Request) -> bool:

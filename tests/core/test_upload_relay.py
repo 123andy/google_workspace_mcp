@@ -1493,6 +1493,7 @@ def fast_lease(monkeypatch):
     """Lease timings in hundredths of a second (real monotonic time)."""
     monkeypatch.setattr(ur, "_LEASE_SECONDS", 0.3)
     monkeypatch.setattr(ur, "_LEASE_RENEW_SECONDS", 0.05)
+    monkeypatch.setattr(ur, "_LEASE_RETRY_SECONDS", 0.01)
     monkeypatch.setattr(ur, "_LEASE_MARGIN_SECONDS", 0.1)
     monkeypatch.setattr(ur, "_LEASE_OP_TIMEOUT", 0.05)
 
@@ -1652,3 +1653,58 @@ def test_startup_warns_when_the_lock_is_process_only(
         with caplog.at_level(logging.WARNING, logger="core.upload_relay"):
             ur.validate_startup("streamable-http")
     assert ("single replica" in caplog.text) is warns
+
+
+@pytest.mark.asyncio
+async def test_a_failed_renewal_is_retried_sooner_than_the_interval(
+    client, google, leases, fast_lease, monkeypatch
+):
+    # One regular renewal fits before the deadline (0.15 s < 0.2 s); retries
+    # after its failure must fit too.
+    monkeypatch.setattr(ur, "_LEASE_RENEW_SECONDS", 0.15)
+    monkeypatch.setattr(ur, "_LEASE_RETRY_SECONDS", 0.01)
+    renew = AsyncMock(side_effect=OSError("db down"))
+    monkeypatch.setattr(ur._leases, "renew_lease", renew)
+    handle = await _handle()
+
+    async def slow(request, body):
+        await asyncio.sleep(5)
+        return httpx.Response(200)
+
+    google.reply = slow
+    response = await client.put(f"/ul/{handle}", content=b"x")
+    assert response.status_code == 503
+    assert renew.await_count >= 2
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_request_stops_its_relay_before_releasing(
+    relay_env, monkeypatch
+):
+    table = FakeLeaseTable()
+    leases = table.replica()
+    order, entered = [], asyncio.Event()
+
+    async def held(handle, request):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.01)  # e.g. closing the upstream connection
+            order.append("relay stopped")
+            raise
+
+    real_release = leases.release_lease
+
+    async def release(*args):
+        order.append("released")
+        return await real_release(*args)
+
+    monkeypatch.setattr(ur, "_serve_held", held)
+    monkeypatch.setattr(leases, "release_lease", release)
+    task = asyncio.create_task(ur._serve_leased(leases, "h" * 22, None))
+    await asyncio.wait_for(entered.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert order == ["relay stopped", "released"]
