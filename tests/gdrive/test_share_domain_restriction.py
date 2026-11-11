@@ -242,6 +242,31 @@ class TestDocstringNote:
         _with_share_restriction_note(dummy)
         assert dummy.__doc__.index("RESTRICTED") < dummy.__doc__.index("Args:")
 
+    def test_decorator_inserts_above_unindented_args_section(self, restricted):
+        # Python 3.13 strips the common docstring indent, so "Args:" can sit
+        # at column 0.
+        def dummy():
+            pass
+
+        dummy.__doc__ = "Summary line.\n\nArgs:\n    x: A thing.\n"
+
+        _with_share_restriction_note(dummy)
+        assert dummy.__doc__.index("RESTRICTED") < dummy.__doc__.index("Args:")
+
+    def test_registered_descriptions_carry_the_note(self, restricted):
+        # The note must survive into what clients see, on any Python version.
+        import importlib
+        from fastmcp.tools.function_parsing import ParsedFunction
+
+        import gdrive.drive_tools as drive_tools
+
+        importlib.reload(drive_tools)
+        for name in ("manage_drive_access", "set_drive_file_permissions"):
+            fn = getattr(drive_tools, name)
+            fn = getattr(fn, "fn", fn)
+            description = ParsedFunction.from_function(fn).description or ""
+            assert "RESTRICTED" in description, name
+
     def test_decorator_noop_when_unset(self, unrestricted):
         def dummy():
             """Original docs."""

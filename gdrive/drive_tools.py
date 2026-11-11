@@ -8,6 +8,7 @@ import asyncio
 import base64
 import logging
 import io
+import re
 
 from typing import Optional, List, Dict, Any
 from tempfile import NamedTemporaryFile, SpooledTemporaryFile
@@ -138,10 +139,12 @@ def _with_share_restriction_note(func):
     note = share_restriction_doc_note()
     doc = func.__doc__
     if note and doc:
-        marker = "\n    Args:"
-        if marker in doc:
-            head, _, tail = doc.partition(marker)
-            func.__doc__ = f"{head.rstrip()}{note}\n{marker}{tail}"
+        # Match "Args:" at any indentation: Python 3.13 strips the common
+        # docstring indent at compile time, 3.12 keeps it.
+        match = re.search(r"\n[ \t]*Args:", doc)
+        if match:
+            head, tail = doc[: match.start()], doc[match.start() :]
+            func.__doc__ = f"{head.rstrip()}{note}\n{tail}"
         else:
             func.__doc__ = doc + note
     return func
