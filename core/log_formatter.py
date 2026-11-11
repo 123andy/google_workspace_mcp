@@ -33,10 +33,14 @@ _CAPABILITY_PATH = re.compile(
     "|".join(re.escape(prefix) for prefix in _CAPABILITY_PATH_PREFIXES)
 )
 _CAPABILITY_IN_QUERY = re.compile(f"({_CAPABILITY_PATH.pattern})[^/?#&\\s]+")
+# OAuth redirect parameters (``/oauth2callback``, ``/auth/callback``): the
+# authorization ``code`` is single-use but still a credential until redeemed,
+# and ``state`` binds it to the pending flow. Redacted wherever they appear.
+_OAUTH_QUERY_PARAM = re.compile(r"(^|&)(code|state)=[^&#\s]*")
 
 
 def redact_capability_path(path: str) -> str:
-    """Redact every capability in a logged request target.
+    """Redact every capability, and any OAuth ``code``/``state``, in a logged request target.
 
     A credential in the path (``/dl/<handle>``, ``/auth/<handle>``) becomes
     ``<redacted>`` and the query string is dropped with it, so a second
@@ -52,6 +56,7 @@ def redact_capability_path(path: str) -> str:
         return path_part
     query = _AUTH_HANDLE.sub("/auth/<redacted>", query)
     query = _CAPABILITY_IN_QUERY.sub(r"\1<redacted>", query)
+    query = _OAUTH_QUERY_PARAM.sub(r"\1\2=<redacted>", query)
     return f"{path_part}?{query}"
 
 

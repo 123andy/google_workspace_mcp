@@ -30,7 +30,20 @@ SECRET = "SECRETHANDLE0123456789ab"
         (f"/dl/{SECRET}?x=1", "/dl/<redacted>"),
         # a literal operator route is not a credential
         ("/auth/callback", "/auth/callback"),
-        ("/auth/callback?code=abc&state=xyz", "/auth/callback?code=abc&state=xyz"),
+        # OAuth redirect parameters are redacted, other parameters kept
+        (
+            "/auth/callback?code=abc&state=xyz",
+            "/auth/callback?code=<redacted>&state=<redacted>",
+        ),
+        (
+            "/oauth2callback?state=s1&iss=https://accounts.google.com&code=4/0Ab&scope=email",
+            "/oauth2callback?state=<redacted>&iss=https://accounts.google.com&code=<redacted>&scope=email",
+        ),
+        (
+            "/oauth2callback?error=access_denied&state=s1",
+            "/oauth2callback?error=access_denied&state=<redacted>",
+        ),
+        ("/oauth2callback?xcode=1&codes=2", "/oauth2callback?xcode=1&codes=2"),
         ("/auth", "/auth"),
         (f"/auth/{SECRET}?x=1", "/auth/<redacted>"),
         # uvicorn logs root_path + path
