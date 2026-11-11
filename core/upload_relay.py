@@ -14,7 +14,8 @@ MIME type, limits) sits in the shared KV store, Fernet-encrypted under its own
 salt. The session URL is validated when stored and again when loaded, so the
 relay can only ever reach Google's upload endpoint.
 
-Per link: one request at a time (per process); at most ``_MAX_REQUESTS``
+Per link: one request at a time (per process, and across replicas when the
+shared backend is Postgres: see ``_serve_leased``); at most ``_MAX_REQUESTS``
 requests and twice the size cap in total; first use within
 ``_FIRST_USE_SECONDS``, then expiry slides with use up to
 ``_MAX_LIFETIME_SECONDS`` after minting, or less where the owner's credentials
@@ -73,8 +74,22 @@ _RANGE_RE = re.compile(r"^bytes=\d{1,15}-\d{1,15}$")
 # Handles with a relay in progress in this process.
 _in_flight: set[str] = set()
 
+# Cross-replica lock: a lease row per handle in the shared Postgres table.
+# Short, and renewed while the relay runs, so a replica that dies mid-relay
+# frees the link within _LEASE_SECONDS; a relay can last up to the link's 2 h.
+_LEASE_COLLECTION = "signed_upload_leases"
+_LEASE_SECONDS = 90.0
+_LEASE_RENEW_SECONDS = 30.0
+# Stop relaying this long before the lease could have expired unrenewed.
+_LEASE_MARGIN_SECONDS = 15.0
+# Bound on one lease statement, pool wait included.
+_LEASE_OP_TIMEOUT = 10.0
+_LOCK_UNAVAILABLE = "The upload link is temporarily unavailable; retry shortly"
+
 _store = None
 _store_built = False
+# The backend's lease methods when it can lock across replicas, else None.
+_leases = None
 
 
 def flag_set() -> bool:
@@ -133,6 +148,17 @@ def validate_startup(transport: str) -> None:
         cap = DEFAULT_MAX_BYTES
     if problems:
         raise ValueError("\n".join(problems))
+    from core.storage import get_configured_kv_store
+
+    configured = get_configured_kv_store()
+    if configured is not None and configured.backend in ("valkey", "disk"):
+        logger.warning(
+            "%s is on with the %s backend: the one-request-per-link lock is per "
+            "process, so run a single replica (only the postgres backend locks "
+            "across replicas).",
+            FLAG_ENV,
+            configured.backend,
+        )
     logger.info(
         "%s is on: upload links use %s/ul/*, which must be publicly reachable and "
         "accept request bodies up to %d bytes.",
@@ -193,7 +219,7 @@ def is_valid_session_url(url: object) -> bool:
 
 def _build_store():
     """Encrypted shared backend when configured, else in-process memory."""
-    global _store, _store_built
+    global _store, _store_built, _leases
     if _store_built:
         return _store
     _store_built = True
@@ -209,6 +235,8 @@ def _build_store():
                 key_value=configured.store,
                 fernet=Fernet(key=derive_shared_fernet_key("workspace-upload-handles")),
             )
+            if configured.backend == "postgres":
+                _leases = configured.store
             logger.info(
                 "Upload handles: using encrypted shared %s store (%s)",
                 configured.backend,
@@ -597,9 +625,89 @@ async def serve(request: Request) -> Response:
     # process, and the record is read only once the handle is held.
     _in_flight.add(handle)
     try:
-        return await _serve_held(handle, request)
+        _build_store()
+        if _leases is None:
+            return await _serve_held(handle, request)
+        return await _serve_leased(_leases, handle, request)
     finally:
         _in_flight.discard(handle)
+
+
+async def _serve_leased(leases, handle: str, request: Request) -> Response:
+    """``_serve_held`` under the handle's shared lease. Fails closed: no lease,
+    no relay. The lease is renewed while the relay runs; if it cannot be kept,
+    the relay is stopped before the lease could lapse and another replica take
+    the link (Google's session keeps whatever bytes it received)."""
+    owner = secrets.token_urlsafe(_HANDLE_BYTES)
+    started = time.monotonic()
+    try:
+        taken = await asyncio.wait_for(
+            leases.acquire_lease(_LEASE_COLLECTION, handle, owner, _LEASE_SECONDS),
+            _LEASE_OP_TIMEOUT,
+        )
+    except Exception as exc:
+        logger.warning("Upload relay: shared lock unavailable (%s)", type(exc).__name__)
+        return _error(503, _LOCK_UNAVAILABLE)
+    if not taken:
+        return _error(409, "Another upload to this link is in progress")
+    work = asyncio.create_task(_serve_held(handle, request))
+    try:
+        if await _keep_lease(leases, handle, owner, started, work) or work.done():
+            return work.result()
+        work.cancel()
+        try:
+            await work
+        except asyncio.CancelledError:
+            pass
+        return _error(
+            503,
+            "The upload was interrupted; send a status query "
+            "('Content-Range: bytes */<total size>'), then resume",
+        )
+    finally:
+        if not work.done():
+            work.cancel()
+        try:
+            await asyncio.wait_for(
+                leases.release_lease(_LEASE_COLLECTION, handle, owner),
+                _LEASE_OP_TIMEOUT,
+            )
+        except Exception as exc:  # the lease expires on its own
+            logger.warning(
+                "Upload relay: shared lock release failed (%s)", type(exc).__name__
+            )
+
+
+async def _keep_lease(
+    leases, handle: str, owner: str, valid_from: float, work: asyncio.Task
+) -> bool:
+    """Renew the lease until ``work`` finishes (True). False as soon as the
+    lease is lost or might lapse before the next renewal could land."""
+    while True:
+        deadline = valid_from + _LEASE_SECONDS - _LEASE_MARGIN_SECONDS
+        wait = min(_LEASE_RENEW_SECONDS, deadline - time.monotonic())
+        if wait > 0:
+            await asyncio.wait({work}, timeout=wait)
+        if work.done():
+            return True
+        attempt = time.monotonic()
+        if attempt >= deadline:
+            logger.warning("Upload relay: shared lock could not be renewed in time")
+            return False
+        try:
+            renewed = await asyncio.wait_for(
+                leases.renew_lease(_LEASE_COLLECTION, handle, owner, _LEASE_SECONDS),
+                min(_LEASE_OP_TIMEOUT, deadline - attempt),
+            )
+        except Exception as exc:  # retried until the deadline
+            logger.warning(
+                "Upload relay: shared lock renewal failed (%s)", type(exc).__name__
+            )
+            continue
+        if not renewed:
+            logger.warning("Upload relay: shared lock was lost")
+            return False
+        valid_from = attempt
 
 
 def _is_status_query(request: Request) -> bool:

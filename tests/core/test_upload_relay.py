@@ -1204,3 +1204,346 @@ def test_error_text_is_one_line_and_names_no_google_url():
 def test_json_bodies_are_json():
     response = ur._error(410, "closed")
     assert json.loads(response.body) == {"error": "closed"}
+
+
+# --- shared lock (cross-replica lease) ----------------------------------------------
+
+
+class FakeLeaseTable:
+    """The lease rows of the shared Postgres table, with the same rules as the
+    SQL in core.storage_postgres (real-Postgres tests:
+    test_upload_relay_lease_postgres.py), and a clock the test moves."""
+
+    def __init__(self):
+        self.rows = {}
+        self.now = 1000.0
+        self.calls = []
+
+    def replica(self):
+        return FakeLeases(self)
+
+
+class FakeLeases:
+    """One replica's view: its own object, the table shared."""
+
+    def __init__(self, table):
+        self.table = table
+
+    async def acquire_lease(self, collection, key, owner, ttl_seconds):
+        self.table.calls.append(("acquire", key, owner))
+        row = self.table.rows.get((collection, key))
+        if row is not None and row[1] > self.table.now:
+            return False
+        self.table.rows[(collection, key)] = (owner, self.table.now + ttl_seconds)
+        return True
+
+    async def renew_lease(self, collection, key, owner, ttl_seconds):
+        self.table.calls.append(("renew", key, owner))
+        row = self.table.rows.get((collection, key))
+        if row is None or row[0] != owner:
+            return False
+        self.table.rows[(collection, key)] = (owner, self.table.now + ttl_seconds)
+        return True
+
+    async def release_lease(self, collection, key, owner):
+        self.table.calls.append(("release", key, owner))
+        row = self.table.rows.get((collection, key))
+        if row is None or row[0] != owner:
+            return False
+        del self.table.rows[(collection, key)]
+        return True
+
+
+@pytest.fixture
+def leases(relay_env, monkeypatch):
+    table = FakeLeaseTable()
+    monkeypatch.setattr(ur, "_leases", table.replica())
+    return table
+
+
+def _lease_owner(table, handle):
+    row = table.rows.get((ur._LEASE_COLLECTION, handle))
+    return row and row[0]
+
+
+@pytest.mark.asyncio
+async def test_lease_table_rules(relay_env):
+    """The fake follows the SQL's rules, so the route tests below mean something."""
+    table = FakeLeaseTable()
+    a, b = table.replica(), table.replica()
+    c = ur._LEASE_COLLECTION
+    assert await a.acquire_lease(c, "h", "A", 90)
+    assert not await b.acquire_lease(c, "h", "B", 90)
+    assert not await b.release_lease(c, "h", "B")
+    assert await a.release_lease(c, "h", "A")
+    assert await b.acquire_lease(c, "h", "B", 90)
+    table.now += 91
+    assert await a.acquire_lease(c, "h", "A2", 90)  # expired: taken over
+    assert not await b.renew_lease(c, "h", "B", 90)
+    assert not await b.release_lease(c, "h", "B")
+    assert _lease_owner(table, "h") == "A2"
+
+
+@pytest.mark.asyncio
+async def test_two_replicas_relay_one_handle_one_at_a_time(
+    client, google, leases, monkeypatch
+):
+    """Replica B has its own in-process set, so only the shared lease stops it."""
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def slow(request, body):
+        entered.set()
+        await release.wait()
+        return httpx.Response(308, headers={"Range": "bytes=0-0"})
+
+    google.reply = slow
+    handle = await _handle()
+    first = asyncio.create_task(
+        client.put(
+            f"/ul/{handle}", content=b"x", headers={"Content-Range": "bytes 0-0/10"}
+        )
+    )
+    await asyncio.wait_for(entered.wait(), 5)
+    holder = _lease_owner(leases, handle)
+    assert holder
+
+    replica_a_in_flight = ur._in_flight
+    monkeypatch.setattr(ur, "_in_flight", set())  # replica B's process
+    monkeypatch.setattr(ur, "_leases", leases.replica())
+    second = await client.put(f"/ul/{handle}", content=b"x")
+    assert second.status_code == 409
+    assert second.json() == {"error": "Another upload to this link is in progress"}
+    assert len(google.requests) == 1  # only the first reached Google
+    assert _lease_owner(leases, handle) == holder
+
+    # Back on replica A (the module globals stand for "this process").
+    monkeypatch.setattr(ur, "_in_flight", replica_a_in_flight)
+    release.set()
+    assert (await first).status_code == 308
+    assert handle not in replica_a_in_flight
+    assert _lease_owner(leases, handle) is None  # released by its owner
+
+    google.reply = lambda request, body: httpx.Response(200, json={"id": "F"})
+    third = await client.put(
+        f"/ul/{handle}", content=b"y", headers={"Content-Range": "bytes 1-1/2"}
+    )
+    assert third.status_code == 200
+    assert len(google.requests) == 2
+    record = await _record(handle)
+    assert (record["state"], record["reqs"], record["bytes"]) == ("done", 2, 2)
+
+
+@pytest.mark.asyncio
+async def test_an_expired_lease_of_a_dead_replica_is_taken_over(client, google, leases):
+    handle = await _handle()
+    assert await leases.replica().acquire_lease(
+        ur._LEASE_COLLECTION, handle, "crashed-replica", ur._LEASE_SECONDS
+    )
+    assert (await client.put(f"/ul/{handle}", content=b"x")).status_code == 409
+    leases.now += ur._LEASE_SECONDS + 1
+    assert (await client.put(f"/ul/{handle}", content=b"x")).status_code == 200
+    assert _lease_owner(leases, handle) is None
+
+
+@pytest.mark.asyncio
+async def test_a_stale_owner_cannot_release_the_current_lease(client, google, leases):
+    """Our relay releases with its own token only: a lease another replica took
+    over after ours lapsed survives our release."""
+    handle = await _handle()
+
+    def reply(request, body):
+        # Mid-relay, our lease lapses and replica B takes the link.
+        leases.rows[(ur._LEASE_COLLECTION, handle)] = ("replica-b", leases.now + 90)
+        return httpx.Response(308)
+
+    google.reply = reply
+    response = await client.put(
+        f"/ul/{handle}", content=b"x", headers={"Content-Range": "bytes 0-0/10"}
+    )
+    assert response.status_code == 308
+    assert _lease_owner(leases, handle) == "replica-b"
+    assert [c[0] for c in leases.calls] == ["acquire", "release"]
+
+
+@pytest.mark.parametrize(
+    "failure", [RuntimeError("postgresql://u:hunter2@db/x"), asyncio.TimeoutError()]
+)
+@pytest.mark.asyncio
+async def test_lock_backend_failure_refuses_without_relaying(
+    client, google, leases, monkeypatch, caplog, failure
+):
+    handle = await _handle()
+    monkeypatch.setattr(ur._leases, "acquire_lease", AsyncMock(side_effect=failure))
+    with caplog.at_level(logging.WARNING, logger="core.upload_relay"):
+        response = await client.put(f"/ul/{handle}", content=b"x")
+    assert response.status_code == 503
+    assert response.json() == {"error": ur._LOCK_UNAVAILABLE}
+    assert google.requests == []
+    assert (await _record(handle))["reqs"] == 0
+    assert type(failure).__name__ in caplog.text and "hunter2" not in caplog.text
+    assert handle not in ur._in_flight
+
+
+@pytest.mark.asyncio
+async def test_a_hung_lock_backend_times_out_to_503(
+    client, google, leases, monkeypatch
+):
+    async def hang(*args):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(ur._leases, "acquire_lease", hang)
+    monkeypatch.setattr(ur, "_LEASE_OP_TIMEOUT", 0.05)
+    handle = await _handle()
+    response = await client.put(f"/ul/{handle}", content=b"x")
+    assert response.status_code == 503
+    assert google.requests == []
+
+
+@pytest.mark.asyncio
+async def test_release_failure_is_logged_by_type_and_left_to_expire(
+    client, google, leases, monkeypatch, caplog
+):
+    monkeypatch.setattr(
+        ur._leases,
+        "release_lease",
+        AsyncMock(side_effect=OSError("postgresql://u:hunter2@db/x")),
+    )
+    handle = await _handle()
+    with caplog.at_level(logging.WARNING, logger="core.upload_relay"):
+        response = await client.put(f"/ul/{handle}", content=b"x")
+    assert response.status_code == 200
+    assert "release failed (OSError)" in caplog.text and "hunter2" not in caplog.text
+    assert _lease_owner(leases, handle)  # still there until it expires
+    leases.now += ur._LEASE_SECONDS + 1
+    assert await leases.replica().acquire_lease(
+        ur._LEASE_COLLECTION, handle, "next", ur._LEASE_SECONDS
+    )
+
+
+@pytest.fixture
+def fast_lease(monkeypatch):
+    """Lease timings in hundredths of a second (real monotonic time)."""
+    monkeypatch.setattr(ur, "_LEASE_SECONDS", 0.3)
+    monkeypatch.setattr(ur, "_LEASE_RENEW_SECONDS", 0.05)
+    monkeypatch.setattr(ur, "_LEASE_MARGIN_SECONDS", 0.1)
+    monkeypatch.setattr(ur, "_LEASE_OP_TIMEOUT", 0.05)
+
+
+@pytest.mark.asyncio
+async def test_a_long_relay_keeps_renewing_its_lease(
+    client, google, leases, fast_lease
+):
+    async def slow(request, body):
+        await asyncio.sleep(0.6)  # twice the lease
+        return httpx.Response(200, json={"id": "F"})
+
+    google.reply = slow
+    handle = await _handle()
+    response = await client.put(f"/ul/{handle}", content=b"x")
+    assert response.status_code == 200
+    kinds = [c[0] for c in leases.calls]
+    assert kinds[0] == "acquire" and kinds[-1] == "release"
+    assert kinds.count("renew") >= 5
+    assert (await _record(handle))["state"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_a_lost_lease_stops_the_relay(client, google, leases, fast_lease):
+    handle = await _handle()
+
+    async def slow(request, body):
+        leases.rows[(ur._LEASE_COLLECTION, handle)] = ("replica-b", leases.now + 90)
+        await asyncio.sleep(5)
+        return httpx.Response(200)
+
+    google.reply = slow
+    started = time.monotonic()
+    response = await client.put(f"/ul/{handle}", content=b"x")
+    assert time.monotonic() - started < 2
+    assert response.status_code == 503
+    assert "interrupted" in response.json()["error"]
+    assert _lease_owner(leases, handle) == "replica-b"
+    assert handle not in ur._in_flight
+
+
+@pytest.mark.asyncio
+async def test_a_lease_that_cannot_be_renewed_stops_the_relay_before_it_lapses(
+    client, google, leases, fast_lease, monkeypatch
+):
+    renew = AsyncMock(side_effect=OSError("db down"))
+    monkeypatch.setattr(ur._leases, "renew_lease", renew)
+    handle = await _handle()
+
+    async def slow(request, body):
+        await asyncio.sleep(5)
+        return httpx.Response(200)
+
+    google.reply = slow
+    started = time.monotonic()
+    response = await client.put(f"/ul/{handle}", content=b"x")
+    elapsed = time.monotonic() - started
+    assert response.status_code == 503
+    # Stopped by the margin: before the 0.3 s lease could lapse unrenewed.
+    assert elapsed < ur._LEASE_SECONDS
+    assert renew.await_count >= 2
+
+
+def _configured(backend):
+    from core.storage import ConfiguredKvStore
+
+    return ConfiguredKvStore(
+        store=MemoryStore(), backend=backend, detail="test", needs_encryption=True
+    )
+
+
+@pytest.mark.parametrize(
+    "backend, locks", [("postgres", True), ("valkey", False), ("disk", False)]
+)
+def test_only_the_postgres_backend_gets_the_shared_lock(
+    relay_env, monkeypatch, backend, locks
+):
+    configured = _configured(backend)
+    monkeypatch.setattr(ur, "_store_built", False)
+    monkeypatch.setattr(ur, "_leases", None)
+    with patch("core.storage.get_configured_kv_store", lambda: configured):
+        assert ur._build_store() is not None
+    assert (ur._leases is configured.store) is locks
+
+
+@pytest.mark.parametrize("configured", [None, _configured("memory")])
+def test_without_a_shared_backend_there_is_no_shared_lock(
+    relay_env, monkeypatch, configured
+):
+    if configured is not None:
+        configured = configured.__class__(
+            store=MemoryStore(), backend="memory", detail="m", needs_encryption=False
+        )
+    monkeypatch.setattr(ur, "_store_built", False)
+    monkeypatch.setattr(ur, "_leases", None)
+    with patch("core.storage.get_configured_kv_store", lambda: configured):
+        assert isinstance(ur._build_store(), MemoryStore)
+    assert ur._leases is None
+
+
+@pytest.mark.parametrize(
+    "backend, warns",
+    [
+        ("valkey", True),
+        ("disk", True),
+        ("postgres", False),
+        ("memory", False),
+        (None, False),
+    ],
+)
+def test_startup_warns_when_the_lock_is_process_only(
+    monkeypatch, caplog, backend, warns
+):
+    monkeypatch.setenv(ur.FLAG_ENV, "true")
+    monkeypatch.setenv(sd.FLAG_ENV, "true")
+    monkeypatch.setenv("WORKSPACE_EXTERNAL_URL", EXTERNAL)
+    monkeypatch.delenv(ur.MAX_BYTES_ENV, raising=False)
+    configured = _configured(backend) if backend else None
+    with patch("core.storage.get_configured_kv_store", lambda: configured):
+        with caplog.at_level(logging.WARNING, logger="core.upload_relay"):
+            ur.validate_startup("streamable-http")
+    assert ("single replica" in caplog.text) is warns

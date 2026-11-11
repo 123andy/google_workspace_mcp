@@ -15,9 +15,17 @@ the race is harmless.
 
 This module imports ``asyncpg`` at import time — import it lazily (see
 ``core.storage._build_postgres_store``) so the driver stays optional.
+
+The store also offers leases (``acquire_lease`` / ``renew_lease`` /
+``release_lease``): a row per key in the same table, held by an owner token
+until ``expires_at``. The KV API has no put-if-absent, so these are single SQL
+statements; each borrows a pool connection only for that statement, never for
+the life of the lease. Times are the database's ``now()``, so replicas' clocks
+do not matter. Expired lease rows are swept like any other.
 """
 
 import asyncio
+import json
 import logging
 import time
 from typing import Any, Mapping, Optional, SupportsFloat
@@ -125,3 +133,57 @@ class SweepingPostgreSQLStore(PostgreSQLStore):
     ) -> None:
         await super().put(key, value, collection=collection, ttl=ttl)
         self._maybe_schedule_sweep()
+
+    # --- Leases ---------------------------------------------------------------------
+
+    async def acquire_lease(
+        self, collection: str, key: str, owner: str, ttl_seconds: float
+    ) -> bool:
+        """Take the lease on ``key`` for ``owner`` if nobody holds it or the
+        holder's lease has expired. True only for the caller that took it."""
+        await self.setup()
+        row = await self._initialized_pool.fetchval(
+            f"INSERT INTO {self._table_name} AS t "  # noqa: S608 - table name validated in __init__
+            "(collection, key, value, ttl, created_at, expires_at) "
+            "VALUES ($1, $2, $3::jsonb, $4, now(), now() + make_interval(secs => $4)) "
+            "ON CONFLICT (collection, key) DO UPDATE SET value = EXCLUDED.value, "
+            "ttl = EXCLUDED.ttl, created_at = EXCLUDED.created_at, "
+            "expires_at = EXCLUDED.expires_at "
+            "WHERE t.expires_at IS NOT NULL AND t.expires_at <= now() "
+            "RETURNING 1",
+            collection,
+            key,
+            json.dumps({"owner": owner}),
+            float(ttl_seconds),
+        )
+        return row == 1
+
+    async def renew_lease(
+        self, collection: str, key: str, owner: str, ttl_seconds: float
+    ) -> bool:
+        """Extend ``owner``'s lease to ``ttl_seconds`` from now. False when the
+        row is gone or another owner has taken it."""
+        await self.setup()
+        row = await self._initialized_pool.fetchval(
+            f"UPDATE {self._table_name} "  # noqa: S608 - table name validated in __init__
+            "SET ttl = $4, expires_at = now() + make_interval(secs => $4) "
+            "WHERE collection = $1 AND key = $2 AND value->>'owner' = $3 "
+            "RETURNING 1",
+            collection,
+            key,
+            owner,
+            float(ttl_seconds),
+        )
+        return row == 1
+
+    async def release_lease(self, collection: str, key: str, owner: str) -> bool:
+        """Drop the lease only if ``owner`` still holds it."""
+        await self.setup()
+        result = await self._initialized_pool.execute(
+            f"DELETE FROM {self._table_name} "  # noqa: S608 - table name validated in __init__
+            "WHERE collection = $1 AND key = $2 AND value->>'owner' = $3",
+            collection,
+            key,
+            owner,
+        )
+        return result.split()[-1] != "0"
