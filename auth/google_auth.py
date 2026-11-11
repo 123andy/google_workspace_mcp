@@ -701,7 +701,7 @@ async def start_auth_flow(
                 logger.warning(f"Could not open browser automatically: {e}")
 
         store = get_oauth21_session_store()
-        store.store_oauth_state(
+        await store.astore_oauth_state(
             oauth_state,
             session_id=session_id,
             code_verifier=flow.code_verifier,
@@ -841,7 +841,7 @@ async def handle_auth_callback(
         state = state_values[0] if state_values else None
 
         if state:
-            state_info = store.validate_and_consume_oauth_state(
+            state_info = await store.avalidate_and_consume_oauth_state(
                 state, session_id=session_id
             )
         elif (

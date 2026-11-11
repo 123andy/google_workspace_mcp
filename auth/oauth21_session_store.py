@@ -63,6 +63,9 @@ def _get_default_oauth_state_file() -> str:
     return os.path.join(base_dir, "oauth_states.json")
 
 
+_RESOLVE_OAUTH_STATE_KV = object()
+
+
 def _normalize_expiry_to_naive_utc(expiry: Optional[Any]) -> Optional[datetime]:
     """
     Convert expiry values to timezone-naive UTC datetimes for google-auth compatibility.
@@ -233,7 +236,11 @@ class OAuth21SessionStore:
     their own credentials.
     """
 
-    def __init__(self, oauth_state_file: Optional[str] = None):
+    def __init__(
+        self,
+        oauth_state_file: Optional[str] = None,
+        oauth_state_kv: Any = _RESOLVE_OAUTH_STATE_KV,
+    ):
         self._sessions: Dict[str, Dict[str, Any]] = {}
         self._mcp_session_mapping: Dict[
             str, str
@@ -243,6 +250,9 @@ class OAuth21SessionStore:
         ] = {}  # Maps session ID -> authenticated user email (immutable)
         self._oauth_states: Dict[str, Dict[str, Any]] = {}
         self._oauth_state_file = oauth_state_file or _get_default_oauth_state_file()
+        # Shared KV for pending OAuth states (see auth.oauth_state_kv). Resolved on
+        # first async use unless injected; None means local file only.
+        self._oauth_state_kv = oauth_state_kv
         self._lock = RLock()
 
     def _ensure_oauth_state_directory(self) -> None:
@@ -462,6 +472,59 @@ class OAuth21SessionStore:
                 state[:8] if len(state) > 8 else state,
             )
 
+    def _new_oauth_state_entry(
+        self,
+        state: str,
+        session_id: Optional[str],
+        expires_in_seconds: int,
+        code_verifier: Optional[str],
+        user_email: Optional[str],
+        expected_user_email: Optional[str],
+        enforce_user_email_match: bool,
+        principal_source: Optional[str],
+    ) -> Dict[str, Any]:
+        if not state:
+            raise ValueError("OAuth state must be provided")
+        if expires_in_seconds < 0:
+            raise ValueError("expires_in_seconds must be non-negative")
+        now = datetime.now(timezone.utc)
+        return {
+            "session_id": session_id,
+            "expires_at": now + timedelta(seconds=expires_in_seconds),
+            "created_at": now,
+            "code_verifier": code_verifier,
+            "user_email": user_email,
+            "expected_user_email": expected_user_email,
+            "enforce_user_email_match": enforce_user_email_match,
+            "principal_source": principal_source,
+        }
+
+    def _store_oauth_state_in_file(
+        self, state: str, state_info: Dict[str, Any]
+    ) -> None:
+        with self._lock:
+            self._cleanup_expired_oauth_states_locked()
+            self._oauth_states[state] = state_info
+            self._persist_oauth_state_to_shared_store(state, state_info)
+            logger.debug(
+                "Stored OAuth state %s (expires at %s)",
+                state[:8] if len(state) > 8 else state,
+                state_info["expires_at"].isoformat(),
+            )
+
+    @staticmethod
+    def _check_oauth_state_session(
+        state_info: Dict[str, Any], session_id: Optional[str]
+    ) -> None:
+        bound_session = state_info.get("session_id")
+        if bound_session and session_id and bound_session != session_id:
+            logger.error(
+                "SECURITY: OAuth state session mismatch (expected %s, got %s)",
+                bound_session,
+                session_id,
+            )
+            raise ValueError("OAuth state does not match the initiating session")
+
     def store_oauth_state(
         self,
         state: str,
@@ -478,33 +541,21 @@ class OAuth21SessionStore:
         Enforced identity bindings are explicit so callback security does not depend on
         process-global configuration at callback time. ``user_email`` is retained only
         for compatibility with state entries created by older releases.
-        """
-        if not state:
-            raise ValueError("OAuth state must be provided")
-        if expires_in_seconds < 0:
-            raise ValueError("expires_in_seconds must be non-negative")
 
-        with self._lock:
-            self._cleanup_expired_oauth_states_locked()
-            now = datetime.now(timezone.utc)
-            expiry = now + timedelta(seconds=expires_in_seconds)
-            state_info = {
-                "session_id": session_id,
-                "expires_at": expiry,
-                "created_at": now,
-                "code_verifier": code_verifier,
-                "user_email": user_email,
-                "expected_user_email": expected_user_email,
-                "enforce_user_email_match": enforce_user_email_match,
-                "principal_source": principal_source,
-            }
-            self._oauth_states[state] = state_info
-            self._persist_oauth_state_to_shared_store(state, state_info)
-            logger.debug(
-                "Stored OAuth state %s (expires at %s)",
-                state[:8] if len(state) > 8 else state,
-                expiry.isoformat(),
-            )
+        This writes the local state file only; async callers should use
+        ``astore_oauth_state`` so a configured shared store is used.
+        """
+        state_info = self._new_oauth_state_entry(
+            state,
+            session_id,
+            expires_in_seconds,
+            code_verifier,
+            user_email,
+            expected_user_email,
+            enforce_user_email_match,
+            principal_source,
+        )
+        self._store_oauth_state_in_file(state, state_info)
 
     def validate_and_consume_oauth_state(
         self,
@@ -538,14 +589,7 @@ class OAuth21SessionStore:
                 raise ValueError("Invalid or expired OAuth state parameter")
 
             self._oauth_states.pop(state, None)
-            bound_session = state_info.get("session_id")
-            if bound_session and session_id and bound_session != session_id:
-                logger.error(
-                    "SECURITY: OAuth state session mismatch (expected %s, got %s)",
-                    bound_session,
-                    session_id,
-                )
-                raise ValueError("OAuth state does not match the initiating session")
+            self._check_oauth_state_session(state_info, session_id)
 
             # State is valid – consume it to prevent reuse
             logger.debug(
@@ -553,6 +597,137 @@ class OAuth21SessionStore:
                 state[:8] if len(state) > 8 else state,
             )
             return state_info
+
+    def _get_oauth_state_kv(self) -> Optional[Any]:
+        if self._oauth_state_kv is _RESOLVE_OAUTH_STATE_KV:
+            from auth.oauth_state_kv import get_oauth_state_kv
+
+            self._oauth_state_kv = get_oauth_state_kv()
+        return self._oauth_state_kv
+
+    async def astore_oauth_state(
+        self,
+        state: str,
+        session_id: Optional[str] = None,
+        expires_in_seconds: int = 600,
+        code_verifier: Optional[str] = None,
+        user_email: Optional[str] = None,
+        expected_user_email: Optional[str] = None,
+        enforce_user_email_match: bool = False,
+        principal_source: Optional[str] = None,
+    ) -> None:
+        """Like ``store_oauth_state``, but in the shared KV store when one is configured.
+
+        A shared store lets any replica complete the callback and survives a
+        restart during consent. If the shared write fails, the state goes to the
+        local file instead, which still works when the callback reaches this
+        instance.
+        """
+        state_info = self._new_oauth_state_entry(
+            state,
+            session_id,
+            expires_in_seconds,
+            code_verifier,
+            user_email,
+            expected_user_email,
+            enforce_user_email_match,
+            principal_source,
+        )
+        kv = self._get_oauth_state_kv()
+        if kv is not None:
+            from auth.oauth_state_kv import OAUTH_STATE_COLLECTION
+
+            try:
+                await kv.put(
+                    state,
+                    self._serialize_oauth_state_entry(state_info),
+                    collection=OAUTH_STATE_COLLECTION,
+                    ttl=expires_in_seconds,
+                )
+                logger.debug(
+                    "Stored OAuth state %s in shared store (expires at %s)",
+                    state[:8] if len(state) > 8 else state,
+                    state_info["expires_at"].isoformat(),
+                )
+                return
+            except Exception as exc:
+                logger.warning(
+                    "Could not store OAuth state in the shared store (%s); using the "
+                    "local state file, so the callback must reach this instance.",
+                    exc,
+                )
+        self._store_oauth_state_in_file(state, state_info)
+
+    async def avalidate_and_consume_oauth_state(
+        self,
+        state: str,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Like ``validate_and_consume_oauth_state``, checking the shared store first.
+
+        A state is accepted from the shared store only if this call's delete
+        removed it, so concurrent callbacks on different replicas cannot both
+        consume it. States not found there are looked up in the local file,
+        which covers states written by an instance without the shared store
+        (for example during a rollout) or after a failed shared write.
+
+        Raises:
+            ValueError: If the state is missing, expired, already used, or does not
+                match the session.
+        """
+        if not state:
+            raise ValueError("Missing OAuth state parameter")
+
+        kv = self._get_oauth_state_kv()
+        if kv is not None:
+            from auth.oauth_state_kv import OAUTH_STATE_COLLECTION
+
+            record = None
+            try:
+                record = await kv.get(state, collection=OAUTH_STATE_COLLECTION)
+            except Exception as exc:
+                logger.warning(
+                    "Could not read OAuth state from the shared store (%s); "
+                    "checking the local state file.",
+                    exc,
+                )
+            if record is not None:
+                try:
+                    deleted = await kv.delete(state, collection=OAUTH_STATE_COLLECTION)
+                except Exception as exc:
+                    # Single use cannot be confirmed, so fail closed.
+                    logger.error(
+                        "SECURITY: could not consume OAuth state in the shared store: %s",
+                        exc,
+                    )
+                    raise ValueError(
+                        "Invalid or expired OAuth state parameter"
+                    ) from exc
+                if not deleted:
+                    logger.error(
+                        "SECURITY: OAuth state was already consumed by another callback"
+                    )
+                    raise ValueError("Invalid or expired OAuth state parameter")
+
+                state_info = self._deserialize_oauth_state_entry(dict(record))
+                expires_at = state_info.get("expires_at")
+                if not isinstance(expires_at, datetime) or expires_at <= datetime.now(
+                    timezone.utc
+                ):
+                    logger.error(
+                        "SECURITY: OAuth callback received unknown or expired state"
+                    )
+                    raise ValueError("Invalid or expired OAuth state parameter")
+                with self._lock:
+                    self._oauth_states.pop(state, None)
+                self._check_oauth_state_session(state_info, session_id)
+                logger.debug(
+                    "Validated OAuth state %s from shared store",
+                    state[:8] if len(state) > 8 else state,
+                )
+                return state_info
+
+        return self.validate_and_consume_oauth_state(state, session_id=session_id)
 
     def consume_latest_oauth_state(
         self,

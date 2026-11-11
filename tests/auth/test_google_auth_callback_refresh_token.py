@@ -47,6 +47,9 @@ class _DummyOAuthStore:
         )
         return {"session_id": bound, "code_verifier": "verifier"}
 
+    async def avalidate_and_consume_oauth_state(self, state, session_id=None):
+        return self.validate_and_consume_oauth_state(state, session_id=session_id)
+
     def consume_latest_oauth_state(
         self,
         initiating_session_id=None,
