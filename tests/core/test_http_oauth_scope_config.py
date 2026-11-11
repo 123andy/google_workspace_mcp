@@ -516,8 +516,15 @@ def _configure_standard_oauth21(monkeypatch):
         "WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND",
         "WORKSPACE_MCP_OAUTH_PROXY_VALKEY_HOST",
         "WORKSPACE_MCP_OAUTH_PROXY_DISK_DIRECTORY",
+        "WORKSPACE_MCP_OAUTH_PROXY_POSTGRES_DSN",
     ):
         monkeypatch.delenv(var, raising=False)
+    # configure_server_for_http reads the backend through core.storage's
+    # process-wide cache; rebuild it from this test's environment.
+    import core.storage as storage
+
+    monkeypatch.setattr(storage, "_configured", None)
+    monkeypatch.setattr(storage, "_configured_built", False)
     monkeypatch.setattr(server_module, "get_transport_mode", lambda: "streamable-http")
     monkeypatch.setattr(server_module, "WorkspaceGoogleProvider", FakeGoogleProvider)
     monkeypatch.setattr(server_module, "set_auth_provider", lambda provider: None)
