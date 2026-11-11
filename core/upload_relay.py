@@ -652,6 +652,11 @@ async def _serve_leased(leases, handle: str, request: Request) -> Response:
             leases.acquire_lease(_LEASE_COLLECTION, handle, owner, _LEASE_SECONDS),
             _LEASE_OP_TIMEOUT,
         )
+    except asyncio.CancelledError:
+        # The INSERT may have committed before the cancel; release it, shielded
+        # (and bounded) so a further cancel cannot cut the release short.
+        await asyncio.shield(_release_lease(leases, handle, owner))
+        raise
     except Exception as exc:
         logger.warning("Upload relay: shared lock unavailable (%s)", type(exc).__name__)
         # A timed-out INSERT may still have committed; don't leave the link

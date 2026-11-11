@@ -1758,3 +1758,25 @@ async def test_a_relay_that_will_not_stop_keeps_its_lease_until_expiry(
     assert "left to expire" in caplog.text
     await asyncio.wait_for(finished.wait(), 5)
 
+
+@pytest.mark.asyncio
+async def test_a_cancel_during_acquire_releases_a_committed_lease(relay_env):
+    table = FakeLeaseTable()
+    leases = table.replica()
+    real_acquire = leases.acquire_lease
+    committed = asyncio.Event()
+
+    async def commit_then_hang(*args):
+        await real_acquire(*args)
+        committed.set()
+        await asyncio.Event().wait()
+
+    leases.acquire_lease = commit_then_hang
+    task = asyncio.create_task(ur._serve_leased(leases, "h" * 22, None))
+    await asyncio.wait_for(committed.wait(), 5)
+    assert _lease_owner(table, "h" * 22)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert [c[0] for c in table.calls] == ["acquire", "release"]
+    assert _lease_owner(table, "h" * 22) is None
