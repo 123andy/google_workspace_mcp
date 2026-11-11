@@ -32,6 +32,7 @@ key checks) and streamable-http; stdio ignores the setting.
 """
 
 import asyncio
+import contextvars
 import logging
 import os
 import re
@@ -90,6 +91,10 @@ _store = None
 _store_built = False
 # The backend's lease methods when it can lock across replicas, else None.
 _leases = None
+# (leases, handle, owner) for the relay running in this task under a lease.
+_held_lease: contextvars.ContextVar = contextvars.ContextVar(
+    "upload_relay_held_lease", default=None
+)
 
 
 def flag_set() -> bool:
@@ -653,7 +658,12 @@ async def _serve_leased(leases, handle: str, request: Request) -> Response:
         return _error(503, _LOCK_UNAVAILABLE)
     if not taken:
         return _error(409, "Another upload to this link is in progress")
-    work = asyncio.create_task(_serve_held(handle, request))
+    # The task copies the context, so its saves are fenced by this lease.
+    held = _held_lease.set((leases, handle, owner))
+    try:
+        work = asyncio.create_task(_serve_held(handle, request))
+    finally:
+        _held_lease.reset(held)
     try:
         if await _keep_lease(leases, handle, owner, started, work) or work.done():
             return work.result()
@@ -662,15 +672,42 @@ async def _serve_leased(leases, handle: str, request: Request) -> Response:
             await work
         except asyncio.CancelledError:
             pass
-        return _error(
-            503,
-            "The upload was interrupted; send a status query "
-            "('Content-Range: bytes */<total size>'), then resume",
-        )
+        return _interrupted()
     finally:
         if not work.done():
             work.cancel()
         await _release_lease(leases, handle, owner)
+
+
+def _interrupted() -> Response:
+    return _error(
+        503,
+        "The upload was interrupted; send a status query "
+        "('Content-Range: bytes */<total size>'), then resume",
+    )
+
+
+async def _still_held() -> bool:
+    """Fence for a save under a lease: renew it (owner-checked) right before
+    writing, so a relay whose lease lapsed, e.g. while the event loop stalled,
+    cannot overwrite a newer holder's record. True without a lease."""
+    held = _held_lease.get()
+    if held is None:
+        return True
+    leases, handle, owner = held
+    try:
+        if await asyncio.wait_for(
+            leases.renew_lease(_LEASE_COLLECTION, handle, owner, _LEASE_SECONDS),
+            _LEASE_OP_TIMEOUT,
+        ):
+            return True
+        logger.warning("Upload relay: shared lock was lost; record not saved")
+    except Exception as exc:
+        logger.warning(
+            "Upload relay: shared lock check failed (%s); record not saved",
+            type(exc).__name__,
+        )
+    return False
 
 
 async def _release_lease(leases, handle: str, owner: str) -> None:
@@ -801,6 +838,8 @@ async def _answer_done(handle: str, record: dict, request: Request) -> Response:
             "Re-authenticate through this server and ask again, or "
             f"{_FIND_IT}",
         )
+    if not await _still_held():
+        return _interrupted()
     record["reqs"] += 1
     await _save(handle, record)
     return Response(
@@ -885,6 +924,8 @@ async def _relay(
         if record["state"] == "done"
         else min(now + _IDLE_SECONDS, record["hard_exp"])
     )
+    if not await _still_held():
+        return _interrupted()
     await _save(handle, record)
     logger.info(
         "Upload relay for %s: %d bytes, Google status %s, link %s",

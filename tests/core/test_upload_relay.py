@@ -1346,23 +1346,69 @@ async def test_an_expired_lease_of_a_dead_replica_is_taken_over(client, google, 
 
 
 @pytest.mark.asyncio
-async def test_a_stale_owner_cannot_release_the_current_lease(client, google, leases):
-    """Our relay releases with its own token only: a lease another replica took
-    over after ours lapsed survives our release."""
+async def test_a_relay_whose_lease_was_taken_over_neither_saves_nor_releases(
+    client, google, leases
+):
+    """If our lease lapses mid-relay (e.g. the event loop stalled) and replica B
+    takes the link, the save is fenced off and B's lease survives our release."""
     handle = await _handle()
+    before = await _record(handle)
 
     def reply(request, body):
-        # Mid-relay, our lease lapses and replica B takes the link.
         leases.rows[(ur._LEASE_COLLECTION, handle)] = ("replica-b", leases.now + 90)
-        return httpx.Response(308)
+        return httpx.Response(200, json={"id": "F"})
 
     google.reply = reply
+    response = await client.put(f"/ul/{handle}", content=b"x")
+    assert response.status_code == 503
+    assert "interrupted" in response.json()["error"]
+    assert await _record(handle) == before  # B's record, not overwritten
+    assert _lease_owner(leases, handle) == "replica-b"
+    assert [c[0] for c in leases.calls] == ["acquire", "renew", "release"]
+
+
+@pytest.mark.asyncio
+async def test_a_save_is_fenced_by_a_renewal_of_our_own_lease(client, google, leases):
+    handle = await _handle()
+    response = await client.put(f"/ul/{handle}", content=b"x")
+    assert response.status_code == 200
+    assert [c[0] for c in leases.calls] == ["acquire", "renew", "release"]
+    assert (await _record(handle))["state"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_fence_check_does_not_save(client, google, leases, monkeypatch):
+    monkeypatch.setattr(
+        ur._leases, "renew_lease", AsyncMock(side_effect=OSError("db down"))
+    )
+    handle = await _handle()
+    before = await _record(handle)
     response = await client.put(
         f"/ul/{handle}", content=b"x", headers={"Content-Range": "bytes 0-0/10"}
     )
-    assert response.status_code == 308
-    assert _lease_owner(leases, handle) == "replica-b"
-    assert [c[0] for c in leases.calls] == ["acquire", "release"]
+    assert response.status_code == 503
+    assert await _record(handle) == before
+
+
+@pytest.mark.asyncio
+async def test_a_replay_on_a_completed_link_is_fenced_too(client, google, leases):
+    handle = await _handle()
+    assert (await client.put(f"/ul/{handle}", content=b"abcd")).status_code == 200
+    done = await _record(handle)
+    real_renew = ur._leases.renew_lease
+
+    async def taken_over(collection, key, owner, ttl):
+        leases.rows[(collection, key)] = ("replica-b", leases.now + 90)
+        return await real_renew(collection, key, owner, ttl)
+
+    ur._leases.renew_lease = taken_over
+    response = await client.put(
+        f"/ul/{handle}",
+        content=b"",
+        headers={"Content-Range": "bytes */4", "Content-Length": "0"},
+    )
+    assert response.status_code == 503
+    assert await _record(handle) == done
 
 
 @pytest.mark.parametrize(

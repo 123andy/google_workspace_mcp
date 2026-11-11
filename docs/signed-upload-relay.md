@@ -161,6 +161,10 @@ replica can relay a link at a time. The lease:
 - frees the link within 90 s if a replica dies mid-relay;
 - is released only by the relay that took it (an owner token), so a relay
   whose lease lapsed cannot release another replica's;
+- fences every write of the link's record: the relay first renews its lease
+  (owner-checked) and does not write if that fails, answering `503` as below.
+  What remains assumed is that the one step between that renewal and the
+  write never takes as long as a lease (90 s);
 - fails closed: if the database errors, the request gets `503` and nothing is
   relayed; if the lease cannot be renewed (or was taken over), the relay is
   stopped before the lease could lapse, and the caller gets `503` and resumes
