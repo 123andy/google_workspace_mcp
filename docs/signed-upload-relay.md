@@ -85,7 +85,7 @@ curl --fail-with-body -w '\nHTTP %{http_code}\n' \
 | Owner without a refresh token | the link ends 30 s before the owner's access token stops being usable here, if that is sooner than 2 hours (the tool result gives the shorter limit); with under 15 minutes of it left, no link is issued |
 | Requests | 50, status queries and replays included |
 | Bytes in total | twice the size cap |
-| Concurrency | one request at a time per server instance (`409` for a second); see [More than one instance](#more-than-one-instance) |
+| Concurrency | one request at a time per link (`409` for a second): across replicas with the Postgres backend, otherwise per server instance; see [More than one instance](#more-than-one-instance) |
 
 ## Status codes
 
@@ -97,12 +97,12 @@ curl --fail-with-body -w '\nHTTP %{http_code}\n' \
 | `401` | The owner's credentials are no longer recoverable on this server. For a status query on a completed link the body also says the upload completed. |
 | `403` | Unknown, malformed or expired handle (one generic body for all, which says to look for the file by name before uploading again). |
 | `405` | Method other than PUT or POST (POST is sent on as PUT). |
-| `409` | Another request on this link is in progress on this server instance. |
+| `409` | Another request on this link is in progress (on this instance, or on any replica with the Postgres backend). |
 | `410` | Link closed: upload completed (the body says so and how to read the file id, or to find the file by name once its 50 requests are used), Google answered 4xx, or 50 requests used. |
 | `411` | No `Content-Length`, or a chunked body. |
 | `413` | Over the size cap (by `Content-Length` or `Content-Range`), or over the link's total. |
 | `502` | Google answered 5xx or an unexpected status, or the connection to Google failed. |
-| `503` | Google answered 408 or 429 (retry later; the link stays open). |
+| `503` | Google answered 408 or 429 (retry later; the link stays open); the shared lock could not be taken because its database failed; or the relay lost the lock mid-request and stopped (query progress, then resume). |
 | `504` | Google did not answer in time. |
 
 `401`, `403`, `409`, `411`, `413`, the header `400`s and the `410` for an
@@ -149,19 +149,31 @@ request.
 
 ## More than one instance
 
-The one-request-per-link lock lives in each server process. With more than
-one replica, or while old and new pods overlap in a rolling update, two
-requests for the same link can run at once on different instances. Each
-reads the record, relays, and writes back its own counts, so:
+Each process refuses a second request for a link it is already relaying. With
+the **Postgres** backend the relay also takes a lease on the link, a row in
+the shared KV table (collection `signed_upload_leases`) taken with one
+`INSERT ... ON CONFLICT DO UPDATE ... WHERE expired` statement, so only one
+replica can relay a link at a time. The lease:
 
-- the request and byte limits per link become soft (one write can overwrite
-  another's counts);
-- a write from a request that started before the upload completed can mark
-  a finished link open again, so a later PUT reaches Google's finished
-  session instead of getting `410`.
+- lasts 90 s and is renewed every 30 s while the relay runs (a relay can last
+  up to the link's 2 hours), using the database clock; a connection is
+  borrowed only for each statement, never held for the upload;
+- frees the link within 90 s if a replica dies mid-relay;
+- is released only by the relay that took it (an owner token), so a relay
+  whose lease lapsed cannot release another replica's;
+- fails closed: if the database errors, the request gets `503` and nothing is
+  relayed; if the lease cannot be renewed (or was taken over), the relay is
+  stopped before the lease could lapse, and the caller gets `503` and resumes
+  after a status query. Google keeps whatever bytes it received.
 
-Google's session still decides what is stored. Run a single replica until a
-shared lock exists; a link in use during a rollout has the same exposure.
+With the **Valkey** or **disk** backend the lock is per process only (a
+startup warning says so). Two requests for the same link on different
+instances can then run at once, each writing back its own counts, so the
+request and byte limits become soft and a request that started before the
+upload completed can mark a finished link open again. Google's session still
+decides what is stored. Run a single replica with those backends; a link in
+use during a rollout has the same exposure. Without a shared backend the
+links live in one process and do not work across replicas at all.
 
 ## Running it behind a proxy
 
