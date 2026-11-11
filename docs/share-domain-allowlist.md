@@ -23,9 +23,8 @@ enforcement, configured with two environment variables:
   - `manage_calendar` applies the same check to calendar sharing: `share`
     refuses public (`default`) access and targets outside the list, and
     `update_sharing` re-checks the existing rule's target unless the new role
-    is `none`. `unshare` is always allowed. Its refusal says to share from
-    Google Calendar directly, and the operator message is not appended,
-    because it routes to Drive tools.
+    is `none`. `unshare` is always allowed. The operator message is not
+    appended to calendar refusals, because it routes to Drive tools.
 
   Matching is case-insensitive and exact — `example.com` does not cover
   `sub.example.com`; list subdomains explicitly. Unset (the default) leaves

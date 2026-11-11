@@ -151,6 +151,20 @@ class TestValidateShareTarget:
         with pytest.raises(ValueError):
             validate_share_target("user", "scientist.com")
 
+    @pytest.mark.parametrize(
+        "identifier",
+        [
+            "evil@x.com@scientist.com",
+            "evil@x.com,bob@scientist.com",
+            "evil@x.com;bob@scientist.com",
+            "evil@x.com bob@scientist.com",
+            "Evil <evil@x.com>@scientist.com",
+        ],
+    )
+    def test_smuggled_address_rejected(self, restricted, identifier):
+        with pytest.raises(ValueError):
+            validate_share_target("user", identifier)
+
     def test_empty_identifier_rejected(self, restricted):
         with pytest.raises(ValueError):
             validate_share_target("user", None)

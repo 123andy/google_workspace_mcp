@@ -1199,8 +1199,7 @@ def _validate_calendar_share_scope(scope: Dict[str, Any]) -> None:
         target = "anyone (public)" if share_type == "anyone" else f"'{value}'"
         raise UserInputError(
             f"Cannot share this calendar with {target}. Calendar sharing on this "
-            f"server is restricted to these domains: {', '.join(domains)}. Share "
-            "outside them from Google Calendar directly."
+            f"server is restricted to these domains: {', '.join(domains)}."
         ) from None
 
 

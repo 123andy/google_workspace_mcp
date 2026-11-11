@@ -259,7 +259,10 @@ def validate_share_target(share_type: str, identifier: Optional[str]) -> None:
     # external members.
     email = (identifier or "").strip().lower()
     local_part, sep, email_domain = email.rpartition("@")
-    if not sep or not local_part or email_domain not in domains:
+    # One plain address only: a second "@", whitespace or a list separator
+    # could make the domain check read a different address than Google does.
+    malformed = email.count("@") != 1 or any(ch in email for ch in " \t\r\n,;<>")
+    if malformed or not sep or not local_part or email_domain not in domains:
         raise ValueError(
             f"Cannot share with '{identifier}'. " + share_restriction_message(domains)
         )
