@@ -171,6 +171,45 @@ async def test_full_export_offers_signed_url_and_skips_fetch(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body_format, expected_ref",
+    [
+        ("text", {"mid": "msg-1", "fmt": "text", "lnk": 1}),
+        ("html", {"mid": "msg-1", "fmt": "html"}),
+    ],
+)
+async def test_full_export_carries_include_links_in_the_link(
+    enabled, body_format, expected_ref
+):
+    """include_links applies to text exports; the link must render the same text."""
+    with patch.object(sd, "offer_url", return_value=(URL, 900)) as offer:
+        await _export_full_message(
+            Mock(),
+            "msg-1",
+            HEADERS,
+            body_format,
+            user_google_email=USER,
+            include_links=True,
+        )
+
+    assert offer.call_args.kwargs["ref"] == expected_ref
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claims_lnk, expected", [({}, False), ({"lnk": 1}, True)])
+async def test_message_route_renders_with_the_links_flag(
+    monkeypatch, claims_lnk, expected
+):
+    render = AsyncMock(return_value=(b"body", "text/plain", ".txt", []))
+    monkeypatch.setattr("gmail.gmail_tools._render_message_export", render)
+    monkeypatch.setattr(sd, "build", lambda *a, **k: Mock())
+
+    await sd._fetch_gmail_message({"mid": "msg-1", "fmt": "text", **claims_lnk}, Mock())
+
+    assert render.call_args.kwargs["include_links"] is expected
+
+
+@pytest.mark.asyncio
 async def test_full_export_falls_back_to_upstream_path(enabled, monkeypatch):
     """No URL: upstream's stateless inline delivery, complete and untruncated."""
     import gmail.gmail_tools as gmail_tools

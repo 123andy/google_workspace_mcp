@@ -534,7 +534,12 @@ async def _export_full_message(
         signed_downloads.offer_url(
             user_google_email,
             source="gmail_message",
-            ref={"mid": message_id, "fmt": body_format},
+            # "lnk" carries include_links, so the route renders the same text.
+            ref={
+                "mid": message_id,
+                "fmt": body_format,
+                **({"lnk": 1} if include_links and body_format == "text" else {}),
+            },
             filename=f"{file_stem[:80]}{extension}",
         )
     )

@@ -507,7 +507,7 @@ async def _fetch_gmail_message(
     gmail = build("gmail", "v1", credentials=credentials)
     try:
         content, mime_type, extension, _notes = await _render_message_export(
-            gmail, message_id, body_format
+            gmail, message_id, body_format, include_links=bool(claims.get("lnk"))
         )
     except Exception as exc:
         raise SignedDownloadError(f"Gmail message export failed: {exc}") from exc
