@@ -647,6 +647,9 @@ async def _serve_leased(leases, handle: str, request: Request) -> Response:
         )
     except Exception as exc:
         logger.warning("Upload relay: shared lock unavailable (%s)", type(exc).__name__)
+        # A timed-out INSERT may still have committed; don't leave the link
+        # locked for a whole lease.
+        await _release_lease(leases, handle, owner)
         return _error(503, _LOCK_UNAVAILABLE)
     if not taken:
         return _error(409, "Another upload to this link is in progress")
@@ -667,15 +670,19 @@ async def _serve_leased(leases, handle: str, request: Request) -> Response:
     finally:
         if not work.done():
             work.cancel()
-        try:
-            await asyncio.wait_for(
-                leases.release_lease(_LEASE_COLLECTION, handle, owner),
-                _LEASE_OP_TIMEOUT,
-            )
-        except Exception as exc:  # the lease expires on its own
-            logger.warning(
-                "Upload relay: shared lock release failed (%s)", type(exc).__name__
-            )
+        await _release_lease(leases, handle, owner)
+
+
+async def _release_lease(leases, handle: str, owner: str) -> None:
+    """Best effort, bounded: on failure the lease expires on its own."""
+    try:
+        await asyncio.wait_for(
+            leases.release_lease(_LEASE_COLLECTION, handle, owner), _LEASE_OP_TIMEOUT
+        )
+    except Exception as exc:
+        logger.warning(
+            "Upload relay: shared lock release failed (%s)", type(exc).__name__
+        )
 
 
 async def _keep_lease(

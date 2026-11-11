@@ -1400,6 +1400,28 @@ async def test_a_hung_lock_backend_times_out_to_503(
 
 
 @pytest.mark.asyncio
+async def test_an_acquire_that_timed_out_after_committing_is_released(
+    client, google, leases, monkeypatch
+):
+    """wait_for cancels the statement, but the row may already be in."""
+    real_acquire = ur._leases.acquire_lease
+
+    async def commit_then_hang(*args):
+        await real_acquire(*args)
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(ur._leases, "acquire_lease", commit_then_hang)
+    monkeypatch.setattr(ur, "_LEASE_OP_TIMEOUT", 0.05)
+    handle = await _handle()
+    response = await client.put(f"/ul/{handle}", content=b"x")
+    assert response.status_code == 503
+    assert google.requests == []
+    assert _lease_owner(leases, handle) is None
+    monkeypatch.setattr(ur._leases, "acquire_lease", real_acquire)
+    assert (await client.put(f"/ul/{handle}", content=b"x")).status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_release_failure_is_logged_by_type_and_left_to_expire(
     client, google, leases, monkeypatch, caplog
 ):
