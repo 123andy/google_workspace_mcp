@@ -303,6 +303,8 @@ uv run main.py --only-tools send_gmail_message manage_drive_access
 
 **Short sign-in URLs**: the ~800-character Google authorization URL in an auth prompt is replaced by `{external_base}/auth/{handle}` (~60 chars), the same claim-check trick as `/dl`. The full URL is held Fernet-encrypted in the shared KV store under a random 128-bit handle with the OAuth state's TTL (10 min); `/auth/{handle}` 302-redirects to it. The stored value is validated as an `https://accounts.google.com` URL on both store and load, so the route cannot become an open redirect. Falls back to the full URL when no store is usable. `WORKSPACE_MCP_SHORT_AUTH_URLS=false` disables it.
 
+**Sessionless HTTP for several instances**: `WORKSPACE_MCP_STATELESS_HTTP=true` serves streamable HTTP without MCP sessions, so any instance behind a load balancer can answer any request, including from clients on the older session-based protocol. Unlike `WORKSPACE_MCP_STATELESS_MODE`, it keeps the configured auth mode and persistence. Pending sign-ins and upload links must then be in a shared store (the Postgres backend above). `WORKSPACE_MCP_SESSION_IDLE_TIMEOUT` has no effect with it on.
+
 ## Security Best Practices
 
 By default this server sends no data anywhere except Google's APIs, using your own OAuth client credentials - no usage reporting, analytics, license server, or SaaS dependency. MIT licensed with no CLA, no dual licensing, and no copyleft in the dependency chain. The full security posture - scope minimization, sensitive-path blocking, stateless mode - is documented at [workspacemcp.com](https://workspacemcp.com/privacy?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=security-privacy).

@@ -470,6 +470,12 @@ def describe_credential_config() -> list[tuple[str, str, str]]:
     ]
 
 
+def _stateless_http_flag_set() -> bool:
+    from core.server import stateless_http_flag_set
+
+    return stateless_http_flag_set()
+
+
 def describe_mode_config(
     disabled_tools: set[str] = frozenset(), *, single_user: bool = False
 ) -> list[tuple[str, str, str]]:
@@ -482,6 +488,11 @@ def describe_mode_config(
     return [
         _mode_field("OAuth 2.1", "MCP_ENABLE_OAUTH21", config.is_oauth21_enabled()),
         _mode_field("Stateless", "WORKSPACE_MCP_STATELESS_MODE", config.stateless_mode),
+        _mode_field(
+            "Sessionless HTTP",
+            "WORKSPACE_MCP_STATELESS_HTTP",
+            config.stateless_mode or _stateless_http_flag_set(),
+        ),
         _mode_field(
             "Single-user",
             "MCP_SINGLE_USER_MODE",
