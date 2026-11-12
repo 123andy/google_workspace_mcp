@@ -1174,13 +1174,13 @@ def main():
             if conflict is not None:
                 fatal(ui, f"Cannot start HTTP server on {host}:{port}", conflict)
 
-            from core.server import use_stateless_http
+            from core.server import stateless_http_flag_set
 
             server.run(
                 transport="streamable-http",
                 host=host,
                 port=port,
-                stateless_http=use_stateless_http(),
+                stateless_http=is_stateless_mode() or stateless_http_flag_set(),
                 show_banner=False,
             )
         else:

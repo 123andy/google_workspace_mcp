@@ -2,26 +2,23 @@
 
 import pytest
 
-from core.server import use_stateless_http
+from core.server import stateless_http_flag_set
 
 
 @pytest.mark.parametrize(
-    "flag, stateless_mode, expected",
+    "flag, expected",
     [
-        (None, False, False),
-        ("true", False, True),
-        ("TRUE", False, True),
-        (" true ", False, True),
-        ("false", False, False),
-        ("1", False, False),
-        (None, True, True),
-        ("false", True, True),
+        (None, False),
+        ("true", True),
+        ("TRUE", True),
+        (" true ", True),
+        ("false", False),
+        ("1", False),
     ],
 )
-def test_use_stateless_http(monkeypatch, flag, stateless_mode, expected):
+def test_stateless_http_flag_set(monkeypatch, flag, expected):
     if flag is None:
         monkeypatch.delenv("WORKSPACE_MCP_STATELESS_HTTP", raising=False)
     else:
         monkeypatch.setenv("WORKSPACE_MCP_STATELESS_HTTP", flag)
-    monkeypatch.setattr("auth.oauth_config.is_stateless_mode", lambda: stateless_mode)
-    assert use_stateless_http() is expected
+    assert stateless_http_flag_set() is expected
