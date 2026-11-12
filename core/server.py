@@ -310,6 +310,25 @@ class WellKnownCacheControlMiddleware:
 well_known_cache_control_middleware = Middleware(WellKnownCacheControlMiddleware)
 
 
+_STATELESS_HTTP_ENV = "WORKSPACE_MCP_STATELESS_HTTP"
+
+
+def use_stateless_http() -> bool:
+    """Serve streamable HTTP without MCP sessions, so any instance can answer any request.
+
+    On with ``WORKSPACE_MCP_STATELESS_MODE`` (which also requires OAuth 2.1 and
+    turns off local persistence), or on its own with
+    ``WORKSPACE_MCP_STATELESS_HTTP=true`` for deployments that keep their
+    persistence but run several instances behind a load balancer.
+    """
+    from auth.oauth_config import is_stateless_mode
+
+    return (
+        is_stateless_mode()
+        or os.getenv(_STATELESS_HTTP_ENV, "false").strip().lower() == "true"
+    )
+
+
 def get_session_idle_timeout() -> Optional[int]:
     """Parse WORKSPACE_MCP_SESSION_IDLE_TIMEOUT; 0 defers to FastMCP's setting.
 
